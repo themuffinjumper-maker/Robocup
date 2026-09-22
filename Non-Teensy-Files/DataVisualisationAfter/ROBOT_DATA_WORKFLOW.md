@@ -1,5 +1,23 @@
 # Robot Debug Recording and Analysis Workflow
 
+## Complete run recording and replay
+
+New recordings use schema version 4. In addition to every telemetry value,
+command, parameter change, robot-state packet, log, fault marker and raw serial
+line, the recorder stores every complete 8x8 frame in `matrix_frames` and a
+complete GUI snapshot once per second in `ui_snapshots`. Recording metadata
+also embeds the debug configuration, editable wiring guide and sensor layout
+that were active when the run began.
+
+Open a recording in `DataVisualiser.py` and select **Run Replay**. The common
+timeline, Play/Pause button, speed control and Go to End button drive replay
+views for Dashboard, 8x8 TOF, Arena View, Plots, Parameters, Commands, Wiring
+Guide, Logs and Raw Serial. **End View** is separately reconstructed to the end
+of the run and remains fixed for inspection. Version 3 recordings remain
+readable; their 8x8 frames are recovered from raw serial where possible, but
+they cannot contain GUI snapshots or embedded wiring/layout data that were
+never recorded.
+
 ## Purpose
 
 This project has two distinct operating modes:

@@ -56,30 +56,39 @@ void RobotDebug::finishLine()
         handler_(message, context_);
 }
 
-void RobotDebug::send(JsonDocument& message)
+bool RobotDebug::send(JsonDocument& message, size_t reserveBytes)
 {
     const size_t required = measureJson(message);
     if (required >= sizeof(txBuffer_))
-        return;
+    {
+        ++droppedMessages_;
+        droppedBytes_ += required + 1;
+        return false;
+    }
 
     const size_t length = serializeJson(message, txBuffer_, sizeof(txBuffer_));
-    size_t offset = 0;
-    while (offset < length)
+    // Never begin a line unless the complete JSON, newline, and requested
+    // command-response reserve fit in the UART ring. HardwareSerial::write()
+    // may otherwise accept a prefix, and the next send then joins two partial
+    // documents into one corrupt line. Dropping one complete bulk frame is far
+    // safer than wedging the CH9143 and preserves room for Stop/parameter ACKs.
+    const size_t requiredSpace = length + 1 + reserveBytes;
+    if (stream_.availableForWrite() < static_cast<int>(requiredSpace))
     {
-        const size_t remaining = length - offset;
-        const size_t chunkLength = remaining < TX_CHUNK_SIZE
-            ? remaining
-            : TX_CHUNK_SIZE;
-        stream_.write(
-            reinterpret_cast<const uint8_t*>(txBuffer_ + offset),
-            chunkLength
-        );
-        offset += chunkLength;
-        if (offset < length)
-            delay(3);
+        ++droppedMessages_;
+        droppedBytes_ += length + 1;
+        return false;
+    }
+    const size_t written = stream_.write(
+        reinterpret_cast<const uint8_t*>(txBuffer_), length);
+    if (written != length)
+    {
+        ++droppedMessages_;
+        droppedBytes_ += length + 1 - written;
+        return false;
     }
     stream_.write('\n');
-    stream_.flush();
+    return true;
 }
 
 void RobotDebug::log(const char* level, const char* text)

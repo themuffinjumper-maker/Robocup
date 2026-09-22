@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, QSettings, Qt, QTimer
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -48,6 +49,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QInputDialog,
     QSplitter,
     QTabWidget,
@@ -61,6 +63,10 @@ from PyQt6.QtWidgets import (
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "Data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+GUI_DIR = HERE.parent / "BluetoothDebugGUI"
+if str(GUI_DIR) not in sys.path:
+    sys.path.insert(0, str(GUI_DIR))
+from ArenaView import ArenaView
 
 
 @dataclass
@@ -95,6 +101,11 @@ class DataVisualiser(QMainWindow):
 
         self.marker_items = []
         self.anomaly_items = []
+        self.replay_events = []
+        self.replay_index = 0
+        self.replay_time = 0.0
+        self.replay_duration = 0.0
+        self.replay_latest = {}
 
         self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(width=1))
         self.cursor_line.setZValue(1000)
@@ -105,6 +116,8 @@ class DataVisualiser(QMainWindow):
         self.measure_region.hide()
 
         self._build_ui()
+        self.replay_timer = QTimer(self)
+        self.replay_timer.timeout.connect(self.advance_replay)
         QApplication.instance().installEventFilter(self)
         self.refresh_recordings()
 
@@ -251,6 +264,7 @@ class DataVisualiser(QMainWindow):
         root.addWidget(self.tabs, 1)
 
         self._build_plot_tab()
+        self._build_replay_tab()
         self._build_events_tab()
         self._build_raw_tab()
         self._build_metadata_tab()
@@ -262,6 +276,90 @@ class DataVisualiser(QMainWindow):
         self.align_fault_button.clicked.connect(self.align_compare_to_first_fault)
         self.clear_compare_button.clicked.connect(self.clear_compare)
         self.export_button.clicked.connect(self.export_selected_csv)
+
+    def _build_replay_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        controls = QHBoxLayout()
+        self.replay_play = QPushButton("Play")
+        self.replay_end = QPushButton("Go to End")
+        self.replay_speed = QComboBox()
+        for label, value in (("0.25×", 0.25), ("0.5×", 0.5), ("1×", 1.0),
+                             ("2×", 2.0), ("5×", 5.0)):
+            self.replay_speed.addItem(label, value)
+        self.replay_speed.setCurrentText("1×")
+        self.replay_clock = QLabel("0.00 / 0.00 s")
+        self.replay_recorded_tab = QLabel("Recorded tab: —")
+        self.replay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.replay_slider.setRange(0, 0)
+        controls.addWidget(self.replay_play)
+        controls.addWidget(self.replay_end)
+        controls.addWidget(QLabel("Speed:"))
+        controls.addWidget(self.replay_speed)
+        controls.addWidget(self.replay_clock)
+        controls.addWidget(self.replay_recorded_tab)
+        controls.addWidget(self.replay_slider, 1)
+        layout.addLayout(controls)
+
+        self.replay_tabs = QTabWidget()
+        layout.addWidget(self.replay_tabs, 1)
+
+        self.replay_dashboard = QTableWidget(0, 2)
+        self.replay_dashboard.setHorizontalHeaderLabels(["Signal", "Value at replay time"])
+        self.replay_dashboard.horizontalHeader().setStretchLastSection(True)
+        self.replay_tabs.addTab(self.replay_dashboard, "Dashboard")
+
+        matrix_page = QWidget(); matrix_layout = QVBoxLayout(matrix_page)
+        self.replay_matrix_status = QLabel("No matrix frame at this time")
+        matrix_layout.addWidget(self.replay_matrix_status)
+        grid = QGridLayout(); self.replay_matrix_cells = []
+        grid.addWidget(QLabel("Y\\X"), 0, 0)
+        for col in range(8): grid.addWidget(QLabel(f"X{col}"), 0, col + 1)
+        for row in range(8):
+            grid.addWidget(QLabel(f"Y{row}"), row + 1, 0)
+            cells = []
+            for col in range(8):
+                cell = QLabel("—"); cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setStyleSheet("QLabel{background:#374151;color:white;border:1px solid #111827;padding:5px;}")
+                grid.addWidget(cell, row + 1, col + 1); cells.append(cell)
+            self.replay_matrix_cells.append(cells)
+        matrix_layout.addLayout(grid); matrix_layout.addStretch()
+        self.replay_tabs.addTab(matrix_page, "8x8 TOF")
+
+        self.replay_arena = ArenaView(
+            QSettings("RobotProject", "DataVisualiserReplay"),
+            show_controls=False,
+        )
+        self.replay_tabs.addTab(self.replay_arena, "Arena View")
+
+        plot_note = QLabel("The Plots tab is synchronized to this replay clock. "
+                           "Its blue cursor follows playback and every recorded numeric signal remains selectable.")
+        plot_note.setWordWrap(True); plot_page = QWidget(); plot_layout = QVBoxLayout(plot_page)
+        plot_layout.addWidget(plot_note); plot_layout.addStretch()
+        self.replay_tabs.addTab(plot_page, "Plots")
+
+        self.replay_parameters = QTableWidget(0, 2)
+        self.replay_parameters.setHorizontalHeaderLabels(["Parameter", "Value at replay time"])
+        self.replay_parameters.horizontalHeader().setStretchLastSection(True)
+        self.replay_tabs.addTab(self.replay_parameters, "Parameters")
+        self.replay_commands = QTextEdit(); self.replay_commands.setReadOnly(True)
+        self.replay_tabs.addTab(self.replay_commands, "Commands")
+        self.replay_wiring = QTextEdit(); self.replay_wiring.setReadOnly(True)
+        self.replay_tabs.addTab(self.replay_wiring, "Wiring Guide")
+        self.replay_logs = QTextEdit(); self.replay_logs.setReadOnly(True)
+        self.replay_tabs.addTab(self.replay_logs, "Logs")
+        self.replay_raw = QTextEdit(); self.replay_raw.setReadOnly(True)
+        self.replay_tabs.addTab(self.replay_raw, "Raw Serial")
+        self.replay_end_arena = ArenaView(
+            QSettings("RobotProject", "DataVisualiserEndView"),
+            show_controls=False,
+        )
+        self.replay_tabs.addTab(self.replay_end_arena, "End View")
+
+        self.tabs.addTab(page, "Run Replay")
+        self.replay_play.clicked.connect(self.toggle_replay)
+        self.replay_end.clicked.connect(lambda: self.replay_slider.setValue(self.replay_slider.maximum()))
+        self.replay_slider.valueChanged.connect(self.seek_replay)
 
     def _build_plot_tab(self):
         page = QWidget()
@@ -443,11 +541,229 @@ class DataVisualiser(QMainWindow):
             self.load_events()
             self.load_raw()
             self.load_metadata()
+            self.load_replay()
             self.update_summary()
             self.refresh_markers()
             self.statusBar().showMessage(f"Loaded {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Could not open recording", str(exc))
+
+    @staticmethod
+    def _recorded_value(value_num, value_text, value_type):
+        if value_type == "bool":
+            return bool(value_num)
+        if value_type == "number":
+            return value_num
+        if value_type == "null":
+            return None
+        return value_text
+
+    def load_replay(self):
+        self.replay_timer.stop()
+        self.replay_play.setText("Play")
+        self.replay_events = []
+        if self.conn is None:
+            return
+        for row in self.conn.execute(
+            "SELECT elapsed_s,robot_time,signal,value_num,value_text,value_type "
+            "FROM telemetry ORDER BY elapsed_s"
+        ):
+            elapsed, robot, signal, number, text_value, value_type = row
+            self.replay_events.append((float(elapsed), "telemetry", (
+                str(signal), self._recorded_value(number, text_value, value_type), robot)))
+        if self.table_exists(self.conn, "matrix_frames"):
+            for elapsed, frame_json in self.conn.execute(
+                    "SELECT elapsed_s,frame_json FROM matrix_frames ORDER BY elapsed_s"):
+                try:
+                    self.replay_events.append((float(elapsed), "matrix", json.loads(frame_json)))
+                except Exception:
+                    pass
+        else:
+            # Version 3 recordings still retain complete inbound JSON in raw_serial.
+            for elapsed, line in self.conn.execute(
+                    "SELECT elapsed_s,line FROM raw_serial ORDER BY elapsed_s"):
+                try:
+                    start = str(line).find("{")
+                    message = json.loads(str(line)[start:])
+                    if message.get("type") == "tof_8x8":
+                        self.replay_events.append((float(elapsed), "matrix", message))
+                except Exception:
+                    pass
+        for table, kind, columns in (
+            ("logs", "log", "elapsed_s,level,message"),
+            ("commands", "command", "elapsed_s,command,arguments_json"),
+            ("parameters", "parameter", "elapsed_s,name,value_json"),
+            ("states", "state", "elapsed_s,state_json"),
+            ("raw_serial", "raw", "elapsed_s,line"),
+            ("ui_snapshots", "snapshot", "elapsed_s,snapshot_json"),
+        ):
+            if not self.table_exists(self.conn, table):
+                continue
+            for row in self.conn.execute(f"SELECT {columns} FROM {table} ORDER BY elapsed_s"):
+                elapsed, *payload = row
+                if kind in ("state", "snapshot"):
+                    try: payload = [json.loads(payload[0])]
+                    except Exception: pass
+                self.replay_events.append((float(elapsed), kind, payload))
+        self.replay_events.sort(key=lambda event: event[0])
+        self.replay_duration = max((event[0] for event in self.replay_events), default=0.0)
+        self.replay_slider.blockSignals(True)
+        self.replay_slider.setRange(0, max(0, int(math.ceil(self.replay_duration * 1000))))
+        self.replay_slider.setValue(0)
+        self.replay_slider.blockSignals(False)
+        self._apply_recorded_arena_configuration(self.replay_arena)
+        self._apply_recorded_arena_configuration(self.replay_end_arena)
+        self._load_replay_wiring()
+        self._reset_replay()
+        self._build_end_view()
+        self.seek_replay(0)
+
+    def _apply_recorded_arena_configuration(self, view):
+        meta = self.get_metadata(self.conn)
+        try: layout = json.loads(meta.get("arena_layout_json", "{}"))
+        except Exception: layout = {}
+        try: settings = json.loads(meta.get("arena_settings_json", "{}"))
+        except Exception: settings = {}
+        if isinstance(layout, dict):
+            point = layout.get("point")
+            ultrasound = layout.get("ultrasound")
+            matrix = layout.get("matrix")
+            if isinstance(point, list): view.model.sensor_specs = point
+            if isinstance(ultrasound, list): view.model.ultrasound_specs = ultrasound
+            if isinstance(matrix, dict): view.model.matrix_spec = matrix
+            view.sensor_canvas.set_specs(view.model.sensor_specs + [view.model.matrix_spec])
+            view.sensor_canvas.set_aux_specs(view.model.ultrasound_specs)
+        controls = {
+            "width": view.arena_width, "height": view.arena_height,
+            "encoder_1_mm_per_count": view.encoder_1_scale,
+            "encoder_2_mm_per_count": view.encoder_2_scale,
+            "track_width_mm": view.track_width, "cell_size_mm": view.grid_size,
+            "weight_gap_mm": view.weight_gap, "matrix_fov_deg": view.matrix_fov,
+        }
+        for key, control in controls.items():
+            if key in settings:
+                control.blockSignals(True); control.setValue(float(settings[key])); control.blockSignals(False)
+        if "matrix_mirrored" in settings:
+            view.model.matrix_mirrored = bool(settings["matrix_mirrored"])
+        view._sync()
+        view.reset_map()
+
+    def _load_replay_wiring(self):
+        meta = self.get_metadata(self.conn)
+        try:
+            entries = json.loads(meta.get("wiring_guide_json", "[]"))
+        except Exception:
+            entries = []
+        lines = ["CPU WIRING RECORDED WITH THIS RUN", "================================="]
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict):
+                lines.append(
+                    f"{entry.get('device','?')}: {entry.get('connector','?')} — "
+                    f"{entry.get('pins','?')}  {entry.get('notes','')}"
+                )
+        if not entries:
+            lines.append("This older recording has no embedded wiring snapshot.")
+        self.replay_wiring.setPlainText("\n".join(lines))
+
+    def _reset_replay(self):
+        self.replay_index = 0
+        self.replay_time = 0.0
+        self.replay_latest = {}
+        self.replay_dashboard.setRowCount(0)
+        self.replay_parameters.setRowCount(0)
+        self.replay_commands.clear(); self.replay_logs.clear(); self.replay_raw.clear()
+        self.replay_recorded_tab.setText("Recorded tab: —")
+        self.replay_arena.reset_map()
+        for row in self.replay_matrix_cells:
+            for cell in row: cell.setText("—")
+
+    def _build_end_view(self):
+        self.replay_end_arena.reset_map()
+        for _elapsed, kind, payload in self.replay_events:
+            if kind == "telemetry":
+                self.replay_end_arena.receive_telemetry(*payload)
+            elif kind == "matrix" and isinstance(payload, dict):
+                self.replay_end_arena.receive_matrix(payload)
+
+    def toggle_replay(self):
+        if self.replay_timer.isActive():
+            self.replay_timer.stop(); self.replay_play.setText("Play")
+        else:
+            if self.replay_time >= self.replay_duration:
+                self.replay_slider.setValue(0)
+            self.replay_timer.start(50); self.replay_play.setText("Pause")
+
+    def advance_replay(self):
+        speed = float(self.replay_speed.currentData() or 1.0)
+        value = self.replay_slider.value() + max(1, int(50 * speed))
+        if value >= self.replay_slider.maximum():
+            value = self.replay_slider.maximum()
+            self.replay_timer.stop(); self.replay_play.setText("Play")
+        self.replay_slider.setValue(value)
+
+    def seek_replay(self, milliseconds: int):
+        target = milliseconds / 1000.0
+        if target < self.replay_time:
+            self._reset_replay()
+        while self.replay_index < len(self.replay_events) and \
+                self.replay_events[self.replay_index][0] <= target:
+            elapsed, kind, payload = self.replay_events[self.replay_index]
+            self._apply_replay_event(elapsed, kind, payload)
+            self.replay_index += 1
+        self.replay_time = target
+        self.replay_clock.setText(f"{target:.2f} / {self.replay_duration:.2f} s")
+        self._refresh_replay_dashboard()
+        self.cursor_line.setPos(target); self.cursor_line.show(); self.update_cursor_values()
+
+    def _apply_replay_event(self, elapsed, kind, payload):
+        if kind == "telemetry":
+            name, value, robot_time = payload
+            self.replay_latest[name] = value
+            self.replay_arena.receive_telemetry(name, value, robot_time)
+        elif kind == "matrix" and isinstance(payload, dict):
+            self.replay_arena.receive_matrix(payload)
+            values = payload.get("data", [])
+            self.replay_matrix_status.setText(
+                f"t={elapsed:.2f}s · frame {payload.get('frame','?')} · "
+                f"valid={payload.get('valid',False)}")
+            if isinstance(values, list) and len(values) == 64:
+                for row in range(8):
+                    for col in range(8):
+                        self.replay_matrix_cells[row][col].setText(str(values[row * 8 + col]))
+        elif kind == "log":
+            self.replay_logs.append(f"[{elapsed:8.3f}] [{payload[0]}] {payload[1]}")
+        elif kind == "command":
+            self.replay_commands.append(f"[{elapsed:8.3f}] {payload[0]} {payload[1]}")
+        elif kind == "parameter":
+            try: value = json.loads(payload[1])
+            except Exception: value = payload[1]
+            self.replay_latest[f"parameter:{payload[0]}"] = value
+        elif kind == "state":
+            state = payload[0] if isinstance(payload, list) else payload
+            if isinstance(state, dict):
+                for key, value in state.items(): self.replay_latest[f"state:{key}"] = value
+        elif kind == "raw":
+            self.replay_raw.append(f"[{elapsed:8.3f}] {payload[0]}")
+        elif kind == "snapshot":
+            snap = payload[0] if isinstance(payload, list) else payload
+            if isinstance(snap, dict):
+                self.replay_recorded_tab.setText(f"Recorded tab: {snap.get('active_tab','—')}")
+                for name, value in snap.get("parameters", {}).items():
+                    self.replay_latest.setdefault(f"parameter:{name}", value)
+
+    def _refresh_replay_dashboard(self):
+        telemetry = sorted((k, v) for k, v in self.replay_latest.items()
+                           if not k.startswith("parameter:"))
+        self.replay_dashboard.setRowCount(len(telemetry))
+        for row, (name, value) in enumerate(telemetry):
+            self.replay_dashboard.setItem(row, 0, QTableWidgetItem(name))
+            self.replay_dashboard.setItem(row, 1, QTableWidgetItem(str(value)))
+        parameters = sorted((k[10:], v) for k, v in self.replay_latest.items()
+                            if k.startswith("parameter:"))
+        self.replay_parameters.setRowCount(len(parameters))
+        for row, (name, value) in enumerate(parameters):
+            self.replay_parameters.setItem(row, 0, QTableWidgetItem(name))
+            self.replay_parameters.setItem(row, 1, QTableWidgetItem(str(value)))
 
     def browse_compare_recording(self):
         name, _ = QFileDialog.getOpenFileName(self, "Open comparison recording", str(DATA_DIR), "Robot Debug Recording (*.rdbg)")

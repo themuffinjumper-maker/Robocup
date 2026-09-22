@@ -79,13 +79,15 @@ namespace Pins {
     constexpr uint8_t TOF_I2C_BUS    = 0; // Wire
     constexpr uint8_t COLOUR_I2C_BUS = 1; // Wire1
 
-    constexpr uint8_t IR_LEFT  = A0;
+    constexpr uint8_t IR_LEFT  = A0; // Also D14; unavailable while ultrasound echo uses D14.
     constexpr uint8_t IR_RIGHT = A1; // Also D15; unavailable while second motor driver uses D15.
 
-    constexpr uint8_t ULTRASOUND_FRONT_TRIG = 9;
-    constexpr uint8_t ULTRASOUND_FRONT_ECHO = 10;
+    constexpr uint8_t ULTRASOUND_FRONT_TRIG = 14;
+    constexpr uint8_t ULTRASOUND_FRONT_ECHO = 24;
+    constexpr uint8_t ULTRASOUND_B_TRIG = 22;
+    constexpr uint8_t ULTRASOUND_B_ECHO = 20;
 
-    constexpr uint8_t INDUCTIVE_PROXIMITY = 11;
+    constexpr uint8_t INDUCTIVE_PROXIMITY = 21;
 
 } // namespace Pins
 

@@ -1,0 +1,7 @@
+{
+  "name": "UltrasoundSensor",
+  "version": "1.0.0",
+  "description": "Non-blocking trigger/echo ultrasonic range sensor",
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

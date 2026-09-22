@@ -1,0 +1,7 @@
+{
+  "name": "DigitalInputSensor",
+  "version": "1.0.0",
+  "description": "Configurable debounced digital presence sensor input",
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

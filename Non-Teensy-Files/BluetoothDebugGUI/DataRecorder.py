@@ -20,7 +20,7 @@ Additional features:
 - session metadata updates
 - complete parameter snapshots
 - annotations
-- schema version 3
+- schema version 4
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ class DataRecorder:
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "port": port,
                 "baudrate": str(baudrate),
-                "format_version": "3",
+                "format_version": "4",
                 "application": "Robot Debug Console",
             }
             if metadata:
@@ -247,6 +247,25 @@ class DataRecorder:
             label TEXT NOT NULL,
             note TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS matrix_frames(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            elapsed_s REAL NOT NULL,
+            wall_time TEXT NOT NULL,
+            robot_time REAL,
+            frame_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_frames_time
+            ON matrix_frames(elapsed_s);
+
+        CREATE TABLE IF NOT EXISTS ui_snapshots(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            elapsed_s REAL NOT NULL,
+            wall_time TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ui_snapshots_time
+            ON ui_snapshots(elapsed_s);
         """)
 
     def _write_one(self, conn: sqlite3.Connection, kind: str, payload):
@@ -300,6 +319,16 @@ class DataRecorder:
         elif kind == "metadata":
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",
+                payload,
+            )
+        elif kind == "matrix":
+            conn.execute(
+                "INSERT INTO matrix_frames(elapsed_s,wall_time,robot_time,frame_json) VALUES (?,?,?,?)",
+                payload,
+            )
+        elif kind == "ui_snapshot":
+            conn.execute(
+                "INSERT INTO ui_snapshots(elapsed_s,wall_time,snapshot_json) VALUES (?,?,?)",
                 payload,
             )
 
@@ -396,3 +425,20 @@ class DataRecorder:
         elapsed, wall = self._times()
         self._enqueue("annotation", (elapsed, wall, str(label), str(note)))
         return elapsed
+
+    def record_matrix(self, message: dict):
+        if not self._recording:
+            return
+        elapsed, wall = self._times()
+        robot_time = message.get("time")
+        try:
+            robot_time = float(robot_time) if robot_time is not None else None
+        except (TypeError, ValueError):
+            robot_time = None
+        self._enqueue("matrix", (elapsed, wall, robot_time, self._json(message)))
+
+    def record_ui_snapshot(self, snapshot: dict):
+        if not self._recording:
+            return
+        elapsed, wall = self._times()
+        self._enqueue("ui_snapshot", (elapsed, wall, self._json(snapshot)))

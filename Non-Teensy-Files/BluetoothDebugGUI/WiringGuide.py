@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -37,9 +37,19 @@ DEFAULT_ENTRIES = [
     {"kind": "Servo", "device": "HX12K C", "connector": "Digital Raw 1 / level shift", "pins": "D31", "notes": "Level-shifted servo output"},
     {"kind": "Servo", "device": "HX12K D", "connector": "Digital Raw 1 / level shift", "pins": "D30", "notes": "Level-shifted servo output"},
     {"kind": "Sensor", "device": "Dual encoder board", "connector": "Digital Raw 2", "pins": "E1 A:D2 B:D3 / E2 A:D4 B:D5", "notes": "Quadrature; 3.3 V signals only"},
-    {"kind": "Sensor", "device": "Front long-range TOF", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
-    {"kind": "Sensor", "device": "Left short-range TOF", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "Inductive proximity sensor", "connector": "Digital", "pins": "D21", "notes": "Active-low digital input; INPUT_PULLUP; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "Ultrasound Left (A)", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D14 / ECHO D24", "notes": "Left ultrasonic range sensor; channel A; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "Ultrasound Right (B)", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D22 / ECHO D20", "notes": "Right ultrasonic range sensor; channel B; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "TOF Long Top Mid Left", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Long Top Mid Right", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Mid Left", "connector": "XSHUT5", "pins": "I2C0 / XSHUT5", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Mid Right", "connector": "XSHUT0", "pins": "I2C0 / XSHUT0", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Right Right", "connector": "XSHUT3", "pins": "I2C0 / XSHUT3", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Left Left", "connector": "XSHUT4", "pins": "I2C0 / XSHUT4", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Long Top Right Right", "connector": "XSHUT6", "pins": "I2C0 / XSHUT6", "notes": "Long-range angled navigation sensor"},
+    {"kind": "Sensor", "device": "TOF Long Top Left Left", "connector": "XSHUT7", "pins": "I2C0 / XSHUT7", "notes": "Long-range angled navigation sensor"},
     {"kind": "Sensor", "device": "SEN0628 8×8 TOF", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x33"},
+    {"kind": "Sensor", "device": "BNO055 IMU", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x28/0x29"},
 ]
 
 COLUMNS = ("Type", "Device", "CPU connector", "CPU pin(s)", "Notes")
@@ -55,6 +65,7 @@ COLORS = {
 
 class WiringGuide(QWidget):
     SETTINGS_KEY = "wiring_guide/entries_v1"
+    entries_changed = pyqtSignal()
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -142,6 +153,120 @@ class WiringGuide(QWidget):
                     self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
                 self.settings.setValue("wiring_guide/encoder_raw2_migrated", True)
                 self.settings.sync()
+
+            # Add the confirmed XSHUT4 sensor once while retaining any custom
+            # XSHUT4 entry/label already created in the live Wiring Guide.
+            if not self.settings.value("wiring_guide/xshut4_migrated", False, type=bool):
+                if not any(entry["connector"].strip().upper() == "XSHUT4"
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["connector"] == "XSHUT4"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/xshut4_migrated", True)
+                self.settings.sync()
+
+            # Add the confirmed D21 proximity input once without replacing any
+            # custom wiring rows or labels.
+            if not self.settings.value("wiring_guide/inductive_d21_migrated", False, type=bool):
+                if not any("D21" in entry["pins"].upper() or
+                           "inductive" in entry["device"].lower() for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Inductive proximity sensor"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/inductive_d21_migrated", True)
+                self.settings.sync()
+
+            if not self.settings.value("wiring_guide/ultrasound_d24_d14_migrated", False, type=bool):
+                if not any("D24" in entry["pins"].upper() and
+                           ("D14" in entry["pins"].upper() or "D22" in entry["pins"].upper())
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Ultrasound Left (A)"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_d24_d14_migrated", True)
+                self.settings.sync()
+
+            if not self.settings.value("wiring_guide/ultrasound_d20_d22_migrated", False, type=bool):
+                if not any("D20" in entry["pins"].upper() and
+                           ("D22" in entry["pins"].upper() or "D14" in entry["pins"].upper())
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Ultrasound Right (B)"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_d20_d22_migrated", True)
+                self.settings.sync()
+
+            if not self.settings.value("wiring_guide/ultrasound_echo_swap_migrated", False, type=bool):
+                changed = False
+                for entry in cleaned:
+                    pins = entry["pins"].strip().upper()
+                    if pins == "TRIG D24 / ECHO D14":
+                        entry["pins"] = "TRIG D24 / ECHO D22"
+                        entry["notes"] = "Test mapping after swapping the two echo lines; 3.3 V maximum"
+                        changed = True
+                    elif pins == "TRIG D20 / ECHO D22":
+                        entry["pins"] = "TRIG D20 / ECHO D14"
+                        entry["notes"] = "Test mapping after swapping the two echo lines; 3.3 V maximum"
+                        changed = True
+                if changed:
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_echo_swap_migrated", True)
+                self.settings.sync()
+
+            if not self.settings.value("wiring_guide/ultrasound_direction_swap_migrated", False, type=bool):
+                changed = False
+                for entry in cleaned:
+                    pins = entry["pins"].strip().upper()
+                    if pins in ("TRIG D24 / ECHO D14", "TRIG D24 / ECHO D22"):
+                        entry["pins"] = "TRIG D14 / ECHO D24"
+                        entry["notes"] = "Original D24/D14 pair with signal directions reversed; 3.3 V maximum"
+                        changed = True
+                    elif pins in ("TRIG D20 / ECHO D22", "TRIG D20 / ECHO D14"):
+                        entry["pins"] = "TRIG D22 / ECHO D20"
+                        entry["notes"] = "Original D20/D22 pair with signal directions reversed; 3.3 V maximum"
+                        changed = True
+                if changed:
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_direction_swap_migrated", True)
+                self.settings.sync()
+
+            # Rename the old generic A/B rows once so existing installations get
+            # the physical left/right naming used by Arena View. User-created
+            # custom ultrasound names are left alone.
+            if not self.settings.value(
+                    "wiring_guide/ultrasound_left_right_names_migrated", False, type=bool):
+                changed = False
+                for entry in cleaned:
+                    old_name = entry["device"].strip().lower()
+                    if old_name == "ultrasound a":
+                        entry["device"] = "Ultrasound Left (A)"
+                        entry["notes"] = "Left ultrasonic range sensor; channel A; 3.3 V maximum"
+                        changed = True
+                    elif old_name == "ultrasound b":
+                        entry["device"] = "Ultrasound Right (B)"
+                        entry["notes"] = "Right ultrasonic range sensor; channel B; 3.3 V maximum"
+                        changed = True
+                if changed:
+                    self.settings.setValue(
+                        self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False)
+                    )
+                self.settings.setValue(
+                    "wiring_guide/ultrasound_left_right_names_migrated", True
+                )
+                self.settings.sync()
+
+            # Add the two outer top long-range sensors after the established
+            # hardware migrations, preserving the stable order of older rows.
+            if not self.settings.value("wiring_guide/xshut6_xshut7_migrated", False, type=bool):
+                existing_ports = {entry["connector"].strip().upper() for entry in cleaned}
+                for port in ("XSHUT6", "XSHUT7"):
+                    if port not in existing_ports:
+                        cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                            if entry["connector"] == port))
+                self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/xshut6_xshut7_migrated", True)
+                self.settings.sync()
+
             return cleaned
         except (TypeError, ValueError):
             return [entry.copy() for entry in DEFAULT_ENTRIES]
@@ -149,6 +274,7 @@ class WiringGuide(QWidget):
     def _save(self):
         self.settings.setValue(self.SETTINGS_KEY, json.dumps(self.entries, ensure_ascii=False))
         self.settings.sync()
+        self.entries_changed.emit()
 
     def _refresh(self):
         self._populating = True

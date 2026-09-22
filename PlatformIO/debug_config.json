@@ -1,16 +1,80 @@
 {
+  "digital_inputs": [
+    {
+      "name": "inductive_proximity",
+      "label": "Inductive proximity sensor",
+      "pin": 21,
+      "active_low": true,
+      "pullup": true,
+      "debounce_ms": 20
+    }
+  ],
+  "ultrasound_sensors": [
+    {
+      "name": "a",
+      "label": "Ultrasound A",
+      "trigger_pin": 14,
+      "echo_pin": 24,
+      "interval_ms": 100,
+      "timeout_us": 30000
+    },
+    {
+      "name": "b",
+      "label": "Ultrasound B",
+      "trigger_pin": 22,
+      "echo_pin": 20,
+      "interval_ms": 100,
+      "timeout_us": 30000
+    }
+  ],
   "tof_sensors": [
     {
-      "name": "front",
-      "label": "Front long-range TOF",
+      "name": "top_mid_left",
+      "label": "Top middle left long-range TOF",
       "type": "long",
       "port": "XSHUT1"
     },
     {
-      "name": "left",
-      "label": "Left short-range TOF",
-      "type": "short",
+      "name": "top_mid_right",
+      "label": "Top middle right long-range TOF",
+      "type": "long",
       "port": "XSHUT2"
+    },
+    {
+      "name": "bottom_mid_left",
+      "label": "Bottom middle left short-range TOF",
+      "type": "short",
+      "port": "XSHUT5"
+    },
+    {
+      "name": "bottom_mid_right",
+      "label": "Bottom middle right short-range TOF",
+      "type": "short",
+      "port": "XSHUT0"
+    },
+    {
+      "name": "bottom_right_right",
+      "label": "Bottom far-right short-range TOF",
+      "type": "short",
+      "port": "XSHUT3"
+    },
+    {
+      "name": "bottom_left_left",
+      "label": "Bottom far-left short-range TOF",
+      "type": "short",
+      "port": "XSHUT4"
+    },
+    {
+      "name": "top_right_right",
+      "label": "Top far-right long-range TOF",
+      "type": "long",
+      "port": "XSHUT6"
+    },
+    {
+      "name": "top_left_left",
+      "label": "Top far-left long-range TOF",
+      "type": "long",
+      "port": "XSHUT7"
     }
 
   ],
@@ -21,11 +85,22 @@
       "description": "Delay between telemetry packets",
       "datatype": "int",
       "unit": "ms",
-      "value": 500,
-      "min": 50,
+      "value": 1000,
+      "min": 750,
       "max": 2000,
       "step": 50
-    }
+    },
+    {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative, 3 frontier A*, 4 reactive wander)","datatype":"int","value":0,"min":0,"max":4,"step":1},
+    {"name":"navigation.front_avoid_mm","label":"Navigation front stop","datatype":"int","unit":"mm","value":300,"min":100,"max":1000,"step":25},
+    {"name":"navigation.side_avoid_mm","label":"Navigation side clearance","datatype":"int","unit":"mm","value":200,"min":80,"max":800,"step":25},
+    {"name":"navigation.wall_follow_mm","label":"Wall-follow distance","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
+    {"name":"navigation.lane_spacing_mm","label":"Sweep lane spacing","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
+    {"name":"navigation.robot_width_mm","label":"Robot physical width","datatype":"int","unit":"mm","value":430,"min":100,"max":1200,"step":10},
+    {"name":"navigation.gap_margin_mm","label":"Gap safety margin","datatype":"int","unit":"mm","value":80,"min":0,"max":500,"step":10},
+    {"name":"navigation.gap_depth_mm","label":"Minimum depth considered open","datatype":"int","unit":"mm","value":550,"min":250,"max":3000,"step":25},
+    {"name":"navigation.matrix_floor_rows","label":"Ignored lower 8x8 rows","datatype":"int","value":2,"min":0,"max":4,"step":1},
+    {"name":"navigation.matrix_fov_deg","label":"8x8 horizontal field of view","datatype":"int","unit":"deg","value":40,"min":20,"max":90,"step":1},
+    {"name":"navigation.gap_confirm_frames","label":"Gap confirmation frames","datatype":"int","value":2,"min":1,"max":5,"step":1}
   ],
   "commands": [
     {
@@ -144,6 +219,19 @@
       "args": []
     },
     {
+      "name": "autonomous_navigation",
+      "label": "Autonomous navigation",
+      "category": "Navigation",
+      "description": "Uses 100% base drive, finds and follows walls at 200 mm, then maps the arena in 200 mm parallel sweep lanes. Every completed turn is checked before forward motion: a still-blocked front causes another turn, while a close wall on all three sides triggers a reverse escape. Navigation uses the top TOFs and 8x8 forward view plus left/right ultrasound; bottom TOFs remain weight-sensing only.",
+      "action": "navigation_toggle",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "RUN NAVIGATION", "arguments": {"enabled": true}},
+        {"label": "STOP NAVIGATION", "arguments": {"enabled": false}}
+      ]
+    },
+    {
       "name": "set_hx12k_angles",
       "label": "Set HX12K servo angles",
       "category": "HX12K",
@@ -167,6 +255,32 @@
       "category": "HX12K",
       "action": "hx12k_disable",
       "args": []
+    },
+    {
+      "name": "set_bumper_servos",
+      "label": "Bumper servos",
+      "category": "HX12K",
+      "description": "Moves the paired bumper servos on level-shifter outputs C and D together.",
+      "action": "hx12k_bumpers",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "BUMPERS ON", "arguments": {"enabled": true}},
+        {"label": "BUMPERS OFF", "arguments": {"enabled": false}}
+      ]
+    },
+    {
+      "name": "arm_sorting",
+      "label": "Arm sorting",
+      "category": "Sorting",
+      "description": "On enable, zeroes Herkulex 4 and sets the bumpers OFF. A 0.50 s confirmed inductive detection selects gate +30 degrees and holds the bumpers ON. After detection clears, the bumper stays ON for 2 seconds and the gate stays at +30 for 5 seconds before returning to -30. With no detection the bumpers pulse for one second every 20 seconds.",
+      "action": "arm_sorting_toggle",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "ARM SORTING ON", "arguments": {"enabled": true}},
+        {"label": "ARM SORTING OFF", "arguments": {"enabled": false}}
+      ]
     },
     {
       "name": "read_all_tof",

@@ -51,7 +51,7 @@ class WiringGuideTest(unittest.TestCase):
             self.assertNotIn("Test encoder", [entry["device"] for entry in second.entries])
             second.close()
 
-    def test_existing_guide_gets_encoder_without_losing_edits(self):
+    def test_existing_guide_gets_new_hardware_without_losing_edits(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings_file = str(Path(temporary) / "existing.ini")
             settings = QSettings(settings_file, QSettings.Format.IniFormat)
@@ -62,6 +62,60 @@ class WiringGuideTest(unittest.TestCase):
             guide = WiringGuide(settings)
             self.assertEqual(guide.entries[0]["device"], "Custom device")
             self.assertEqual(guide.entries[1]["device"], "Dual encoder board")
+            self.assertEqual(guide.entries[2]["connector"], "XSHUT4")
+            self.assertEqual(guide.entries[3]["pins"], "D21")
+            self.assertEqual(guide.entries[4]["pins"], "TRIG D14 / ECHO D24")
+            self.assertEqual(guide.entries[5]["pins"], "TRIG D22 / ECHO D20")
+            guide.close()
+
+    def test_inductive_sensor_firmware_definition_is_d21_active_low(self):
+        config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
+        inputs = json.loads(config_path.read_text(encoding="utf-8"))["digital_inputs"]
+        inductive = next(item for item in inputs if item["name"] == "inductive_proximity")
+        self.assertEqual(inductive["pin"], 21)
+        self.assertTrue(inductive["active_low"])
+        self.assertTrue(inductive["pullup"])
+        self.assertEqual(inductive["debounce_ms"], 20)
+
+    def test_ultrasound_firmware_definition_reverses_each_original_pair(self):
+        config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
+        sensors = json.loads(config_path.read_text(encoding="utf-8"))["ultrasound_sensors"]
+        first = next(item for item in sensors if item["name"] == "a")
+        self.assertEqual(first["trigger_pin"], 14)
+        self.assertEqual(first["echo_pin"], 24)
+        self.assertEqual(first["timeout_us"], 30000)
+        second = next(item for item in sensors if item["name"] == "b")
+        self.assertEqual(second["trigger_pin"], 22)
+        self.assertEqual(second["echo_pin"], 20)
+        self.assertEqual(second["timeout_us"], 30000)
+
+    def test_ultrasound_workflow_supports_two_sequential_channels(self):
+        root = Path(__file__).resolve().parents[2] / "PlatformIO" / "lib" / "BluetoothDebugWorkflow"
+        header = (root / "BluetoothDebugWorkflow.h").read_text(encoding="utf-8")
+        source = (root / "BluetoothDebugWorkflow.cpp").read_text(encoding="utf-8")
+        self.assertIn("MAX_ULTRASOUND_SENSORS = 2", header)
+        self.assertIn("activeUltrasoundIndex_", source)
+        self.assertIn("Only one transducer may transmit/listen at a time", source)
+
+    def test_saved_ultrasound_rows_receive_direction_swap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_file = str(Path(temporary) / "old_ultrasound.ini")
+            settings = QSettings(settings_file, QSettings.Format.IniFormat)
+            settings.setValue(WiringGuide.SETTINGS_KEY, json.dumps([
+                {"kind": "Sensor", "device": "Ultrasound A", "connector": "Digital",
+                 "pins": "TRIG D24 / ECHO D14", "notes": "Old A"},
+                {"kind": "Sensor", "device": "Ultrasound B", "connector": "Digital",
+                 "pins": "TRIG D20 / ECHO D22", "notes": "Old B"},
+            ]))
+            # Isolate this test to the echo-swap migration.
+            settings.setValue("wiring_guide/encoder_raw2_migrated", True)
+            settings.setValue("wiring_guide/xshut4_migrated", True)
+            settings.setValue("wiring_guide/inductive_d21_migrated", True)
+            settings.setValue("wiring_guide/ultrasound_d24_d14_migrated", True)
+            settings.setValue("wiring_guide/ultrasound_d20_d22_migrated", True)
+            guide = WiringGuide(settings)
+            self.assertEqual(guide.entries[0]["pins"], "TRIG D14 / ECHO D24")
+            self.assertEqual(guide.entries[1]["pins"], "TRIG D22 / ECHO D20")
             guide.close()
 
 
