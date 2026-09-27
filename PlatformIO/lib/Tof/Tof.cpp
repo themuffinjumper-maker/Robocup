@@ -17,6 +17,17 @@ bool sensorTimedOut[TofConfig::MAX_SENSOR_COUNT] = {};
 uint8_t sensorCount = 0;
 bool expanderReady = false;
 
+constexpr uint8_t DEFAULT_SENSOR_ADDRESS = 0x29;
+constexpr uint16_t BOOT_SETTLE_MS = 40;
+
+// Do not call a sensor library's init() until the just-enabled device has
+// actually acknowledged on its factory address.  Besides making failures
+// quick, this avoids a failed XSHUT socket holding up the rest of the I2C bus.
+bool sensorAcknowledgesAtDefaultAddress() {
+  Wire.beginTransmission(DEFAULT_SENSOR_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
+
 // Holds every sensor's XSHUT low so they all boot at the same default I2C
 // address (0x29) without colliding, ready to be brought up one at a time.
 void resetAllSensors() {
@@ -48,12 +59,18 @@ bool Tof::begin(const SensorDefinition* definitions, uint8_t count) {
   }
 
   resetAllSensors();
-  delay(10);
+  delay(BOOT_SETTLE_MS);
   bool allReady = true;
 
   for (uint8_t i = 0; i < sensorCount; ++i) {
     expander.digitalWrite(sensorDefinitions[i].xshutPin, HIGH);
-    delay(10);
+    delay(BOOT_SETTLE_MS);
+
+    if (!sensorAcknowledgesAtDefaultAddress()) {
+      allReady = false;
+      expander.digitalWrite(sensorDefinitions[i].xshutPin, LOW);
+      continue;
+    }
 
     if (sensorDefinitions[i].type == SensorType::Short) {
       shortSensors[i].setTimeout(500);
@@ -91,9 +108,16 @@ bool Tof::retry(uint8_t index) {
   const SensorDefinition& definition = sensorDefinitions[index];
   expander.pinMode(definition.xshutPin, OUTPUT);
   expander.digitalWrite(definition.xshutPin, LOW);
-  delay(5);
-  expander.digitalWrite(definition.xshutPin, HIGH);
   delay(10);
+  expander.digitalWrite(definition.xshutPin, HIGH);
+  delay(BOOT_SETTLE_MS);
+
+  if (!sensorAcknowledgesAtDefaultAddress()) {
+    sensorReady[index] = false;
+    sensorTimedOut[index] = true;
+    expander.digitalWrite(definition.xshutPin, LOW);
+    return false;
+  }
 
   bool ready = false;
   if (definition.type == SensorType::Short) {

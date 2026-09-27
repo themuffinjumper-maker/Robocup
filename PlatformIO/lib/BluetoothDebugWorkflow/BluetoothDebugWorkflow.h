@@ -119,6 +119,8 @@ private:
     uint32_t lastTofRecoverySuccessMs_ = 0;
     uint32_t lastTofRecoveryDurationMs_ = 0;
     uint8_t tofRecoverySensorCursor_ = 0;
+    uint8_t tofRecoveryFailures_[MAX_TOF_SENSORS] = {};
+    uint32_t tofNextRecoveryAttemptMs_[MAX_TOF_SENSORS] = {};
     bool missionTofRecoveryHold_ = false;
     bool tofDegradedLogged_ = false;
     uint8_t missionOuterCueWaypoint_ = 255;
@@ -243,12 +245,19 @@ private:
     uint16_t navigationSideAvoidMm_ = 200;
     uint16_t navigationWallFollowMm_ = 200;
     uint16_t navigationLaneSpacingMm_ = 200;
-    uint16_t navigationRobotWidthMm_ = 430;
+    // Width determines whether a forward gap is passable. Length converts
+    // centre-to-target distance into a range at the forward sensor face.
+    uint16_t navigationRobotWidthMm_ = 290;
+    uint16_t navigationRobotLengthMm_ = 430;
     uint16_t navigationWallClearanceMm_ = 30;
     uint16_t navigationRouteLineToleranceMm_ = 100;
-    uint16_t navigationGapMarginMm_ = 80;
+    uint16_t navigationGapMarginMm_ = 60;
     uint16_t navigationGapDepthMm_ = 550;
     uint16_t navigationWeightSearchRadiusMm_ = 500;
+    uint16_t navigationWeightApproachClearanceMm_ = 180;
+    // Either inward-facing intake TOF may authorise collection by itself.
+    // This keeps the pickup path usable if its opposite sensor is offline.
+    uint16_t navigationWeightInnerLockMm_ = 130;
     uint8_t navigationMatrixFloorRows_ = 2;
     uint8_t navigationMatrixFovDeg_ = 40;
     uint8_t navigationGapConfirmFrames_ = 2;
@@ -386,6 +395,13 @@ private:
     uint8_t missionTopLandmarkMatches_[4] = {};
     int8_t missionTopLandmarkIds_[4] = {-1, -1, -1, -1};
     uint16_t missionTopLandmarkCorrections_ = 0;
+    // A paired inner TOF sighting of the currently planned, uncollected
+    // weight is a precise local landmark.  Corrections are deliberately
+    // rate-limited and bounded so a single bad pair cannot teleport pose.
+    uint32_t missionLastWeightLandmarkCorrectionMs_ = 0;
+    uint16_t missionWeightLandmarkCorrections_ = 0;
+    uint16_t missionWeightLandmarkResidualMm_ = 0;
+    float weightSensorAuthority_ = 0.0f;
     uint8_t missionTopLocationConfirmations_ = 0;
     bool navigationMatrixWallRejectedByTopTof_ = false;
     int16_t missionUltrasoundLateralMm_[2] = {};

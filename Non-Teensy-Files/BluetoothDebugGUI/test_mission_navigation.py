@@ -183,14 +183,14 @@ class MissionUploadTests(unittest.TestCase):
         self.assertEqual(features[:5], [0, 1750, 650, 2400, 0])
         self.assertEqual(features[9], 1)
         self.assertEqual(features[14], 2)
-        self.assertEqual(layout.map_payload()["dummy_extra_mm"], 150)
+        self.assertEqual(layout.map_payload()["dummy_clearance_mm"], 100)
         self.assertTrue(layout.blocked(3150, 1200))
         self.assertFalse(layout.blocked(3300, 1200))
-        layout.dummy_extra_mm = 50
+        layout.dummy_clearance_mm = 50
         self.assertFalse(layout.blocked(3150, 1200))
         restored = MissionLayout()
         restored.load_dict(layout.to_dict())
-        self.assertEqual(restored.dummy_extra_mm, 50)
+        self.assertEqual(restored.dummy_clearance_mm, 50)
 
     def test_weight_route_has_straight_staging_and_run_through(self):
         layout = MissionLayout()

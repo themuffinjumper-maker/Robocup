@@ -2818,7 +2818,7 @@ class ArenaView(QWidget):
         inspector_layout.addWidget(self.mission_cursor_label)
         guide = QLabel(
             "Seven dashed vertical placement lines split the 4.9 m arena into eight equal bays. "
-            "Dummy weights get the normal robot clearance plus the adjustable extra berth. "
+            "Dummy clearance and wall clearance are both measured from the robot edge. "
             "Walls/ramps/tubes use normal robot clearance. "
             "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
         guide.setWordWrap(True)
@@ -3063,8 +3063,21 @@ class ArenaView(QWidget):
         return bool(self.mission_layout.route)
 
     def _build_navigation_tuning_panel(self):
+        # Older GUI builds stored the former (incorrect) 430 mm "width".
+        # Migrate that value once to the measured 290 mm drive width instead
+        # of silently using the old gap geometry forever.
+        if int(self.settings.value("navigation/geometry_schema", 1)) < 2:
+            previous_width = self.settings.value("navigation/robot_width_mm", None)
+            try:
+                previous_width = float(previous_width)
+            except (TypeError, ValueError):
+                previous_width = 430.0
+            if abs(previous_width - 430.0) < 0.5:
+                self.settings.setValue("navigation/robot_width_mm", 290)
+            self.settings.setValue("navigation/robot_length_mm", 430)
+            self.settings.setValue("navigation/geometry_schema", 2)
         self.navigation_tuning_tabs = QTabWidget()
-        self.navigation_tuning_tabs.setMaximumHeight(285)
+        self.navigation_tuning_tabs.setMaximumHeight(325)
         page = QWidget()
         grid = QGridLayout(page)
         self.navigation_strategy = QComboBox()
@@ -3085,12 +3098,14 @@ class ArenaView(QWidget):
             ("side_avoid_mm", "Side clearance", 200, 80, 800),
             ("wall_follow_mm", "Wall-follow distance", 200, 80, 1000),
             ("lane_spacing_mm", "Sweep spacing", 200, 80, 1000),
-            ("robot_width_mm", "Robot width", 430, 100, 1200),
+            ("robot_width_mm", "Robot width (gaps)", 290, 100, 1200),
+            ("robot_length_mm", "Robot length (front ranging)", 430, 100, 1200),
             ("wall_clearance_mm", "Wall clearance (edge)", 30, 0, 300),
             ("route_line_tolerance_mm", "Route line tolerance", 100, 30, 300),
-            ("gap_margin_mm", "Gap safety margin", 80, 0, 500),
+            ("gap_margin_mm", "Extra gap width", 60, 0, 500),
             ("gap_depth_mm", "Open-gap depth", 550, 250, 3000),
             ("weight_search_radius_mm", "Weight search radius", 500, 150, 800),
+            ("weight_approach_clearance_mm", "Weight approach clearance", 180, 70, 600),
             ("matrix_floor_rows", "Ignore bottom 8×8 rows", 2, 0, 4),
             ("matrix_fov_deg", "8×8 horizontal FOV", 40, 20, 90),
             ("gap_confirm_frames", "Gap confirmation frames", 2, 1, 5),
@@ -3109,7 +3124,7 @@ class ArenaView(QWidget):
             self.navigation_tuning_controls[name] = control
         apply_button = QPushButton("APPLY NAVIGATION TUNING")
         apply_button.clicked.connect(self._apply_navigation_tuning)
-        grid.addWidget(apply_button, 6, 0, 1, 6)
+        grid.addWidget(apply_button, 7, 0, 1, 6)
         self.navigation_tuning_tabs.addTab(page, "Navigation tuning")
 
     def _start_run(self):
