@@ -98,6 +98,18 @@ private:
     bool tofAvailable_[MAX_TOF_SENSORS] = {};
     bool tofTimedOut_[MAX_TOF_SENSORS] = {};
     int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
+    uint8_t tofReadyCount_ = 0;
+    uint8_t tofBadPolls_ = 0;
+    uint16_t tofRecoveryAttempts_ = 0;
+    uint32_t lastTofRecoveryAttemptMs_ = 0;
+    uint32_t lastTofRecoverySuccessMs_ = 0;
+    bool missionTofRecoveryHold_ = false;
+    uint8_t missionOuterCueWaypoint_ = 255;
+    uint8_t missionOuterCueTriedMask_ = 0;
+    uint32_t missionOuterCueStartedMs_ = 0;
+    uint32_t missionOuterCueAlignedSinceMs_ = 0;
+    float missionOuterCueHeadingDeg_ = 0.0f;
+    bool missionOuterCueActive_ = false;
     uint32_t lastTof8x8FrameMs_ = 0;
     uint32_t lastTof8x8TransmitMs_ = 0;
     float tof8x8FrameHeadingDeg_ = 0.0f;
@@ -278,6 +290,9 @@ private:
     uint8_t missionInnerAlignFailedWaypoint_ = 255;
     uint32_t missionBlockedSinceMs_ = 0;
     uint32_t missionLastRerouteMs_ = 0;
+    float missionReroutePoseXmm_ = 0.0f;
+    float missionReroutePoseYmm_ = 0.0f;
+    bool missionReroutePoseValid_ = false;
     uint8_t missionRerouteCount_ = 0;
     uint8_t missionSkippedWaypoints_ = 0;
     uint8_t missionSearchWaypoint_ = 255;
@@ -315,6 +330,9 @@ private:
     struct MissionFeature {
         int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         uint8_t kind = 0;
+        bool rotatedWall = false;
+        int16_t wallX = 0, wallY = 0;
+        uint8_t rotationDeg = 0;
     };
     MissionFeature missionFeatures_[MAX_MISSION_FEATURES] = {};
     uint8_t missionFeatureCount_ = 0;
@@ -331,6 +349,14 @@ private:
     bool missionAutoReturnHome_ = false;
     uint32_t missionDockTurnStartedMs_ = 0;
     bool missionDockAligned_ = false;
+    uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, 2..5 shake legs
+    uint32_t missionUnloadPhaseStartedMs_ = 0;
+    int32_t missionUnloadStartEncoder1_ = 0;
+    int32_t missionUnloadStartEncoder2_ = 0;
+    float missionUnloadArenaHeadingDeg_ = 0.0f;
+    float missionUnloadImuHeadingDeg_ = 0.0f;
+    int16_t missionUnloadHomeXmm_ = 0;
+    int16_t missionUnloadHomeYmm_ = 0;
     bool missionHomeValid_ = false;
     int16_t missionHomeXmm_ = 0;
     int16_t missionHomeYmm_ = 0;
@@ -341,6 +367,9 @@ private:
     bool missionWallReverseFailed_ = false;
     bool missionWallReverseNoProgress_ = false;
     uint32_t missionWallReverseStartedMs_ = 0;
+    uint8_t missionWallReverseWaypoint_ = 255;
+    uint8_t missionWallReverseRepeatCount_ = 0;
+    uint32_t missionWallReverseLastStartMs_ = 0;
     int32_t missionWallReverseEncoder1_ = 0;
     int32_t missionWallReverseEncoder2_ = 0;
     uint32_t missionForwardProgressStartedMs_ = 0;
@@ -404,6 +433,7 @@ private:
     void updateMissionPose(uint32_t now);
     void stopNavigation(const char* reason = nullptr);
     void readTofSensors();
+    void recoverTofSensorsIfNeeded();
     void updateWeightDetection();
     void updateTof8x8();
     void sendTof8x8Frame();

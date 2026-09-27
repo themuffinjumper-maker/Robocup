@@ -20,6 +20,11 @@ struct SensorDefinition {
 // marked unavailable rather than halting the rest of the robot firmware.
 bool begin(const SensorDefinition* definitions, uint8_t count);
 
+// Reboot the configured XSHUT bank and reassign each sensor address. Safe to
+// call again after a failed initial begin; configuration is retained.
+bool retry();
+bool expanderAvailable();
+
 uint8_t count();
 int16_t read(uint8_t index);
 bool available(uint8_t index);

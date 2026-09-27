@@ -1163,7 +1163,7 @@ class MissionLayout:
     REFERENCE_LINE_COUNT = 7
 
     DEFAULT_SIZES = {
-        "wall": (700.0, 110.0),
+        "wall": (600.0, 130.0),
         "ramp": (700.0, 380.0),
         "tube": (320.0, 320.0),
     }
@@ -1237,7 +1237,15 @@ class MissionLayout:
     def rotate_item(self, item_id):
         for item in self.obstacles:
             if item["id"] == item_id and item["kind"] in ("wall", "ramp"):
-                item["rotation"] = (int(item.get("rotation", 0)) + 90) % 180
+                item["rotation"] = (float(item.get("rotation", 0)) + 90) % 180
+                self.route = []
+                return True
+        return False
+
+    def set_obstacle_rotation(self, item_id, angle_deg):
+        for item in self.obstacles:
+            if item["id"] == item_id and item["kind"] == "wall":
+                item["rotation"] = float(angle_deg) % 180.0
                 self.route = []
                 return True
         return False
@@ -1246,6 +1254,8 @@ class MissionLayout:
         for item in self.obstacles:
             if item["id"] != item_id:
                 continue
+            if item["kind"] == "wall":
+                return False  # All physical wall pieces are 600 × 130 mm.
             width = max(50.0, min(4000.0, float(width_mm)))
             height = max(50.0, min(2400.0, float(height_mm)))
             item["w"] = width
@@ -1264,12 +1274,19 @@ class MissionLayout:
         x0, y0, x1, y1 = rect
         return x0 <= x <= x1 and y0 <= y <= y1
 
+    def _obstacle_corners(self, item):
+        angle = math.radians(float(item.get("rotation", 0)))
+        cosine, sine = math.cos(angle), math.sin(angle)
+        half_w, half_h = item["w"] / 2, item["h"] / 2
+        return [(item["x"] + dx * cosine - dy * sine,
+                 item["y"] + dx * sine + dy * cosine)
+                for dx, dy in ((-half_w, -half_h), (half_w, -half_h),
+                               (half_w, half_h), (-half_w, half_h))]
+
     def _obstacle_rect(self, item):
-        width, height = item["w"], item["h"]
-        if int(item.get("rotation", 0)) % 180 == 90:
-            width, height = height, width
-        return (item["x"] - width / 2, item["y"] - height / 2,
-                item["x"] + width / 2, item["y"] + height / 2)
+        corners = self._obstacle_corners(item)
+        return (min(x for x, _ in corners), min(y for _, y in corners),
+                max(x for x, _ in corners), max(y for _, y in corners))
 
     def blocked(self, x, y, extra=0.0):
         clearance = self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM + extra
@@ -1284,9 +1301,14 @@ class MissionLayout:
                 radius = item["w"] / 2 + clearance
                 if math.hypot(x - item["x"], y - item["y"]) <= radius:
                     return True
-            elif self._inside_rect(x, y, self._inflate_rect(
-                    self._obstacle_rect(item), clearance)):
-                return True
+            else:
+                angle = math.radians(float(item.get("rotation", 0)))
+                dx, dy = x - item["x"], y - item["y"]
+                local_x = dx * math.cos(angle) + dy * math.sin(angle)
+                local_y = -dx * math.sin(angle) + dy * math.cos(angle)
+                if abs(local_x) <= item["w"] / 2 + clearance and \
+                        abs(local_y) <= item["h"] / 2 + clearance:
+                    return True
         for item in self.weights:
             if not item["dummy"]:
                 continue
@@ -1359,6 +1381,12 @@ class MissionLayout:
                     continue
                 if self.blocked(x, y):
                     continue
+                # A diagonal step can cut through an inflated rectangle even
+                # when both grid endpoints are free. Never hand that corner
+                # cut to the robot as a supposedly clear travel segment.
+                if not self._segment_clear(
+                        (current[0] * spacing, current[1] * spacing), (x, y)):
+                    continue
                 tentative = g_score[current] + cost
                 if tentative >= g_score.get(nxt, float("inf")):
                     continue
@@ -1377,7 +1405,7 @@ class MissionLayout:
             path[0] = (float(start[0]), float(start[1]))
         if self._segment_clear(path[-1], goal):
             path[-1] = (float(goal[0]), float(goal[1]))
-        return self._round_clear_corners(self._smooth(path))
+        return self._smooth(path)
 
     def _smooth(self, path):
         if not path:
@@ -1394,48 +1422,33 @@ class MissionLayout:
             anchor = furthest
         return result
 
-    def _round_clear_corners(self, path):
-        """Round A* corners only where the whole replacement remains map-clear.
-
-        The weight-collection approach is appended by ``plan`` afterwards,
-        so its final straight bearing is deliberately unaffected.
-        """
-        if len(path) < 3:
-            return path
-        result = [path[0]]
-        for previous, corner, following in zip(path, path[1:], path[2:]):
-            incoming = (corner[0] - previous[0], corner[1] - previous[1])
-            outgoing = (following[0] - corner[0], following[1] - corner[1])
-            first_length = math.hypot(*incoming)
-            second_length = math.hypot(*outgoing)
-            if min(first_length, second_length) < 180.0:
-                result.append(corner)
-                continue
-            cosine = (incoming[0] * outgoing[0] +
-                      incoming[1] * outgoing[1]) / (first_length * second_length)
-            if cosine > 0.94:
-                result.append(corner)
-                continue
-            trim = min(180.0, first_length * 0.3, second_length * 0.3)
-            entry = (corner[0] - trim * incoming[0] / first_length,
-                     corner[1] - trim * incoming[1] / first_length)
-            exit = (corner[0] + trim * outgoing[0] / second_length,
-                    corner[1] + trim * outgoing[1] / second_length)
-            midpoint = ((entry[0] + 2.0 * corner[0] + exit[0]) / 4.0,
-                        (entry[1] + 2.0 * corner[1] + exit[1]) / 4.0)
-            replacement = [result[-1], entry, midpoint, exit, following]
-            if all(self._segment_clear(a, b) for a, b in
-                   zip(replacement, replacement[1:])):
-                result.extend((entry, midpoint, exit))
-            else:
-                result.append(corner)
-        result.append(path[-1])
-        return result
-
     @staticmethod
     def _path_length(path):
         return sum(math.hypot(b[0] - a[0], b[1] - a[1])
                    for a, b in zip(path, path[1:]))
+
+    def _travel_path(self, start, goal):
+        """Prefer room for an arc, falling back to the normal safe corridor."""
+        base_margin = self.SAFETY_MARGIN_MM
+        try:
+            for extra in (100.0, 60.0, 0.0):
+                self.SAFETY_MARGIN_MM = base_margin + extra
+                path = self._astar(start, goal)
+                self.SAFETY_MARGIN_MM = base_margin
+                if not path:
+                    continue
+                if not self._segment_clear(start, path[0]) or \
+                        not self._segment_clear(path[-1], goal):
+                    continue
+                if math.dist(start, path[0]) > 1.0:
+                    path.insert(0, (float(start[0]), float(start[1])))
+                if math.dist(path[-1], goal) > 1.0:
+                    path.append((float(goal[0]), float(goal[1])))
+                if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])):
+                    return path
+        finally:
+            self.SAFETY_MARGIN_MM = base_margin
+        return None
 
     def docking_path(self, start, home):
         """Route to a clear turning point, then a straight reversing corridor."""
@@ -1446,10 +1459,25 @@ class MissionLayout:
                 stage = (home[0] + inward * distance, home[1] + offset)
                 if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
                     continue
-                path = self._astar(start, stage)
+                path = self._travel_path(start, stage)
                 if path and len(path) >= 2:
                     candidates.append((self._path_length(path) + distance * 0.15,
                                        path, stage))
+        if not candidates:
+            # A wall can block every horizontal approach to home while a
+            # diagonal reverse corridor remains clear. The firmware searches
+            # these same radial candidates when returning automatically.
+            for distance in (750, 950, 1150, 1350, 1550, 1750):
+                for degrees in (20, -20, 35, -35, 50, -50, 65, -65, 80, -80):
+                    angle = math.radians(degrees)
+                    stage = (home[0] + inward * distance * math.cos(angle),
+                             home[1] + distance * math.sin(angle))
+                    if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
+                        continue
+                    path = self._travel_path(start, stage)
+                    if path and len(path) >= 2:
+                        candidates.append((self._path_length(path) + distance * 0.15,
+                                           path, stage))
         if not candidates:
             return None
         _score, path, stage = min(candidates, key=lambda item: item[0])
@@ -1471,6 +1499,7 @@ class MissionLayout:
         while remaining:
             options = []
             for item in remaining:
+                weight_options = []
                 weight = (item["x"], item["y"])
                 visit = weight
                 if self.blocked(*visit):
@@ -1505,7 +1534,7 @@ class MissionLayout:
                             break
                     if clear_behind < 200:
                         continue
-                    path = self._astar(current, stage)
+                    path = self._travel_path(current, stage)
                     if path:
                         # Do not take a shortcut *through* the weight on the
                         # way to the staging point; that defeats the chosen
@@ -1527,14 +1556,26 @@ class MissionLayout:
                         if crosses_weight:
                             continue
                         length = self._path_length(path) + 350.0
-                        options.append((length - 0.7 * clear_behind,
-                                        length, item, path, visit))
+                        # Clearance beyond the weight matters more than a
+                        # short trip to staging: the robot must drive right
+                        # through the object without meeting a wall behind it.
+                        weight_options.append((clear_behind, length, item,
+                                               path, visit))
+                if weight_options:
+                    # Choose the side with the longest clear collection leg
+                    # for this weight before comparing travel to other sites.
+                    # Otherwise a short path can point the intake at a wall.
+                    best_clearance = max(option[0] for option in weight_options)
+                    options.extend((length, item, path, visit)
+                                   for clearance, length, item, path, visit
+                                   in weight_options
+                                   if clearance == best_clearance)
             if not options:
                 self.route_error = (
                     "No clear straight approach and collection run-through "
                     "for at least one weight.")
                 return False
-            _score, _length, chosen, path, visit = min(
+            _length, chosen, path, visit = min(
                 options, key=lambda value: value[0])
             for point in path[1:]:
                 route.append({"x": point[0], "y": point[1], "target": False})
@@ -1574,8 +1615,13 @@ class MissionLayout:
         # walls/ramps/tubes/dummy weights are physical ranging landmarks.
         features = []
         rectangles = [(self.no_go_home(), 0)]
-        rectangles.extend((self._obstacle_rect(item), 1)
-                          for item in self.obstacles)
+        rotated_walls = []
+        for item in self.obstacles:
+            if item["kind"] == "wall":
+                rotated_walls.extend([len(rectangles), int(round(item["x"])),
+                                      int(round(item["y"])),
+                                      int(round(float(item.get("rotation", 0)))) % 180])
+            rectangles.append((self._obstacle_rect(item), 1))
         rectangles.extend(((item["x"] - 120, item["y"] - 120,
                             item["x"] + 120, item["y"] + 120), 2)
                           for item in self.weights if item["dummy"])
@@ -1584,7 +1630,7 @@ class MissionLayout:
             features.extend([max(0, int(round(x0))), max(0, int(round(y0))),
                              min(4900, int(round(x1))), min(2400, int(round(y1))),
                              kind])
-        return {"features": features,
+        return {"features": features, "rotated_walls": rotated_walls,
                 "dummy_extra_mm": int(round(self.dummy_extra_mm))}
 
     def to_dict(self):
@@ -1614,6 +1660,10 @@ class MissionLayout:
         }
         self.weights = [dict(item) for item in data.get("weights", []) if isinstance(item, dict)]
         self.obstacles = [dict(item) for item in data.get("obstacles", []) if isinstance(item, dict)]
+        for item in self.obstacles:
+            if item.get("kind") == "wall":
+                item["w"], item["h"] = self.DEFAULT_SIZES["wall"]
+                item["rotation"] = float(item.get("rotation", 0)) % 180.0
         self._next_id = max(int(data.get("next_id", 1)),
                             1 + max([0] + [int(item.get("id", 0)) for item in self.weights + self.obstacles]))
         self.route = []
@@ -1932,8 +1982,8 @@ class MissionLayoutCanvas(QWidget):
                 radius = item["w"] / 2 * scale
                 p.drawEllipse(self._screen(item["x"], item["y"]), radius, radius)
             else:
-                x0, y0, x1, y1 = model._obstacle_rect(item)
-                p.drawRect(rect_world((x0, y0, x1, y1)))
+                p.drawPolygon(QPolygonF([self._screen(x, y)
+                                         for x, y in model._obstacle_corners(item)]))
             centre = self._screen(item["x"], item["y"])
             p.setPen(QColor("#111827"))
             size_text = (f"Ø{item['w']:.0f}" if item["kind"] == "tube" else
@@ -2443,6 +2493,8 @@ class ArenaView(QWidget):
             self.return_home_button = QPushButton("RETURN HOME")
             self.run_motors_button = QPushButton("RUN MOTORS")
             self.stop_motors_button = QPushButton("STOP MOTORS")
+            self.open_gate_button = QPushButton("OPEN GATE")
+            self.close_gate_button = QPushButton("CLOSE GATE")
             for button in (self.run_navigation_button, self.run_motors_button):
                 button.setStyleSheet(
                     "QPushButton { background: #15803d; color: white; "
@@ -2466,12 +2518,20 @@ class ArenaView(QWidget):
             self.stop_motors_button.clicked.connect(
                 self._stop_motors
             )
+            self.open_gate_button.clicked.connect(
+                lambda: self.command_requested.emit("storage_release_gate", {"open": True})
+            )
+            self.close_gate_button.clicked.connect(
+                lambda: self.command_requested.emit("storage_release_gate", {"open": False})
+            )
             controls.addWidget(self.run_navigation_button)
             controls.addWidget(self.stop_navigation_button)
             controls.addWidget(self.return_home_button)
             controls.addSpacing(16)
             controls.addWidget(self.run_motors_button)
             controls.addWidget(self.stop_motors_button)
+            controls.addWidget(self.open_gate_button)
+            controls.addWidget(self.close_gate_button)
             controls.addStretch()
             left_layout.addLayout(controls)
         self.mission_phase_label = QLabel("NAVIGATION STATE: waiting for robot telemetry")
@@ -2701,7 +2761,7 @@ class ArenaView(QWidget):
         inspector_layout = QVBoxLayout(inspector)
         inspector_layout.setContentsMargins(4, 4, 4, 4)
 
-        selection_group = QGroupBox("Selected obstacle dimensions")
+        selection_group = QGroupBox("Selected obstacle geometry")
         selection_form = QFormLayout(selection_group)
         self.mission_selected_label = QLabel("START")
         selection_form.addRow("Selected", self.mission_selected_label)
@@ -2719,6 +2779,13 @@ class ArenaView(QWidget):
             self._mission_obstacle_dimension_changed)
         selection_form.addRow("Length / diameter", self.mission_obstacle_width)
         selection_form.addRow("Thickness / depth", self.mission_obstacle_height)
+        self.mission_obstacle_angle = QDoubleSpinBox()
+        self.mission_obstacle_angle.setRange(0, 179)
+        self.mission_obstacle_angle.setDecimals(0)
+        self.mission_obstacle_angle.setSuffix("°")
+        self.mission_obstacle_angle.valueChanged.connect(
+            self._mission_obstacle_angle_changed)
+        selection_form.addRow("Wall angle", self.mission_obstacle_angle)
         self.mission_dummy_extra = QDoubleSpinBox()
         self.mission_dummy_extra.setRange(0, 500)
         self.mission_dummy_extra.setDecimals(0)
@@ -2804,6 +2871,7 @@ class ArenaView(QWidget):
              if item.get("id") == ident), None)
         self.mission_obstacle_width.blockSignals(True)
         self.mission_obstacle_height.blockSignals(True)
+        self.mission_obstacle_angle.blockSignals(True)
         try:
             if obstacle is None:
                 if ident == "start":
@@ -2817,18 +2885,31 @@ class ArenaView(QWidget):
                 self.mission_selected_label.setText(label)
                 self.mission_obstacle_width.setEnabled(False)
                 self.mission_obstacle_height.setEnabled(False)
+                self.mission_obstacle_angle.setEnabled(False)
                 return
             self.mission_selected_label.setText(
                 f"{obstacle['kind'].upper()} #{obstacle['id']}")
-            self.mission_obstacle_width.setEnabled(True)
+            is_wall = obstacle.get("kind") == "wall"
+            self.mission_obstacle_width.setEnabled(not is_wall)
             self.mission_obstacle_width.setValue(float(obstacle.get("w", 100.0)))
             is_tube = obstacle.get("kind") == "tube"
-            self.mission_obstacle_height.setEnabled(not is_tube)
+            self.mission_obstacle_height.setEnabled(not is_tube and not is_wall)
             self.mission_obstacle_height.setValue(
                 float(obstacle.get("h", obstacle.get("w", 100.0))))
+            self.mission_obstacle_angle.setEnabled(is_wall)
+            self.mission_obstacle_angle.setValue(float(obstacle.get("rotation", 0)))
         finally:
             self.mission_obstacle_width.blockSignals(False)
             self.mission_obstacle_height.blockSignals(False)
+            self.mission_obstacle_angle.blockSignals(False)
+
+    def _mission_obstacle_angle_changed(self, value):
+        if not hasattr(self, "mission_canvas"):
+            return
+        if self.mission_layout.set_obstacle_rotation(
+                self.mission_canvas.selected_id, value):
+            self._mission_layout_changed()
+            self.mission_canvas.update()
 
     def _mission_obstacle_dimension_changed(self, _value=None):
         if not hasattr(self, "mission_canvas"):
@@ -3685,12 +3766,23 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 14):
+        if ("system.uptime_s" in m.latest and controller_version != 21):
             firmware_warning += (
-                "Navigation controller v14 is not running; upload the current clean build. "
+                "Navigation controller v21 is not running; upload the current clean build. "
             )
-        online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
+        online = sum(m.latest.get(f"tof.{spec['name']}.available") is True and
+                     m.latest.get(f"tof.{spec['name']}.timed_out") is not True
                      for spec in m.sensor_specs)
+        point_tof_warning = ""
+        if "system.uptime_s" in m.latest and online < len(m.sensor_specs):
+            attempts = int(_number(m.latest.get("tof.recovery_attempts")) or 0)
+            expander = m.latest.get("tof.expander_available")
+            cause = ("I2C0 expander is not responding. " if expander is False
+                     else "Automatic XSHUT-bank reset is retrying. ")
+            point_tof_warning = (
+                f"POINT TOFS OFFLINE ({online}/{len(m.sensor_specs)}): {cause}"
+                f"Recovery attempts: {attempts}. Weight centring is unavailable. "
+            )
         ultrasound_valid = sum(
             m.latest.get(f"ultrasound.{spec['telemetry_name']}.valid") is True
             for spec in m.ultrasound_specs
@@ -3711,6 +3803,8 @@ class ArenaView(QWidget):
             "searching_weight": "SEARCHING WEIGHT SITE",
             "aligning_to_weight": "CENTERING ON WEIGHT",
             "centering_weight": "CENTERING WITH INNER TOFS",
+            "checking_outer_weight_cue": "TURNING TO VERIFY OUTER WEIGHT CUE",
+            "waiting_for_point_tofs": "WAITING FOR POINT TOF RECOVERY",
             "collecting_weight": "DRIVING THROUGH WEIGHT",
             "checking_pickup": "WAITING FOR PICKUP CONFIRMATION",
             "reversing_for_weight_retry": "REVERSING FOR WEIGHT RETRY",
@@ -3719,6 +3813,7 @@ class ArenaView(QWidget):
             "blocked": "PATH BLOCKED",
             "returning_home": "RETURNING HOME",
             "backing_into_home": "BACKING INTO HOME",
+            "unloading_at_home": "UNLOADING AT HOME",
         }
         phase = m.latest.get("mission.phase")
         if phase is None:
@@ -3755,11 +3850,11 @@ class ArenaView(QWidget):
             self.mission_status.setText(
                 f"{progress}waypoint "
                 f"{waypoint + 1 if waypoint < waypoint_count else waypoint_count}/{waypoint_count}. "
-                f"{movement}Map reroutes: {reroutes}; skipped invalid corners: {skipped}. "
+                f"{movement}Map reroutes: {reroutes}; passed/skipped route points: {skipped}. "
                 f"Landmark trim/recovery: {corrections}/{recoveries}."
             )
         self.status.setText(
-            f"{firmware_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "
+            f"{firmware_warning}{point_tof_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "
             f"Travel: {m.distance_travelled_mm:.0f} mm; speed: {m.linear_speed_mm_s:.0f} mm/s. "
             f"IMU fusion {'running' if m.last_imu_fusion_running is True else 'not ready'}; "
             f"system calibration {calibration}/3; status/error "

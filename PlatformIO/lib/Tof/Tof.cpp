@@ -14,6 +14,7 @@ VL53L1X longSensors[TofConfig::MAX_SENSOR_COUNT];
 Tof::SensorDefinition sensorDefinitions[TofConfig::MAX_SENSOR_COUNT] = {};
 bool sensorReady[TofConfig::MAX_SENSOR_COUNT] = {};
 uint8_t sensorCount = 0;
+bool expanderReady = false;
 
 // Holds every sensor's XSHUT low so they all boot at the same default I2C
 // address (0x29) without colliding, ready to be brought up one at a time.
@@ -31,10 +32,14 @@ void resetAllSensors() {
 bool Tof::begin(const SensorDefinition* definitions, uint8_t count) {
   sensorCount = count > TofConfig::MAX_SENSOR_COUNT ? TofConfig::MAX_SENSOR_COUNT : count;
   for (uint8_t i = 0; i < TofConfig::MAX_SENSOR_COUNT; ++i) sensorReady[i] = false;
+  // Keep definitions even if the expander is absent on this attempt, so a
+  // later retry can recover without rebuilding the JSON configuration.
+  for (uint8_t i = 0; i < sensorCount; ++i) sensorDefinitions[i] = definitions[i];
 
   Wire.begin();
   Wire.setClock(400000);
-  if (!expander.begin(TofConfig::EXPANDER_I2C_ADDRESS)) {
+  expanderReady = expander.begin(TofConfig::EXPANDER_I2C_ADDRESS);
+  if (!expanderReady) {
     return false;
   }
 
@@ -43,7 +48,6 @@ bool Tof::begin(const SensorDefinition* definitions, uint8_t count) {
   bool allReady = true;
 
   for (uint8_t i = 0; i < sensorCount; ++i) {
-    sensorDefinitions[i] = definitions[i];
     expander.digitalWrite(sensorDefinitions[i].xshutPin, HIGH);
     delay(10);
 
@@ -70,6 +74,14 @@ bool Tof::begin(const SensorDefinition* definitions, uint8_t count) {
   }
 
   return allReady;
+}
+
+bool Tof::retry() {
+  return begin(sensorDefinitions, sensorCount);
+}
+
+bool Tof::expanderAvailable() {
+  return expanderReady;
 }
 
 // Latest continuous-mode reading, mm.

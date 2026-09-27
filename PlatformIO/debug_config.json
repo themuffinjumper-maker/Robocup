@@ -258,6 +258,19 @@
       "args": []
     },
     {
+      "name": "storage_release_gate",
+      "label": "Storage release gate",
+      "category": "HX12K",
+      "description": "HX12K B (D32): closed during navigation at 50°, open at home at 10°. Manual buttons work while navigation is stopped.",
+      "action": "hx12k_storage_gate",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "OPEN GATE", "arguments": {"open": true}},
+        {"label": "CLOSE GATE", "arguments": {"open": false}}
+      ]
+    },
+    {
       "name": "set_bumper_servos",
       "label": "Bumper servos",
       "category": "HX12K",

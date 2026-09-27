@@ -10,6 +10,8 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
 from ArenaView import ArenaView, MissionLayout
+from DebugGUI import CommandWidget
+from PyQt6.QtWidgets import QPushButton
 
 
 class MissionUploadTests(unittest.TestCase):
@@ -25,13 +27,119 @@ class MissionUploadTests(unittest.TestCase):
             for phase, expected in (
                 ("following_route", "FOLLOWING PATH"),
                 ("aligning_to_weight", "CENTERING ON WEIGHT"),
+                ("checking_outer_weight_cue", "TURNING TO VERIFY OUTER WEIGHT CUE"),
+                ("waiting_for_point_tofs", "WAITING FOR POINT TOF RECOVERY"),
                 ("reversing_for_weight_retry", "REVERSING FOR WEIGHT RETRY"),
+                ("unloading_at_home", "UNLOADING AT HOME"),
             ):
                 view.model.latest.update({"mission.active": True,
                                           "mission.phase": phase})
                 view._refresh_status()
                 self.assertIn(expected, view.mission_phase_label.text())
             view.close()
+
+    def test_point_tof_bank_failure_is_visible_on_arena(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.model.latest.update({
+                "system.uptime_s": 30.0,
+                "system.navigation_controller_version": 21,
+                "tof.expander_available": False,
+                "tof.recovery_attempts": 2,
+            })
+            view._refresh_status()
+            self.assertIn("POINT TOFS OFFLINE", view.status.text())
+            self.assertIn("I2C0 expander", view.status.text())
+            self.assertIn("Recovery attempts: 2", view.status.text())
+            view.close()
+
+    def test_arena_gate_buttons_send_open_and_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            sent = []
+            view.command_requested.connect(lambda name, data: sent.append((name, data)))
+            view.open_gate_button.click()
+            view.close_gate_button.click()
+            self.assertEqual(sent, [
+                ("storage_release_gate", {"open": True}),
+                ("storage_release_gate", {"open": False}),
+            ])
+            view.close()
+
+    def test_gate_command_card_has_open_and_close(self):
+        config = (Path(__file__).resolve().parents[2] / "PlatformIO" /
+                  "debug_config.json")
+        commands = json.loads(config.read_text(encoding="utf-8"))["commands"]
+        definition = next(item for item in commands
+                          if item["name"] == "storage_release_gate")
+        sent = []
+        widget = CommandWidget(definition,
+                               lambda name, args: sent.append((name, args)))
+        buttons = {button.text(): button for button in widget.findChildren(QPushButton)}
+        buttons["OPEN GATE"].click()
+        buttons["CLOSE GATE"].click()
+        self.assertEqual(sent, [
+            ("storage_release_gate", {"open": True}),
+            ("storage_release_gate", {"open": False}),
+        ])
+        widget.close()
+
+    def test_rotated_wall_geometry_is_saved_and_uploaded(self):
+        layout = MissionLayout()
+        wall = layout.add_obstacle("wall", 2200, 1100)
+        self.assertEqual((wall["w"], wall["h"]), (600, 130))
+        self.assertTrue(layout.set_obstacle_rotation(wall["id"], 35))
+        self.assertTrue(layout.blocked(2200, 1100))
+        self.assertFalse(layout.blocked(3000, 1100))
+        payload = layout.map_payload()
+        self.assertEqual(payload["rotated_walls"], [1, 2200, 1100, 35])
+        saved = layout.to_dict()
+        restored = MissionLayout()
+        restored.load_dict(saved)
+        self.assertEqual(restored.obstacles[0]["rotation"], 35)
+        self.assertEqual(restored.map_payload(), payload)
+        route = layout._astar((1000, 1100), (3400, 1100))
+        self.assertIsNotNone(route)
+        self.assertTrue(all(layout._segment_clear(a, b)
+                            for a, b in zip(route, route[1:])))
+
+    def test_recorded_wall_gap_has_clear_leg_after_missed_transit_point(self):
+        # Geometry and poses from the 27 Sep 14:10 run: the robot was near
+        # (1066,1261), still chasing (800,1400) after passing it, although
+        # the next leg to (1600,1000) went through the wall gap.
+        layout = MissionLayout()
+        layout.my_home = "blue"
+        for x, y in ((1207, 311), (1204, 2089)):
+            wall = layout.add_obstacle("wall", x, y)
+            layout.set_obstacle_rotation(wall["id"], 90)
+        current = (800, 1400)
+        following = (1600, 1000)
+        pose = (1066, 1261)
+        length = math.dist(current, following)
+        along = sum((pose[i] - current[i]) * (following[i] - current[i])
+                    for i in (0, 1)) / length
+        lateral = abs((pose[0] - current[0]) * (following[1] - current[1]) -
+                      (pose[1] - current[1]) * (following[0] - current[0])) / length
+        self.assertGreater(along, 130)
+        self.assertLess(lateral, 240)
+        self.assertTrue(layout._segment_clear(pose, following))
+
+    def test_recorded_home_layout_has_diagonal_docking_corridor(self):
+        # The 15:21 run had a confirmed pickup but stopped because every
+        # horizontal home corridor crossed this upper wall's inflated shape.
+        layout = MissionLayout()
+        for x, y in ((1207, 311), (1204, 2089)):
+            wall = layout.add_obstacle("wall", x, y)
+            layout.set_obstacle_rotation(wall["id"], 90)
+        route = layout.docking_path((2408, 1491), (325, 325))
+        self.assertIsNotNone(route)
+        self.assertTrue(all(layout._segment_clear(a, b)
+                            for a, b in zip(route, route[1:])))
+        self.assertGreater(route[-2][1], 800)
 
     def test_sensed_weight_marker_persists_after_detection_clears(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +202,24 @@ class MissionUploadTests(unittest.TestCase):
                target["y"] + 200 * dy / distance)
         self.assertTrue(layout._segment_clear(
             (target["x"], target["y"]), end))
+
+    def test_weight_approach_prefers_clear_side_over_short_side(self):
+        layout = MissionLayout()
+        layout.start.update(x=1700.0, y=1200.0)
+        layout.add_weight(2200, 1200)
+        # The direct approach from the start points through the weight at a
+        # nearby wall. The opposite/side approach has room for collection.
+        layout.add_obstacle("wall", 3000, 1200)
+        self.assertTrue(layout.plan(), layout.route_error)
+        stage, target = layout.route[-2:]
+        dx = target["x"] - stage["x"]
+        dy = target["y"] - stage["y"]
+        distance = math.hypot(dx, dy)
+        self.assertGreaterEqual(distance, 300)
+        self.assertTrue(layout._segment_clear(
+            (target["x"], target["y"]),
+            (target["x"] + 500 * dx / distance,
+             target["y"] + 500 * dy / distance)))
 
     def test_run_uploads_map_then_route_then_start(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +310,7 @@ class MissionUploadTests(unittest.TestCase):
             self.assertEqual(sent[-1], ("stop", {}))
             view.close()
 
-    def test_curved_travel_legs_remain_collision_free(self):
+    def test_travel_legs_remain_collision_free(self):
         layout = MissionLayout()
         layout.add_obstacle("wall", 2450, 1200)
         path = layout._astar((900, 1200), (4000, 1200))
@@ -192,6 +318,26 @@ class MissionUploadTests(unittest.TestCase):
         self.assertGreaterEqual(len(path), 3)
         for first, second in zip(path, path[1:]):
             self.assertTrue(layout._segment_clear(first, second))
+
+    def test_realistic_mission_route_cannot_cut_diagonal_wall_corners(self):
+        layout = MissionLayout()
+        layout.SAFETY_MARGIN_MM = 40
+        layout.start.update(x=288, y=328, heading_deg=0)
+        layout.add_obstacle("wall", 933, 729)
+        layout.add_obstacle("wall", 318, 723)
+        layout.add_obstacle("tube", 1835, 1574)
+        layout.add_weight(1851, 1167, dummy=True)
+        layout.add_weight(1827, 1996)
+        layout.add_weight(624, 1184)
+        self.assertTrue(layout.plan(), layout.route_error)
+        positions = [(layout.start["x"], layout.start["y"])] + [
+            (point["x"], point["y"]) for point in layout.route]
+        self.assertTrue(all(layout._segment_clear(a, b)
+                            for a, b in zip(positions, positions[1:])))
+        command = json.dumps({"type": "command", "command": "mission_plan_set",
+                              **layout.command_payload()},
+                             separators=(",", ":")).encode("utf-8")
+        self.assertLess(len(command), 760)
 
     def test_return_home_can_use_marked_actual_position_when_odometry_drifted(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -178,6 +178,11 @@ example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
 - `hx12k_bumpers`: moves the paired bumper outputs together. `enabled=true`
   commands C=0 degrees and D=130 degrees; `enabled=false` commands C=130
   degrees and D=0 degrees. It requires Debug Mode and Run state.
+- `hx12k_storage_gate`: dedicated storage-release gate on HX12K B/D32.
+  `open=true` commands 10 degrees; `open=false` commands 50 degrees.
+  The paired GUI buttons require Debug Mode, Run state, and stopped navigation.
+  Navigation owns this output while active: it closes at departure, opens at
+  home for the bounded unload shake, and recloses before any resumed exploration.
 - `tof_read_all`: immediately reads every configured TOF sensor. All sensors
   are also read automatically with normal telemetry packets.
 
