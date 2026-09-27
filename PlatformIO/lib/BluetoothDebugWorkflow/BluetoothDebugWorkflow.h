@@ -71,6 +71,7 @@ private:
     uint16_t missionHandledSortingSerial_ = 0;
     uint8_t missionPendingPickupWaypoint_ = 255;
     uint32_t missionPendingPickupSinceMs_ = 0;
+    bool missionPendingPickupWasIncomplete_ = false;
     uint32_t missionPostPickupStraightUntilMs_ = 0;
     float missionPostPickupHeadingDeg_ = 0.0f;
     bool sortingIdlePulseActive_ = false;
@@ -89,6 +90,17 @@ private:
     uint32_t telemetryIntervalMs_ = 200;
     uint32_t lastTelemetryMs_ = 0;
     uint32_t lastElectricalDiagnosticsMs_ = 0;
+    uint32_t lastCurrentSampleMs_ = 0;
+    uint16_t currentSensorRawAdc_ = 0;
+    uint16_t currentSensorAdc1FirstRaw_ = 0;
+    uint16_t currentSensorAdc1RepeatRaw_ = 0;
+    uint16_t currentSensorAdc2Raw_ = 0;
+    bool currentSensorAdc2Valid_ = false;
+    uint32_t lastCurrentAdcCompareMs_ = 0;
+    float currentSensorFilteredVolts_ = 0.0f;
+    bool currentSensorSampleValid_ = false;
+    // ACS712-30A at 5 V: 2.5 V zero and 66 mV/A; 12k/12k halves both.
+    float currentSensorZeroVolts_ = 1.25f;
     uint32_t lastDefinitionsMs_ = 0;
     uint32_t receivedMessages_ = 0;
     uint32_t lastUpdateStartedUs_ = 0;
@@ -106,10 +118,17 @@ private:
     bool missionTofRecoveryHold_ = false;
     uint8_t missionOuterCueWaypoint_ = 255;
     uint8_t missionOuterCueTriedMask_ = 0;
+    uint8_t missionOuterReverseTriedMask_ = 0;
     uint32_t missionOuterCueStartedMs_ = 0;
     uint32_t missionOuterCueAlignedSinceMs_ = 0;
     float missionOuterCueHeadingDeg_ = 0.0f;
+    float missionOuterCueHitXmm_ = 0.0f;
+    float missionOuterCueHitYmm_ = 0.0f;
     bool missionOuterCueActive_ = false;
+    bool missionOuterReverseActive_ = false;
+    uint32_t missionOuterReverseStartedMs_ = 0;
+    int32_t missionOuterReverseEncoder1_ = 0;
+    int32_t missionOuterReverseEncoder2_ = 0;
     uint32_t lastTof8x8FrameMs_ = 0;
     uint32_t lastTof8x8TransmitMs_ = 0;
     float tof8x8FrameHeadingDeg_ = 0.0f;
@@ -250,6 +269,11 @@ private:
     float missionStartYmm_ = 0.0f;
     float missionStartArenaHeadingDeg_ = 0.0f;
     float missionStartImuHeadingDeg_ = 0.0f;
+    uint8_t missionLaunchPhase_ = 0;  // 1 = align in home, 2 = straight exit
+    uint32_t missionLaunchStartedMs_ = 0;
+    int32_t missionLaunchEncoder1_ = 0;
+    int32_t missionLaunchEncoder2_ = 0;
+    bool missionLaunchBlocked_ = false;
     float missionPoseXmm_ = 0.0f;
     float missionPoseYmm_ = 0.0f;
     float missionArenaHeadingDeg_ = 0.0f;
@@ -287,7 +311,6 @@ private:
     uint16_t missionWeightVectorOvershootMm_ = 0;
     bool missionInnerWeightLocked_ = false;
     uint32_t missionInnerAlignStartedMs_ = 0;
-    uint8_t missionInnerAlignFailedWaypoint_ = 255;
     uint32_t missionBlockedSinceMs_ = 0;
     uint32_t missionLastRerouteMs_ = 0;
     float missionReroutePoseXmm_ = 0.0f;

@@ -6120,3 +6120,272 @@ Not verified here:
   shake were left unchanged. PlatformIO Teensy 4.0 build succeeded and
   all 20 focused mission GUI tests passed. The firmware was not uploaded
   and this speed transition has not yet been tested on the moving robot.
+
+2026-09-27 — Weight alignment review and collection change (firmware v21)
+- Reviewed the two latest recordings, 15:52:01 and 15:54:00. The first
+  searched the weight site without a collection vector. In the second, an
+  outer TOF supplied directional cues, then a lone right-inner return
+  briefly read 85 mm and started a collection vector. The left-inner TOF
+  did not corroborate it; inner_locked stayed false. Its projected hit
+  was roughly 165 mm from the uploaded weight site, and pickup was not
+  independently confirmed before the retry/search sequence.
+- The installed inner sensors physically point inward at about 40 degrees.
+  Their saved Arena View angle signs and the existing Teensy sensor-origin
+  polarity were preserved. A proposed change to that polarity was reverted
+  before handoff. Outer and lone inner detections now give directional
+  cues, not unrestricted straight-through collection commands. A fused
+  inner pair may lock the centre and collect. A lone inner reading may
+  still start a collection vector only if its projected hit agrees within
+  70 mm of the uploaded site and is 250-600 mm ahead, leaving room to align.
+- For paired-inner centred collection, the preferred clear-space overshoot
+  rose from 180 to 240 mm, and the guarded slow follow-through from 2.0 to
+  2.5 seconds. Frontal and mapped-clearance checks still apply. The return
+  home sequence was not changed. Teensy 4.0 firmware compiles and the 20
+  focused navigation GUI tests pass. Firmware has not been uploaded or
+  validated on the moving robot.
+
+2026-09-27 — Review of 16:08:51 run and delayed pickup (firmware v22)
+- The latest recording used controller v21 and reached the only mapped
+  weight site. It never formed a confirmed inner-pair lock or collection
+  vector. It performed the site search from about 37 to 51 s, then started
+  home. The inductor confirmed a weight at about 57 s, six seconds later.
+  The prior controller logged that as a pickup without a matching site,
+  because it retained pending-site credit only after an incomplete search.
+  This is strong evidence the weight reached the intake during the search;
+  the recording alone does not prove exactly when it entered the mechanism.
+- Every unverified site search now retains a 30 s pending pickup attribution,
+  including a complete visual sweep. A delayed inductor event credits that
+  earlier site rather than the next waypoint or home. The incomplete-site
+  counter is reduced only when that specific pending site was incomplete.
+  A delayed confirmation while returning home does not command the usual
+  extra 95% straight pickup motion, which could divert the dock route.
+  Pending waypoint index is published in mission telemetry (255 means none).
+- The outer-left bottom TOF stayed around 120-160 mm over many positions
+  and headings, triggered a directional cue, and the inner sensors did not
+  corroborate a mapped weight hit. Its return may be a self/near-field echo;
+  the recording cannot establish the physical cause. No TOF angle or
+  polarity was changed. Teensy 4.0 build and 20 focused GUI tests pass;
+  firmware v22 has not been uploaded or tested on the moving robot.
+
+2026-09-27 — Direct inner-TOF centring and single-sensor seeking (v23)
+- The saved sensor locations and angles remain unchanged. Near an active
+  mapped weight site, both inward-facing inner-bottom TOFs now directly
+  qualify a centred collection when each has a valid bottom/top low-object
+  gap, neither matches a mapped wall, both raw ranges are at most 300 mm,
+  and their ranges differ by no more than 80 mm. This no longer requires
+  the two projected rays to fuse into bearing sector 4 first. If the pair
+  disagrees, the robot steers toward the nearer reading and may retry after
+  a bounded search step instead of permanently disabling pair alignment.
+  A confirmed pair freezes the current forward heading and drives through
+  at 65%, retaining the mapped/frontal clearance checks, 240 mm preferred
+  overshoot and guarded 2.5 s follow-through.
+- A lone confirmed bottom TOF reading, inner or outer, is a direction cue
+  only. Outer hits are blended with the known site and use a 450 mm staging
+  stand-off; inner hits use a 350 mm stand-off. The robot can turn and move
+  toward that staging point while repeatedly checking the inner pair. No
+  single sensor can independently launch a collection drive-through.
+  `weight.inner_pair_ready` telemetry exposes the raw pair test. Teensy
+  4.0 firmware compiles and all 20 focused navigation GUI tests pass.
+  Firmware v23 has not been uploaded or physically tested.
+
+2026-09-27 — Outer-cue recovery when weight is beside intake (v24)
+- A confirmed far-outer bottom TOF remains a steering hint, not collection
+  authority. When it sees a mapped weight close beside the robot (within
+  350 mm of that site and no more than 450 mm forward), the controller now
+  backs up at most 160 mm before turning toward the stored hit and seeking
+  a staging point. Reverse requires a mapped clear corridor behind and is
+  bounded by encoder travel and 2.5 s. If the reverse corridor is not clear,
+  it skips the reverse and retains the directional turn/check. An earlier
+  outer cue no longer consumes this later close-range reverse opportunity;
+  each outer sensor can trigger the reverse at most once per weight site.
+- The robot then approaches the weight-site waypoint and keeps testing the
+  two inner TOFs. Only their matching low-object ranges start the forward
+  drive-through. Arena View displays BACKING UP TO CENTER WEIGHT for this
+  phase; telemetry includes `weight.outer_reverse_active`. Teensy 4.0
+  firmware builds and all 20 focused mission GUI tests pass. Firmware v24
+  has not been uploaded or tested on the moving robot.
+
+2026-09-27 — Planned-mission home launch (v25)
+- Compared the 18:45:29 and 18:47:40 recordings. Both uploaded the same route
+  beginning at (298, 2079) mm, but the poor run declared an east-facing
+  start (0 degrees). It passed the first nearby transit point, began turning
+  beside home, and repeatedly reversed from the frontal wall. The better run
+  declared north (270 degrees), left home in a straight line, and did not
+  enter that wall-reverse loop. The start-heading field still must describe
+  the robot's real placement; the IMU measures changes from that reference,
+  not an absolute arena bearing.
+- Planned navigation started within 350 mm of home now has two launch phases
+  before ordinary route following: point-turn to the inward long-axis heading
+  while in home, then drive 500 mm straight out at up to 100% with IMU heading
+  correction and encoder-measured distance. Short transit points already
+  passed during this exit are skipped, never weight targets. A close frontal
+  return, large heading drift, or an occupied mapped corridor holds the
+  motors stopped until the exit clears; it cannot enter the repeated
+  turn-into-wall/reverse cycle during launch. The GUI reports ALIGNING IN
+  HOME or DRIVING STRAIGHT OUT OF HOME. Navigation controller version is 25.
+- Recording telemetry includes `mission.launch_phase`,
+  `mission.launch_distance_mm`, and `mission.launch_blocked` for checking the
+  exit in replay without guessing from the drawn path.
+- Firmware compiled for Teensy 4.0 and 20 focused GUI navigation tests pass.
+  The new launch has not yet been uploaded or tested on the moving robot.
+
+2026-09-27 — Keyestudio ACS712-30A current sensor on D23/A9
+- D23/A9 is now sampled as a 12-bit analog input every 10 ms. The sensor
+  module requires regulated 5 V, not the Teensy's 3V3 output. Its OUT signal
+  reaches D23 through the user's 12k/12k divider; sensor and Teensy grounds
+  must be common. The current-carrying terminals go in series with one
+  supply lead. At zero current the divider should deliver about 1.25 V to
+  D23; the nominal sensitivity at that pin is 33 mV/A. D23 must remain
+  within the Teensy ADC's 0–3.3 V input range.
+- The Bluetooth telemetry and recordings include raw ADC count, smoothed D23
+  volts, reconstructed sensor-output volts, calibrated zero volts, and
+  signed current amps under `current_sensor.d23.*`. A light exponential
+  filter reduces PWM noise. The default zero is 1.25 V after boot.
+- The Commands tab includes "Zero D23 current sensor". It only accepts
+  calibration while the robot and both motor banks are stopped; the measured
+  midpoint must be 0.95–1.55 V, which rejects a missing or clearly
+  underpowered sensor. Zero calibration is in RAM and should be repeated
+  after a reboot for the best accuracy. The Wiring Guide adds D23 without
+  replacing existing user-edited rows.
+- Teensy 4.0 firmware compiles and all eight focused wiring-guide tests pass.
+  No hardware voltage or live current measurement has yet been verified.
+
+2026-09-27 — D23 current-sensor ADC scaling correction
+- The supplied CPU pinout's A9Z connector carries Teensy D23/A9, and the
+  firmware continues to use digital pin number 23. No other project code
+  configures D23 as an output. PJRC's Teensy 4.0 analogRead mapping routes
+  D23/A9 to ADC1 by default, though the pin is accessible to both ADC units.
+- Found that BluetoothDebugWorkflow set the global analog resolution to
+  10 bits, but UltrasoundSensor::begin subsequently changed it to 12 bits.
+  The current-sensor voltage and zero-calibration calculations still divided
+  the resulting 0–4095 readings by 1023, making reported volts and amps
+  about four times too high. The workflow now explicitly uses 12-bit ADC
+  resolution and divides both conversions by 4095. The Teensy 4.0 firmware
+  compiles successfully. This change has not been uploaded or live-tested.
+- The user's measured 1.275 V at the divider/CPU input should correspond to
+  about 1582 ADC counts at 12 bits, whereas the previous recording reported
+  about 1999 counts (roughly 1.61 V after corrected scaling). This remaining
+  discrepancy needs a simultaneous D23-to-CPU-GND voltage measurement and
+  fresh raw telemetry after upload. The ADC scaling fix alone does not prove
+  why the raw count changed little when the motor was loaded.
+
+2026-09-27 — Live D23 and first motor-bank check
+- With the corrected firmware live on COM10, bank 1 stopped and reporting
+  0%/0%, D23 stayed near 1993 ADC counts (about 1.59–1.60 V) and displayed
+  about +10.4 A against its uncalibrated 1.25 V default zero. This is not a
+  credible no-load current; the firmware scaling bug is resolved but the
+  observed ADC voltage remains inconsistent with the user's earlier 1.275 V
+  measurement at the CPU input. That voltage was not remeasured live.
+- Short manual commands were confirmed in telemetry. Channel A at +50% kept
+  D23 near 1993 counts. Channel B at +50% brought it down to a median of
+  1893 counts (roughly 80 mV at D23, or -2.4 A equivalent). Both at +75%
+  were near 1995 counts, but there were only three one-second telemetry
+  frames and the physical motor motion was not independently observed. This
+  suggests D23 is not completely static; it does not establish which current
+  path or sampling effect caused the B-only change.
+- The first diagnostic attempt used internal action names and firmware
+  returned Unknown command, so no motors moved during that attempt. The
+  corrected diagnostic is
+  `Non-Teensy-Files/BluetoothDebugGUI/diagnose_current_sensor_live.py`;
+  it uses configured command names and automatically stops bank 1 between
+  phases and on exit. At final disconnect telemetry confirmed bank 1 at
+  0%/0%; no further live testing should occur while the robot is off.
+
+2026-09-27 — Bank 1 equal-speed correction and ESP32 current reference
+- The user clarified that the two bank-1 drum motors must always receive the
+  same signed percentage and run in the same direction. The prior A-only and
+  B-only live diagnostic was an invalid operating test. Firmware now rejects
+  unequal channel A/B commands for the first 203 driver before it changes
+  navigation or motor state; bank 2 remains independently steerable. The
+  bank-1 GUI command now has one signed `speed_percent` field instead of two
+  separately editable fields. The handler sets both A and B to that value,
+  while accepting older equal-valued A/B route commands for compatibility.
+  The future live diagnostic tests A+B at +50% and +75% only. Firmware
+  compiled and the Python diagnostic passed syntax compilation; the new
+  firmware was not uploaded or tested with the robot before it was turned off.
+- User-supplied ESP32 characterisation at
+  `C:/Users/alex/Desktop/RobocupTesting/CurrentSensorResults/` shows the
+  single installed sensor is sufficient on one motor's current path. Its
+  calibrated zero was 1294.747 mV at the ESP32 ADC after the divider. Across
+  401 off samples, mean absolute current was 0.048 A; 401 free-running
+  samples averaged 0.161 A; three stall trials averaged 1.273, 1.142, and
+  1.104 A absolute current. Those are reference measurements from a
+  different MCU, not a Teensy validation. The Teensy's roughly 1.6 V D23
+  resting report still requires a same-time voltage-vs-raw-count check.
+
+2026-09-27 — D23 ADC1/ADC2 comparison firmware
+- The user measured approximately 1.272 V directly at both the A9Z D signal
+  contact and Teensy D23 pad while the Teensy 3V rail measured 3.286 V.
+  A 12-bit ADC should report about 1586 counts, yet the live firmware had
+  reported roughly 1993. The sensor and carrier cable are not sufficient
+  explanations for this raw conversion mismatch.
+- Added bounded diagnostic samples of the same D23 input: an initial ADC1
+  `analogRead`, an immediate repeated ADC1 `analogRead`, and ADC2 channel 14
+  (D23/A9 on Teensy 4.0) via the hardware registers. The three readings are
+  sampled together every 100 ms, and ADC2 waits at most 1 ms. Existing
+  current estimation and motor behaviour remain unchanged. Telemetry now
+  exposes `current_sensor.d23.adc1_first_raw`, `.adc1_repeat_raw`,
+  `.adc2_raw`, `.adc2_valid`, and `.adc_compare_ms`. A value of -1 for
+  `.adc2_raw` means the conversion timed out.
+- Teensy 4.0 firmware compiled successfully. The user will upload it; no
+  hardware comparison or motor test has yet been performed with this build.
+
+2026-09-27 — Latest current-sensor evidence and interpretation
+- In `RobotRun_2026-09-27_20-46-06.rdbg`, the GUI sent
+  `set_dc_motor_203_speed` with `speed_percent: 100` at approximately
+  43.99 s. The firmware acknowledged the command at about 48.22 s and
+  telemetry reported bank-1 channels A and B both at +100%, each with a
+  1950 us control pulse. The user confirmed both drum motors physically
+  spun. The command path and bank-1 motor outputs therefore worked in
+  this run; the current measurement is the unresolved issue.
+- D23 raw-count median was 1993 over the 30–43 s pre-command window and
+  1995 over the 46–62 s running window. Both windows also contained
+  occasional raw counts near 1885–1894; these large excursions were not
+  correlated with the motor command. The roughly 0.161 A free-running
+  current measured in the ESP32 characterisation would move a 12-bit ADC
+  by only about 7 counts after this sensor's 12k/12k output divider, so
+  that normal-running current is easily lost under the observed noise.
+- The user measured the divider signal directly at both the carrier's
+  A9Z D contact and the Teensy module's D23 pad: 1.272 V while the motor
+  ran freely and 1.260 V while it was briefly stalled. The 12 mV drop is
+  real at the MCU input and corresponds to roughly 15 counts at a 3.286 V
+  ADC reference, or about 0.36 A using the nominal 33 mV/A divided
+  sensitivity. The Teensy 3V rail measured 3.286 V while running. At
+  1.272 V and 3.286 V reference, the expected ADC reading is roughly
+  1586 counts, not the previously observed approximately 1993 counts.
+- The ACS712 module is powered from the digital level-shift board's 5 V,
+  not the Teensy 3V rail. Its midpoint and sensitivity are ratiometric
+  with that 5 V supply. A roughly 48 mV change in that 5 V supply could
+  itself cause a 12 mV change at D23 after the divider, so the measured
+  free-to-stall voltage change does not yet prove the full current delta.
+  The sensor's 5 V supply under load was not measured in this check.
+- The installed Teensy 4.0 core maps `analogRead(23)` to D23/A9 on ADC1
+  channel 14; project search found no other code configuring D23 as an
+  output. The large raw-count-versus-probed-voltage mismatch therefore
+  remains unexplained. The newly added simultaneous ADC1-first,
+  ADC1-repeat, and ADC2-channel-14 telemetry is intended to distinguish
+  ADC1 sampling/settling from a shared analog reference or pad issue.
+  This is diagnostic only: it does not change which reading drives the
+  displayed current. Do not trust absolute amps until the mismatch is
+  resolved and the zero is calibrated with the motor stopped.
+
+2026-09-27 — ADC comparison result from the uploaded firmware
+- Analysed `Non-Teensy-Files/DataVisualisationAfter/Data/RobotRun_2026-09-27_21-10-01.rdbg`
+  (about 90 s). The run recorded 81 comparison samples. ADC2 was valid in
+  all 81, and ADC1-first, ADC1-repeat, and ADC2 were all near 1990 counts
+  with matching excursions into the high 1800s. This rules out a unique
+  ADC1 failure and a first-conversion settling problem as the main cause.
+- Before the +100% bank-1 command, median raw current ADC count was 1996;
+  during 32–48 s after the command it was 1993. The first bank reported
+  channels A and B both at +100% with 1950 us pulses. It kept emitting
+  telemetry, so this recording does not show a Bluetooth or command stall.
+- The firmware's displayed 9–11 A comes from treating those approximately
+  1990 counts as about 1.60 V and subtracting a fixed 1.25 V zero. It is
+  not credible against the user's directly measured 1.272 V on D23 (about
+  1586 expected counts at the measured 3.286 V rail). The analog input
+  voltage versus ADC-code discrepancy remains unresolved; do not use the
+  reported current for control or stall decisions. Re-probe D23-to-Teensy
+  ground while the comparison firmware is running, ideally alongside a
+  scope or meter reading of 3.3 V and sensor 5 V. A disconnect-and-reconnect
+  test of the D23 signal could isolate whether the ADC input follows the
+  physical sensor wire, but should only be done with robot power off.

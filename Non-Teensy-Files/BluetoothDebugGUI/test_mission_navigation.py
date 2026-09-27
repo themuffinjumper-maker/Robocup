@@ -26,7 +26,10 @@ class MissionUploadTests(unittest.TestCase):
             view = ArenaView(settings)
             for phase, expected in (
                 ("following_route", "FOLLOWING PATH"),
+                ("aligning_in_home", "ALIGNING IN HOME"),
+                ("leaving_home_straight", "DRIVING STRAIGHT OUT OF HOME"),
                 ("aligning_to_weight", "CENTERING ON WEIGHT"),
+                ("reversing_to_center_weight", "BACKING UP TO CENTER WEIGHT"),
                 ("checking_outer_weight_cue", "TURNING TO VERIFY OUTER WEIGHT CUE"),
                 ("waiting_for_point_tofs", "WAITING FOR POINT TOF RECOVERY"),
                 ("reversing_for_weight_retry", "REVERSING FOR WEIGHT RETRY"),
@@ -45,7 +48,7 @@ class MissionUploadTests(unittest.TestCase):
             view = ArenaView(settings)
             view.model.latest.update({
                 "system.uptime_s": 30.0,
-                "system.navigation_controller_version": 21,
+                "system.navigation_controller_version": 25,
                 "tof.expander_available": False,
                 "tof.recovery_attempts": 2,
             })

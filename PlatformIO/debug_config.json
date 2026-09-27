@@ -180,11 +180,11 @@
       "name": "set_dc_motor_203_speed",
       "label": "Set first 203 motor speed (D27/D26)",
       "category": "203 DC Motor",
+      "description": "Bank 1 drum motors run together at the same signed percentage. Negative reverses both; zero stops both.",
       "action": "dc_motor_203_speed",
       "debug_mode_required": true,
       "args": [
-        {"name": "channel_a_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0},
-        {"name": "channel_b_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0}
+        {"name": "speed_percent", "label": "Both motors (%)", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0}
       ]
     },
     {
@@ -217,6 +217,14 @@
       "label": "Zero both encoder counts",
       "category": "Encoder",
       "action": "encoder_zero",
+      "args": []
+    },
+    {
+      "name": "zero_current_sensor",
+      "label": "Zero D23 current sensor",
+      "category": "Current sensor",
+      "description": "With the robot stopped and no current through the measured circuit, calibrate the ACS712-30A zero point. The module must be powered from 5 V; its analog output reaches D23 through the 12k/12k divider.",
+      "action": "current_sensor_zero",
       "args": []
     },
     {

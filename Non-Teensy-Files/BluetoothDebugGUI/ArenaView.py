@@ -3766,9 +3766,9 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 21):
+        if ("system.uptime_s" in m.latest and controller_version != 25):
             firmware_warning += (
-                "Navigation controller v21 is not running; upload the current clean build. "
+                "Navigation controller v25 is not running; upload the current clean build. "
             )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True and
                      m.latest.get(f"tof.{spec['name']}.timed_out") is not True
@@ -3800,9 +3800,12 @@ class ArenaView(QWidget):
             "idle": "IDLE / STOPPED",
             "exploring": "EXPLORING",
             "following_route": "FOLLOWING PATH",
+            "aligning_in_home": "ALIGNING IN HOME",
+            "leaving_home_straight": "DRIVING STRAIGHT OUT OF HOME",
             "searching_weight": "SEARCHING WEIGHT SITE",
             "aligning_to_weight": "CENTERING ON WEIGHT",
             "centering_weight": "CENTERING WITH INNER TOFS",
+            "reversing_to_center_weight": "BACKING UP TO CENTER WEIGHT",
             "checking_outer_weight_cue": "TURNING TO VERIFY OUTER WEIGHT CUE",
             "waiting_for_point_tofs": "WAITING FOR POINT TOF RECOVERY",
             "collecting_weight": "DRIVING THROUGH WEIGHT",

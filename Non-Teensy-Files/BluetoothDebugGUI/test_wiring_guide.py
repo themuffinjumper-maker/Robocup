@@ -66,6 +66,7 @@ class WiringGuideTest(unittest.TestCase):
             self.assertEqual(guide.entries[3]["pins"], "D21")
             self.assertEqual(guide.entries[4]["pins"], "TRIG D14 / ECHO D24")
             self.assertEqual(guide.entries[5]["pins"], "TRIG D22 / ECHO D20")
+            self.assertTrue(any(entry["pins"] == "D23 / A9" for entry in guide.entries))
             guide.close()
 
     def test_inductive_sensor_firmware_definition_is_d21_active_low(self):
@@ -76,6 +77,12 @@ class WiringGuideTest(unittest.TestCase):
         self.assertTrue(inductive["active_low"])
         self.assertTrue(inductive["pullup"])
         self.assertEqual(inductive["debounce_ms"], 20)
+
+    def test_current_sensor_has_zero_command_and_d23_wiring(self):
+        config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
+        commands = json.loads(config_path.read_text(encoding="utf-8"))["commands"]
+        self.assertTrue(any(item["action"] == "current_sensor_zero" for item in commands))
+        self.assertTrue(any(entry["pins"] == "D23 / A9" for entry in DEFAULT_ENTRIES))
 
     def test_ultrasound_firmware_definition_reverses_each_original_pair(self):
         config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"

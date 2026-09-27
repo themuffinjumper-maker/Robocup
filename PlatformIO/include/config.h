@@ -88,6 +88,9 @@ namespace Pins {
     constexpr uint8_t ULTRASOUND_B_ECHO = 20;
 
     constexpr uint8_t INDUCTIVE_PROXIMITY = 21;
+    // Keyestudio ACS712-30A analog output, divided by 12k/12k before D23/A9.
+    // Power the sensor module from 5 V; the Teensy ADC remains 3.3 V only.
+    constexpr uint8_t CURRENT_SENSOR = 23;
 
 } // namespace Pins
 
