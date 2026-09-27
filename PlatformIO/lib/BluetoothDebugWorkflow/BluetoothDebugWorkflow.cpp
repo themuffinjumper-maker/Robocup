@@ -1686,6 +1686,35 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["bluetooth.messages_received"] = receivedMessages_;
     data["bluetooth.tx_dropped_messages"] = link_.droppedMessages();
     data["bluetooth.tx_dropped_bytes"] = link_.droppedBytes();
+    // Keep point-TOF fields in the first telemetry chunk. The radio can have
+    // room for only the first bounded packet in a cycle, and these fields are
+    // essential both to navigation and recording diagnostics.
+    data["tof.bank_ready_count"] = tofReadyCount_;
+    data["tof.bank_configured_count"] = tofSensorCount_;
+    data["tof.expander_available"] = Tof::expanderAvailable();
+    data["tof.recovery_attempts"] = tofRecoveryAttempts_;
+    data["tof.last_recovery_success_ms"] = lastTofRecoverySuccessMs_;
+    data["tof.last_recovery_duration_ms"] = lastTofRecoveryDurationMs_;
+    data["tof.navigation_hold"] = missionTofRecoveryHold_;
+    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    {
+        char key[56];
+        snprintf(key, sizeof(key), "tof.%s.available", tofSensorNames_[i]);
+        data[key] = tofAvailable_[i];
+        snprintf(key, sizeof(key), "tof.%s.timed_out", tofSensorNames_[i]);
+        data[key] = tofTimedOut_[i];
+        snprintf(key, sizeof(key), "tof.%s.recovery_failures", tofSensorNames_[i]);
+        data[key] = tofRecoveryFailures_[i];
+        snprintf(key, sizeof(key), "tof.%s.next_recovery_in_ms", tofSensorNames_[i]);
+        data[key] = tofNextRecoveryAttemptMs_[i] == 0 ||
+            static_cast<int32_t>(now - tofNextRecoveryAttemptMs_[i]) >= 0
+            ? 0UL : tofNextRecoveryAttemptMs_[i] - now;
+        if (tofAvailable_[i] && !tofTimedOut_[i] && tofDistanceMm_[i] >= 0)
+        {
+            snprintf(key, sizeof(key), "tof.%s.distance_mm", tofSensorNames_[i]);
+            data[key] = tofDistanceMm_[i];
+        }
+    }
     data["servo.last_id"] = lastServoId_;
     data["servo.commanded_angle_deg"] = lastServoAngleDeg_;
     data["servo.zeroed"] = servoZeroed_[lastServoId_];
@@ -2024,32 +2053,6 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["hx12k.c.angle_deg"] = hx12kC_.commandedAngle();
     data["hx12k.d.enabled"] = hx12kD_.enabled();
     data["hx12k.d.angle_deg"] = hx12kD_.commandedAngle();
-    data["tof.bank_ready_count"] = tofReadyCount_;
-    data["tof.bank_configured_count"] = tofSensorCount_;
-    data["tof.expander_available"] = Tof::expanderAvailable();
-    data["tof.recovery_attempts"] = tofRecoveryAttempts_;
-    data["tof.last_recovery_success_ms"] = lastTofRecoverySuccessMs_;
-    data["tof.last_recovery_duration_ms"] = lastTofRecoveryDurationMs_;
-    data["tof.navigation_hold"] = missionTofRecoveryHold_;
-    for (uint8_t i = 0; i < tofSensorCount_; ++i)
-    {
-        char key[56];
-        snprintf(key, sizeof(key), "tof.%s.available", tofSensorNames_[i]);
-        data[key] = tofAvailable_[i];
-        snprintf(key, sizeof(key), "tof.%s.timed_out", tofSensorNames_[i]);
-        data[key] = tofTimedOut_[i];
-        snprintf(key, sizeof(key), "tof.%s.recovery_failures", tofSensorNames_[i]);
-        data[key] = tofRecoveryFailures_[i];
-        snprintf(key, sizeof(key), "tof.%s.next_recovery_in_ms", tofSensorNames_[i]);
-        data[key] = tofNextRecoveryAttemptMs_[i] == 0 ||
-            static_cast<int32_t>(now - tofNextRecoveryAttemptMs_[i]) >= 0
-            ? 0UL : tofNextRecoveryAttemptMs_[i] - now;
-        if (tofAvailable_[i] && !tofTimedOut_[i] && tofDistanceMm_[i] >= 0)
-        {
-            snprintf(key, sizeof(key), "tof.%s.distance_mm", tofSensorNames_[i]);
-            data[key] = tofDistanceMm_[i];
-        }
-    }
     if (servoZeroed_[lastServoId_])
         data["servo.zero_offset_deg"] = servoZeroOffsetsDeg_[lastServoId_];
     if (!isnan(measuredServoAngleDeg_))
@@ -4759,9 +4762,12 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionWaypointIndex_ = 0;
                 missionWaypointCount_ = 0;
             }
-            // Find a turn-around point with more clearance than a travel
-            // waypoint, and a straight mapped-clear corridor back into home.
+            // A staging point gives the robot room to turn before backing
+            // into home.  It needs normal chassis clearance, not an extra
+            // 70 mm margin that can reject every valid corridor in a narrow
+            // home area.
             bool stageFound = false;
+            const float dockClearanceMm = 0.5f * navigationRobotWidthMm_ + 10.0f;
             const float inward = missionHomeXmm_ < 2450 ? 1.0f : -1.0f;
             for (const int distance : {750, 950, 1150, 1350, 1550, 1750})
             {
@@ -4770,9 +4776,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 {
                     const float stageX = missionHomeXmm_ + inward * distance;
                     const float stageY = missionHomeYmm_ + offset;
-                    if (!pointFreeAt(stageX, stageY, mapClearanceMm + 70.0f) ||
+                    if (!pointFreeAt(stageX, stageY, mapClearanceMm) ||
                         !segmentFreeAt(stageX, stageY, missionHomeXmm_,
-                                       missionHomeYmm_, mapClearanceMm))
+                                       missionHomeYmm_, dockClearanceMm))
                         continue;
                     missionWaypoints_[missionWaypointIndex_].xMm =
                         static_cast<int16_t>(stageX);
@@ -4796,9 +4802,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                             inward * distance * cosf(angle);
                         const float stageY = missionHomeYmm_ +
                             distance * sinf(angle);
-                        if (!pointFreeAt(stageX, stageY, mapClearanceMm + 70.0f) ||
+                        if (!pointFreeAt(stageX, stageY, mapClearanceMm) ||
                             !segmentFreeAt(stageX, stageY, missionHomeXmm_,
-                                           missionHomeYmm_, mapClearanceMm))
+                                           missionHomeYmm_, dockClearanceMm))
                             continue;
                         missionWaypoints_[missionWaypointIndex_].xMm =
                             static_cast<int16_t>(roundf(stageX));
@@ -4812,11 +4818,34 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             if (!stageFound)
             {
+                // The map can be incomplete even though the live route to a
+                // clear staging point is usable.  Do not strand the robot at
+                // the last weight simply because the final reverse corridor
+                // has not been drawn yet; use a map-clear staging fallback
+                // and let normal live rerouting bring it there.
+                for (const int distance : {750, 950, 1150, 1350, 1550, 1750})
+                {
+                    const float stageX = missionHomeXmm_ + inward * distance;
+                    const float stageY = missionHomeYmm_;
+                    if (!pointFreeAt(stageX, stageY, mapClearanceMm))
+                        continue;
+                    missionWaypoints_[missionWaypointIndex_].xMm =
+                        static_cast<int16_t>(stageX);
+                    missionWaypoints_[missionWaypointIndex_].yMm =
+                        static_cast<int16_t>(stageY);
+                    missionWaypoints_[missionWaypointIndex_].flags = 0;
+                    stageFound = true;
+                    link_.log("WARNING", "Home dock corridor unverified; routing to map-clear staging fallback");
+                    break;
+                }
+            }
+            if (!stageFound)
+            {
                 setDrive(0, 0);
                 if (missionBlockedSinceMs_ == 0)
                 {
                     missionBlockedSinceMs_ = now;
-                    link_.log("WARNING", "Home corridor not yet verified; navigation remains active and will retry");
+                    link_.log("WARNING", "No map-clear home staging point yet; navigation remains active and will retry");
                 }
                 return;
             }
@@ -4962,7 +4991,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (missionWaypointIndex_ == 0 || !lastImuSampleValid_ ||
                 !segmentFreeAt(missionPoseXmm_, missionPoseYmm_,
                                routeWaypoint.xMm, routeWaypoint.yMm,
-                               mapClearanceMm))
+                               0.5f * navigationRobotWidthMm_ + 10.0f))
             {
                 stopNavigation("Reverse home corridor or IMU no longer valid");
                 return;
@@ -5145,7 +5174,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                     ? 0U : now + 1200U;
                 if (missionReturnHome_)
                     setDrive(0, 0);
-                link_.log("INFO", "Delayed inductive pickup credited to previous site; next site remains scheduled");
+                link_.log("INFO", "Inductive pickup confirmed after completed collection pass");
                 return;
             }
             missionPendingPickupWaypoint_ = 255;
@@ -5798,13 +5827,27 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWeightVectorActive_ = false;
             missionCollectionFollowThroughUntilMs_ = 0;
             missionInnerWeightLocked_ = false;
-            missionWeightVectorCompletedWaypoint_ = missionWaypointIndex_;
+            // A locked inner sensor followed by the complete drive-through is
+            // the collection criterion. The inductor remains useful as a
+            // downstream confirmation, but never blocks the next site.
+            const uint8_t collectedWaypoint = missionWaypointIndex_;
+            missionWeightVectorCompletedWaypoint_ = collectedWaypoint;
             missionSearchWaypoint_ = 255;
-            missionVerifyWaypoint_ = missionWaypointIndex_;
-            missionVerifyPhase_ = 1;
-            missionVerifyStartedMs_ = now;
-            missionVerifyHeadingDeg_ = imu_.headingDeg();
-            missionVerifySawWeight_ = false;
+            missionVerifyWaypoint_ = 255;
+            missionVerifyPhase_ = 0;
+            missionVerifyRetries_ = 0;
+            missionPendingPickupWaypoint_ = collectedWaypoint;
+            missionPendingPickupSinceMs_ = now;
+            missionPendingPickupWasIncomplete_ = false;
+            if (missionTargetsVisited_ < missionTargetCount_)
+                ++missionTargetsVisited_;
+            if (missionSearchSitesChecked_ < 255U)
+                ++missionSearchSitesChecked_;
+            ++missionWaypointIndex_;
+            weightBearingWaypoint_ = 255;
+            missionBlockedSinceMs_ = 0;
+            missionAvoidAttempts_ = 0;
+            link_.log("INFO", "Inner-TOF drive-through complete; weight marked collected and moving on");
             return;
         }
         if (!missionWeightVectorActive_ && distanceToWaypoint <= arrivalMm)
@@ -6115,10 +6158,11 @@ void BluetoothDebugWorkflow::updateNavigation()
             return;
         }
         if (blockedOnLeg && missionReturnHome_ && missionAvoidPhase_ == 0 &&
-            now - missionBlockedSinceMs_ < 3500U)
+            now - missionBlockedSinceMs_ < 900U)
         {
-            // Give the independent front/side landmark check time to reject
-            // a drifting home pose before choosing a detour from that pose.
+            // Briefly allow the front/side landmark update to settle, then
+            // detour.  A missing ultrasound must not freeze return-home for
+            // several seconds every time the front range sees a wall.
             setDrive(0, 0);
             return;
         }
@@ -6132,13 +6176,15 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (int8_t side = -1; side <= 1; side += 2)
             {
                 const uint16_t sideRange = side < 0 ? left : right;
-                if (sideRange == 0xFFFF) continue;
+                const bool sideMeasured = sideRange != 0xFFFF;
                 // A fixed 500 mm sidestep plus 650 mm forward leg was
                 // impossible near the arena edge in the return-home run,
-                // even though a shorter right-side route was map-clear.
+                // even though a shorter route was map-clear.  Prefer a live
+                // side measurement, but permit a map-verified side when its
+                // ultrasound is temporarily unavailable.
                 for (const float lateralMm : {250.0f, 350.0f, 500.0f})
                 {
-                    if (sideRange < lateralMm +
+                    if (sideMeasured && sideRange < lateralMm +
                         0.5f * navigationRobotWidthMm_ + 50.0f) continue;
                     const float x = missionPoseXmm_ - forwardY * side * lateralMm;
                     const float y = missionPoseYmm_ + forwardX * side * lateralMm;
@@ -6148,10 +6194,11 @@ void BluetoothDebugWorkflow::updateNavigation()
                         const float passX = x + forwardX * forwardMm;
                         const float passY = y + forwardY * forwardMm;
                         if (!segmentFree(x, y, passX, passY)) continue;
-                        const float score = static_cast<float>(sideRange) -
+                        const float score = (sideMeasured ? static_cast<float>(sideRange) : 450.0f) -
                             0.2f * hypotf(waypoint.xMm - passX,
                                          waypoint.yMm - passY) -
                             0.05f * (lateralMm + forwardMm) -
+                            (sideMeasured ? 0.0f : 160.0f) -
                             (side == missionAvoidSide_ ? 100.0f : 0.0f);
                         if (score > bestScore)
                         {

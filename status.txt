@@ -6767,3 +6767,40 @@ Not verified here:
   hardware still determines whether a sensor can answer its XSHUT/I2C probe;
   the dashboard now exposes that distinction instead of allowing failed
   sensors to silently invalidate collection logic.
+
+2026-09-28 — Collection completion, degraded-side recovery, and recording repair
+- Reviewed the two latest recordings from the current session. Both had no
+  raw `tof.*` rows at all even though navigation logs were reporting point-TOF
+  failures, and ultrasound B had only one or two valid readings for an entire
+  run. The newer run did nevertheless demonstrate the new `mid_right` inner
+  lock and an inductive confirmation; the robot then spent too long in
+  return-home/wall-recovery states because it treated the absent side range as
+  a reason not to choose a map-clear bypass.
+- A successful pickup is now unambiguous: after an inward bottom TOF has
+  locked and the existing straight collection pass plus its slow 2.5 s
+  follow-through finishes, the site is immediately marked collected and the
+  mission advances to the next waypoint. The inductive sensor remains logged
+  as downstream confirmation and is attributed to that completed site for up
+  to 30 seconds, but it no longer triggers a second visual verification,
+  retry, or a delay at the weight.
+- Point-TOF telemetry is emitted near the start of each bounded Bluetooth
+  telemetry cycle. This is intentional: the radio may only accept the first
+  large telemetry packet before its UART buffer refills, and the old ordering
+  placed the complete raw point-TOF block after that first packet. Availability,
+  timeouts, ranges, recovery failures, and retry timing will therefore again
+  be present in new recordings.
+- Return-home staging now uses the actual configurable chassis clearance rather
+  than an unshown additional 70 mm restriction. Docking requires only the
+  robot half-width plus 10 mm. If the final reverse corridor has not yet been
+  mapped, the mission routes to a map-clear staging fallback instead of idling
+  permanently at the last target.
+- Side-ultrasound use remains preferred whenever it is valid. When one side is
+  unavailable, a map-verified detour on that side is now a lower-scored but
+  permitted fallback; it does not override a valid close side range. The
+  return-home landmark pause was shortened from 3.5 seconds to 0.9 seconds so
+  a single dead side ultrasound cannot repeatedly freeze the robot at every
+  front-wall detection.
+- Verification: PlatformIO Teensy 4.0 build completed successfully after this
+  change (`FLASH code 213176 B`, `RAM1 variables 65120 B`). Physical testing is
+  still required to validate the new recording order and the one-sided
+  ultrasound fallback in the arena.
