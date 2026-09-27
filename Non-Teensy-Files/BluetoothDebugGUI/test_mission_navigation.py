@@ -53,9 +53,10 @@ class MissionUploadTests(unittest.TestCase):
                 "tof.recovery_attempts": 2,
             })
             view._refresh_status()
-            self.assertIn("POINT TOFS OFFLINE", view.status.text())
+            self.assertIn("POINT TOFS DEGRADED", view.status.text())
             self.assertIn("I2C0 expander", view.status.text())
             self.assertIn("Recovery attempts: 2", view.status.text())
+            self.assertIn("Mission travel continues", view.status.text())
             view.close()
 
     def test_arena_gate_buttons_send_open_and_close(self):
@@ -287,6 +288,7 @@ class MissionUploadTests(unittest.TestCase):
             home = (points[-3], points[-2])
             self.assertTrue(view.mission_layout._segment_clear(stage, home))
             self.assertEqual(len(sent[1][1]["bottom_sensors"]), 12)
+            self.assertEqual(len(sent[1][1]["top_sensors"]), 12)
             self.assertEqual(len(sent[1][1]["ultrasound_offsets"]), 4)
             view.close()
 

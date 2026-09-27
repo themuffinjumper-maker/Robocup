@@ -348,7 +348,9 @@ class CommandWidget(QGroupBox):
 
 
 class RobotDebugGUI(QMainWindow):
-    MAX_HISTORY_POINTS = 10000
+    # Keep only enough samples for a useful live plot. Histories are allocated
+    # only for signals the user has actually added to the plot.
+    MAX_HISTORY_POINTS = 3000
 
     def __init__(self):
         super().__init__()
@@ -367,6 +369,8 @@ class RobotDebugGUI(QMainWindow):
         self.telemetry = {}
         self.telemetry_rows = {}
         self.telemetry_history = {}
+        self.pending_telemetry_ui = {}
+        self.plot_signal_names = set()
         self.parameter_editors = {}
         self.command_widgets = {}
         self.command_definitions = {}
@@ -415,7 +419,13 @@ class RobotDebugGUI(QMainWindow):
         self.plot_timer.timeout.connect(
             self.update_plot
         )
-        self.plot_timer.start(50)
+        self.plot_timer.start(200)
+
+        self.telemetry_ui_timer = QTimer(self)
+        self.telemetry_ui_timer.timeout.connect(
+            self.flush_telemetry_ui
+        )
+        self.telemetry_ui_timer.start(100)
 
         self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(
@@ -2029,6 +2039,7 @@ class RobotDebugGUI(QMainWindow):
         self.log_console.setReadOnly(
             True
         )
+        self.log_console.document().setMaximumBlockCount(2000)
 
         font = QFont(
             "Consolas"
@@ -2091,6 +2102,7 @@ class RobotDebugGUI(QMainWindow):
         self.raw_console.setReadOnly(
             True
         )
+        self.raw_console.document().setMaximumBlockCount(1500)
 
         font = QFont(
             "Consolas"
@@ -2597,6 +2609,8 @@ class RobotDebugGUI(QMainWindow):
             name
         ] = value
 
+        self.pending_telemetry_ui[name] = value
+
         if (
             isinstance(
                 value,
@@ -2607,82 +2621,47 @@ class RobotDebugGUI(QMainWindow):
                 bool,
             )
         ):
-            if (
-                name
-                not in self.telemetry_history
-            ):
-                self.telemetry_history[
-                    name
-                ] = deque(
-                    maxlen=self.MAX_HISTORY_POINTS
-                )
+            if name in self.plot_curves:
+                self.telemetry_history.setdefault(
+                    name, deque(maxlen=self.MAX_HISTORY_POINTS)
+                ).append((now - self.start_time, float(value)))
 
-            elapsed = (
-                now
-                - self.start_time
-            )
-
-            self.telemetry_history[
-                name
-            ].append(
-                (
-                    elapsed,
-                    float(value),
-                )
-            )
-
-            if (
-                self.plot_signal_combo.findText(
-                    name
-                )
-                < 0
-            ):
+            if name not in self.plot_signal_names:
+                self.plot_signal_names.add(name)
                 self.plot_signal_combo.addItem(
                     name
                 )
 
-        if name not in self.telemetry_rows:
-            row = (
-                self.telemetry_table.rowCount()
-            )
+    def flush_telemetry_ui(self):
+        """Apply coalesced live values in one short GUI update batch."""
+        if not self.pending_telemetry_ui:
+            return
 
-            self.telemetry_table.insertRow(
-                row
-            )
+        updates = self.pending_telemetry_ui
+        self.pending_telemetry_ui = {}
+        timestamp = time.strftime("%H:%M:%S")
+        table = self.telemetry_table
+        table.setUpdatesEnabled(False)
+        try:
+            for name, value in updates.items():
+                if name not in self.telemetry_rows:
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    self.telemetry_rows[name] = row
+                    table.setItem(row, 0, QTableWidgetItem(name))
+                    table.setItem(row, 1, QTableWidgetItem())
+                    table.setItem(row, 2, QTableWidgetItem())
 
-            self.telemetry_rows[
-                name
-            ] = row
-
-            self.telemetry_table.setItem(
-                row,
-                0,
-                QTableWidgetItem(name),
-            )
-
-        row = self.telemetry_rows[
-            name
-        ]
-
-        self.telemetry_table.setItem(
-            row,
-            1,
-            QTableWidgetItem(
-                self.format_value(
-                    value
-                )
-            ),
-        )
-
-        self.telemetry_table.setItem(
-            row,
-            2,
-            QTableWidgetItem(
-                time.strftime(
-                    "%H:%M:%S"
-                )
-            ),
-        )
+                row = self.telemetry_rows[name]
+                value_item = table.item(row, 1)
+                update_item = table.item(row, 2)
+                formatted = self.format_value(value)
+                if value_item.text() != formatted:
+                    value_item.setText(formatted)
+                if update_item.text() != timestamp:
+                    update_item.setText(timestamp)
+        finally:
+            table.setUpdatesEnabled(True)
 
     @staticmethod
     def format_value(
@@ -2710,6 +2689,8 @@ class RobotDebugGUI(QMainWindow):
         self.telemetry.clear()
         self.telemetry_rows.clear()
         self.telemetry_history.clear()
+        self.pending_telemetry_ui.clear()
+        self.plot_signal_names.clear()
 
         self.telemetry_table.setRowCount(
             0
@@ -2745,6 +2726,12 @@ class RobotDebugGUI(QMainWindow):
         self.plot_curves[
             name
         ] = curve
+        value = self.telemetry.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            self.telemetry_history[name] = deque(
+                [(time.monotonic() - self.start_time, float(value))],
+                maxlen=self.MAX_HISTORY_POINTS,
+            )
 
         self.active_plot_list.addItem(
             name
@@ -2767,6 +2754,7 @@ class RobotDebugGUI(QMainWindow):
                 self.plot_widget.removeItem(
                     curve
                 )
+            self.telemetry_history.pop(name, None)
 
             self.active_plot_list.takeItem(
                 self.active_plot_list.row(
@@ -2783,11 +2771,12 @@ class RobotDebugGUI(QMainWindow):
             )
 
         self.plot_curves.clear()
+        self.telemetry_history.clear()
 
         self.active_plot_list.clear()
 
     def update_plot(self):
-        if not self.plot_curves:
+        if not self.plot_curves or self.tabs.tabText(self.tabs.currentIndex()) != "Plots":
             return
 
         now = (

@@ -109,13 +109,18 @@ private:
     char tofSensorNames_[MAX_TOF_SENSORS][25] = {};
     bool tofAvailable_[MAX_TOF_SENSORS] = {};
     bool tofTimedOut_[MAX_TOF_SENSORS] = {};
+    bool tofFresh_[MAX_TOF_SENSORS] = {};
     int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
+    uint32_t tofLastSampleMs_[MAX_TOF_SENSORS] = {};
     uint8_t tofReadyCount_ = 0;
     uint8_t tofBadPolls_ = 0;
     uint16_t tofRecoveryAttempts_ = 0;
     uint32_t lastTofRecoveryAttemptMs_ = 0;
     uint32_t lastTofRecoverySuccessMs_ = 0;
+    uint32_t lastTofRecoveryDurationMs_ = 0;
+    uint8_t tofRecoverySensorCursor_ = 0;
     bool missionTofRecoveryHold_ = false;
+    bool tofDegradedLogged_ = false;
     uint8_t missionOuterCueWaypoint_ = 255;
     uint8_t missionOuterCueTriedMask_ = 0;
     uint8_t missionOuterReverseTriedMask_ = 0;
@@ -231,14 +236,19 @@ private:
     bool navigationRecoveryForceHalfTurn_ = false;
     uint8_t navigationClearanceTurnCount_ = 0;
     uint8_t navigationStrategy_ = 0;
-    uint16_t navigationFrontAvoidMm_ = 300;
+    // These are physical, user-tunable distances.  The wall clearance is
+    // measured from the outside of the chassis, not from its centre.
+    uint16_t navigationFrontAvoidMm_ = 150;
     uint16_t navigationMatrixWallMm_ = 400;
     uint16_t navigationSideAvoidMm_ = 200;
     uint16_t navigationWallFollowMm_ = 200;
     uint16_t navigationLaneSpacingMm_ = 200;
     uint16_t navigationRobotWidthMm_ = 430;
+    uint16_t navigationWallClearanceMm_ = 30;
+    uint16_t navigationRouteLineToleranceMm_ = 100;
     uint16_t navigationGapMarginMm_ = 80;
     uint16_t navigationGapDepthMm_ = 550;
+    uint16_t navigationWeightSearchRadiusMm_ = 500;
     uint8_t navigationMatrixFloorRows_ = 2;
     uint8_t navigationMatrixFovDeg_ = 40;
     uint8_t navigationGapConfirmFrames_ = 2;
@@ -311,6 +321,7 @@ private:
     uint16_t missionWeightVectorOvershootMm_ = 0;
     bool missionInnerWeightLocked_ = false;
     uint32_t missionInnerAlignStartedMs_ = 0;
+    uint32_t missionInnerCentreStableSinceMs_ = 0;
     uint32_t missionBlockedSinceMs_ = 0;
     uint32_t missionLastRerouteMs_ = 0;
     float missionReroutePoseXmm_ = 0.0f;
@@ -329,6 +340,8 @@ private:
     uint8_t missionSearchSamples_ = 0;
     uint8_t missionSearchCoverageSamples_ = 0;
     float missionSearchApproachHeadingDeg_ = 0.0f;
+    float missionSearchCenterXmm_ = 0.0f;
+    float missionSearchCenterYmm_ = 0.0f;
     uint8_t missionVerifyPhase_ = 0; // 0 idle, 1 pause, 2-4 scan, 5 reverse for retry
     uint8_t missionVerifyWaypoint_ = 255;
     uint8_t missionVerifyRetries_ = 0;
@@ -359,12 +372,22 @@ private:
     };
     MissionFeature missionFeatures_[MAX_MISSION_FEATURES] = {};
     uint8_t missionFeatureCount_ = 0;
-    uint16_t missionDummyExtraMm_ = 150;
+    // Clearance from the outer edge of the chassis to a dummy weight.
+    uint16_t missionDummyClearanceMm_ = 100;
     struct MissionBottomSensorPose {
         int16_t lateralMm = 0, forwardMm = 0, angleDeg = 0;
     };
     MissionBottomSensorPose missionBottomSensors_[4] = {};
     bool missionBottomSensorGeometryValid_ = false;
+    MissionBottomSensorPose missionTopSensors_[4] = {};
+    bool missionTopSensorGeometryValid_ = false;
+    uint32_t missionLastTopLandmarkSampleMs_[4] = {};
+    uint32_t missionLastTopLandmarkCorrectionMs_[4] = {};
+    uint8_t missionTopLandmarkMatches_[4] = {};
+    int8_t missionTopLandmarkIds_[4] = {-1, -1, -1, -1};
+    uint16_t missionTopLandmarkCorrections_ = 0;
+    uint8_t missionTopLocationConfirmations_ = 0;
+    bool navigationMatrixWallRejectedByTopTof_ = false;
     int16_t missionUltrasoundLateralMm_[2] = {};
     int16_t missionUltrasoundForwardMm_[2] = {};
     bool missionUltrasoundGeometryValid_ = false;
@@ -413,13 +436,18 @@ private:
     int8_t missionLastLandmarkId_ = -1;
 
     // Live low-object/weight visibility from matched bottom/top point-TOF pairs.
-    // Four sectors run far-left, mid-left, mid-right, far-right. A sector is
-    // confirmed only after three fresh 100 ms polls agree that the bottom TOF
-    // sees an object at least 150 mm closer than its matched top TOF.
+    // Four sectors run far-left, mid-left, mid-right, far-right. Evidence
+    // needs fresh polls and a 150 mm bottom/top height gap; confirmation count
+    // increases toward the outer edge of the planned 500 mm weight region.
     uint8_t weightEvidence_[4] = {};
+    uint32_t weightLastEvidenceMs_[4] = {};
+    uint32_t weightLastQualifiedMs_[4] = {};
+    uint8_t weightEvidenceWaypoint_[4] = {255, 255, 255, 255};
     uint8_t weightValidMask_ = 0;
     uint8_t weightGapMask_ = 0;
+    uint8_t weightFreshMask_ = 0;
     uint8_t weightTargetMask_ = 0;
+    float weightTargetConfidence_ = 0.0f;
     uint8_t weightMapWallMask_ = 0;
     uint8_t weightSectorMask_ = 0;
     uint16_t weightNearestMm_ = 0;
@@ -454,6 +482,8 @@ private:
     void updateMotionAndRangeSensors();
     void updateNavigation();
     void updateMissionPose(uint32_t now);
+    float expectedMappedSurfaceRange(float x, float y, float ux, float uy,
+                                     int8_t* surfaceId = nullptr) const;
     void stopNavigation(const char* reason = nullptr);
     void readTofSensors();
     void recoverTofSensorsIfNeeded();

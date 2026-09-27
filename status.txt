@@ -6389,3 +6389,304 @@ Not verified here:
   scope or meter reading of 3.3 V and sensor 5 V. A disconnect-and-reconnect
   test of the D23 signal could isolate whether the ADC input follows the
   physical sensor wire, but should only be done with robot power off.
+
+2026-09-27 — 21-run navigation review and responsiveness pass
+- Reviewed the newest 21 `.rdbg` recordings in `Non-Teensy-Files/DataVisualisationAfter/Data`.
+  The clearest full mission was `RobotRun_2026-09-27_22-41-18.rdbg`: it
+  left home, collected one weight (inductor confirmation at about 29.6 s),
+  centred/advanced toward another site, then auto-return began at about
+  71.8 s. The operator stopped at about 115.7 s before return completed.
+- On the return leg, map reroutes increased to three. Waypoint progress
+  stalled near (850, 1490) mm while the robot rotated through changing
+  headings for roughly 25 seconds; it never reached the home corridor. The
+  mission did not enter the explicit blocked/recovery state. The active route
+  waypoint remained around (1148, 1406) mm while reported heading targets
+  varied widely. This points to navigation tracking/replanning and pose
+  consistency, not a dead Bluetooth link: the run had 0 protocol errors and
+  continuous telemetry.
+- Across several of the 21 recordings, the point-TOF bank repeatedly logged
+  SX1509/I2C recovery failures. Firmware previously rejected planned missions
+  unless every point TOF was ready and stopped the drive bank on an outage.
+  The independent 8x8 TOF and side ultrasounds remain usable for travel, so
+  this was an unnecessary all-sensors hard gate.
+- Firmware now starts planned navigation in degraded point-TOF mode and
+  continues on the matrix TOF/side ultrasounds instead of forcing idle. A
+  full synchronous point-TOF reset is deferred during active navigation to
+  avoid multi-second Teensy/Bluetooth stalls; retry remains available once
+  navigation stops. The GUI warning now distinguishes reduced point-TOF
+  weight-centering from continued robot travel.
+- Known-wall side-ultrasound pose correction now tolerates up to 300 mm of
+  residual, requires four repeated readings for the same map landmark, and
+  applies a gradual correction of at most 18 mm per update. Previously it
+  accepted only 110 mm residual and applied at most 3 mm, too weak to recover
+  meaningful odometry/IMU drift.
+- Mission transit waypoint capture was tightened from 120 to 80 mm. Route
+  preview now engages closer to the waypoint and looks 180 mm ahead instead
+  of 300 mm, reducing corner cutting and drift away from the uploaded route.
+  Ordinary transit point-turn entry/exit thresholds were narrowed from
+  70/35 degrees to 45/24 degrees, keeping more turns on powered differential
+  arcs instead of prolonged stationary spins. Weight alignment thresholds
+  were left unchanged.
+- GUI responsiveness changes: telemetry values are coalesced into 100 ms
+  table batches, plotted history is retained only for selected signals and
+  capped at 3,000 samples, plots refresh at 5 Hz only while the Plots tab is
+  visible, and long log/raw-serial widgets are capped at 2,000/1,500 blocks.
+  The arena raw-value labels and 8x8 table avoid rewriting unchanged text.
+- These changes have been source-edited but require a fresh PlatformIO
+  firmware build and upload before robot behaviour changes. Do not treat the
+  navigation tuning as hardware-validated until a new recording confirms
+  reliable return-home completion and wall-based pose corrections.
+- Verification after these edits: PlatformIO Teensy 4.0 firmware build
+  succeeded; Python compilation succeeded; all 20 hardware-free
+  `test_mission_navigation` GUI tests pass offscreen. The only PlatformIO
+  warning is the existing unused-parameter warning in Teensy's Wire header.
+
+2026-09-27 — Three failed starts and delayed inductive confirmation
+- Compared the 23:23:41, 23:26:00 and 23:27:23 recordings with the earlier
+  22:41:18 run. The 23:23 run was the only one of this group to leave home.
+  The other attempts aligned to a fixed 270-degree launch heading, then held
+  the second motor bank at 0% because the forward range remained 242–262 mm
+  (the launch code has a hard 380 mm gate). The route uploaded for those runs
+  instead leaves home diagonally toward its first meaningful transit point,
+  at about 311 degrees. Repeated start commands in the 23:26 run simply
+  restarted the same invalid heading and hold.
+- In the 23:23 run the inductor confirmed the physically sorted weight at
+  29.5 s and moved the bumper/gate, but mission logic logged “confirmed
+  without a matching active weight site.” The sensor confirmation arrived
+  during the post-drive-through verification phase, which was omitted from
+  the active-site attribution condition. This left the route searching that
+  site again despite a real sorter event.
+- That successful run also failed its first return-home docking turn: the
+  stage target was approximately 315.5 degrees, while the IMU repeatedly
+  swung around the target under fixed 85% turn output; the 18 s dock timeout
+  stopped navigation. Three front-wall retreats preceded the stage turn.
+- Firmware now derives the launch heading from the first meaningful uploaded
+  transit leg, checks the forward corridor along that actual diagonal, and
+  skips passed waypoints using projection along the same vector. The fine
+  phase of shared heading turns now uses 75% rather than fixed 85% power and
+  requires a 250 ms settled interval. Inductive detection during the matching
+  current site's verification phase now completes that site rather than
+  being discarded as unassigned.
+- The newly built Teensy firmware must be uploaded before these latest fixes
+  can affect the robot. Validate with an initial launch heading/front-range trace,
+  then verify that `sorting.confirmed` advances the active site and that the
+  return-home docking phase reaches gate-open/unload instead of timing out.
+- The revised Teensy 4.0 firmware build completed successfully after these
+  edits. Only the existing unused-parameter warning from the Teensy Wire
+  framework remains; the new project code emits no build warning.
+
+2026-09-28 — Home exit and weight-site search review
+- Compared the three newest recordings (23:59:50, 00:00:43 and 00:01:17).
+  In the first two, launch heading alignment completed but both drive outputs
+  stayed at zero: a fixed 380 mm front-range gate rejected the steady 371 mm
+  reading. The map/corridor check was independent of that range gate.
+- The third run left home and reached the first target. Its site search used
+  only two narrow flank offsets (150 mm on the first sweep and 100 mm on the
+  repeat), then returned to the planned waypoint. That can put the search
+  back on the uploaded route rather than around the measured weight location.
+- The home-exit-only front threshold is now 70 mm. Normal navigation obstacle
+  thresholds are unchanged. The mapped corridor check and heading check still
+  have to pass before the launch drive is commanded.
+- Planned weight-site search now uses the most recent valid sensor bearing as
+  the search centre when available, otherwise the planned site. Its approach
+  axis follows that bearing, and the first lateral sweep radius defaults to
+  350 mm (configurable 150–800 mm from Arena View > Navigation tuning or the
+  Parameters tab); a repeat sweep uses 70% of the selected radius. Telemetry
+  records the active search centre and radius. Search timeout was lengthened
+  to 40 s so the wider sweep can complete.
+- Verification: `debug_config.json` parses; ArenaView.py passes Python syntax
+  compilation; Teensy 4.0 PlatformIO firmware build succeeds. GUI unit tests
+  could not run in the available Python environment because PyQt6 is absent.
+  Firmware has not been uploaded or hardware-tested; the next run should show
+  `mission.launch_blocked=false`, launch distance increasing, and search
+  centre/radius values in telemetry.
+
+2026-09-28 — Manual driving compared with three autonomous attempts
+- Reviewed `RobotRun_2026-09-28_00-24-02.rdbg`, `00-20-07.rdbg`, and
+  `00-01-17.rdbg` as the three newest attempts; `00-00-43.rdbg` is included
+  as an additional diagnostic because it shows the earlier home-exit failure.
+- In `00-24-02`, autonomous navigation starts at 2.6 s and exits home at
+  6.6 s, then declares the first route leg blocked at 7.2 s. It tries a
+  bounded reverse twice; the second attempt reports no encoder progress and
+  the pose stays around x=520, y=1,875 mm until STOP at 51.2 s. The human
+  keyboard-drive commands begin at 54.6 s, so the later manually driven
+  movement is a separate control phase, not a successful autonomous segment.
+- `00-20-07` is the most complete autonomous attempt: it exits home, reaches
+  the target area, starts a weight vector and pickup check, then searches for
+  about 40 s and marks the site incomplete. It begins its home return at
+  113.2 s, starts the reverse-docking phase at 121.1 s and is stopped at
+  136.7 s before docking finishes. Manual keyboard commands begin only after
+  that stop.
+- Weight acquisition is the common failure: all three newest recordings have
+  `weight.sector_mask=0`, `sorting.detected=false`, and
+  `sorting.confirmed=false` throughout. In `00-24-02` and `00-01-17`, the
+  point-TOF bank reports zero ready sensors for the entire recording and the
+  weight valid mask stays zero. In `00-20-07`, the bank is intermittent
+  (7/8 sensors ready for much of the recording, but also 0/8), and the four
+  bottom TOFs often report the 8191 mm timeout sentinel during approach and
+  search. A nonzero raw valid/target mask did not become a stable bearing or
+  sector, so autonomy had no reliable weight lock or sorter confirmation.
+- The manual section behaves better because the operator visually closes the
+  loop and sends direct differential motor commands; it is not subject to
+  autonomous route blocking, point-TOF candidate rejection, or the weight
+  vector/search state machine. This comparison points to autonomous sensing
+  and recovery—not a general inability of the drive motors to move—as the
+  dominant difference. The recordings do not prove which individual sensor
+  is electrically at fault; they do prove the firmware had no stable bottom
+  TOF weight candidate during these runs.
+- `00-00-43` separately confirms the 371 mm front reading held against the
+  old 380 mm launch gate with zero encoder movement. The source was changed
+  to 70 mm for the home-exit-only range check, but the data must be retaken
+  after uploading the rebuilt firmware to verify that correction.
+- Important test interpretation: after navigation is stopped, mission pose
+  telemetry continues changing under manual keyboard drive and is not a valid
+  measure of autonomous path tracking. Use only the active-navigation portion
+  when evaluating route/pose performance.
+
+2026-09-28 — Non-blocking point-TOF polling and weight evidence
+- Changed the point-TOF library to poll continuous-mode readiness before
+  reading. The previous VL53L0X/VL53L1X calls could wait synchronously for up
+  to 500 ms per sensor; with eight sensors, a missed conversion could stall
+  navigation, Bluetooth command handling, and telemetry for a long interval.
+- Fresh ranges are now consumed only when the sensor reports a completed
+  measurement. The firmware keeps each last range between conversions and
+  marks it stale after 250 ms without a new sample. This prevents repeated
+  reads of the same measurement from counting as independent evidence.
+- Weight-sector confirmation now accumulates only on fresh, qualified
+  top/bottom observations, preserves evidence through a brief (350 ms) sample
+  dropout, and resets on a fresh contradictory observation or a longer gap.
+  Evidence is also scoped to the active waypoint so it cannot carry from one
+  weight site to another. The inner-sensor pair still has to agree before it
+  creates the fused centered-weight vector; this does not relax the actual
+  collection check.
+- Verification: Teensy 4.0 PlatformIO build succeeds. Only the existing
+  unused-parameter warning in the Teensy Wire framework remains. Firmware was
+  not uploaded or hardware-tested in this change; next run should be checked
+  for steady link telemetry, responsive commands, updated TOF distances, and
+  nonzero `weight.sector_mask` / `weight.bearing_*` near a real target.
+
+2026-09-28 — Top-TOF map confirmation and reconnect cadence
+- Reviewed the newest three recordings (00:48:57, 00:51:37, 00:53:39). In
+  every run all eight point TOFs were unavailable (0/8 ready) even though the
+  I2C0 expander reported present; both central top TOFs were timed out for the
+  full recording, so they could not corroborate the suspected wall. The newest
+  run logged repeated bounded-reverse/blocked events, but its sampled matrix
+  broad-wall consensus was mostly false; the single front-range estimate is
+  not enough to establish that a persistent mapped wall was present.
+- Added editable top-TOF placement upload with mission maps. During a planned
+  mission, fresh top-TOF readings are ray-matched only against the known arena
+  perimeter and placed physical walls. Four consistent samples against the
+  same mapped surface produce a small bounded pose correction. Unknown short
+  returns never shift the robot's estimated location.
+- A broad 8x8 close-wall return can now be discounted only when both central
+  top TOFs independently match the same known mapped surface farther ahead.
+  If either top sensor is missing, or the map does not corroborate both, the
+  original obstacle response remains in force. Telemetry now exposes top-TOF
+  map confirmations/corrections, whether matrix wall evidence was rejected,
+  and the duration of the last bank-recovery attempt.
+- Point-TOF bank recovery now retries every 5 s while the entire bank is down
+  (3 s while navigation is stopped), instead of waiting 10 s; a partially
+  healthy bank is not reset during a run. Reconnection success still depends
+  on the hardware responding on I2C0/XSHUT.
+- Verification: Teensy 4.0 firmware compiles successfully. The GUI mission
+  test could not run because PyQt6 is not installed in this environment;
+  `git diff --check` is clean. Firmware has not been uploaded or physically
+  tested. Check `tof.bank_ready_count`, `tof.last_recovery_duration_ms`,
+  `mission.top_tof_location_confirmations`, and
+  `navigation.matrix_wall_rejected_by_top_tof` on the next run.
+
+2026-09-28 — Graded 500 mm weight search, TOF self-reconnect, and post-unload roam
+- Reviewed the two newest recordings: `RobotRun_2026-09-28_01-17-39.rdbg`
+  and `RobotRun_2026-09-28_01-21-38.rdbg`. The first file contains two mission
+  attempts: the point-TOF bank degraded almost immediately in the first and
+  later reached 0/8 ready; the second attempt did confirm one pickup only after
+  leaving the weight site. In the 01:21:38 run, weight-site search did not begin
+  until about 26 s into the run, when the robot was already at the waypoint.
+  It then collected six search samples (four with valid range coverage), but
+  no inductor confirmation occurred. One point TOF dropped out at 28 s and
+  stayed out while moving because the previous recovery policy waited for the
+  entire bank to fail. The robot reached the return-home staging point at 72 s
+  but timed out during its 18 s heading-turn phase; therefore it never reached
+  home, opened the gate, or ran the unload shake in that recording.
+- Weight-site search now begins once the robot is within 500 mm of a planned
+  weight. The editable search radius defaults to 500 mm; its two lateral sweep
+  points are placed on the corresponding radius rather than extending past it.
+  Point-TOF evidence is location-weighted with a quadratic confidence falloff
+  (1 at the planned centre, 0 at the 500 mm perimeter). Near-centre detections
+  need two fresh confirmations, mid-radius detections three or four, and edge
+  detections five. Single-sensor sightings remain search/direction evidence;
+  weight collection still requires the existing inner-sensor centering checks.
+  `weight.target_confidence` exposes the current graded confidence in telemetry.
+- Failed or stale point TOFs are now rebooted individually through their own
+  XSHUT line every 2.5 s while navigating (1.5 s while stopped), preserving
+  working TOFs instead of repeatedly resetting the whole bank or leaving a
+  single sensor offline. A retry uses a 120 ms driver timeout and produces a
+  per-sensor reconnect log. If the I2C0 expander itself is absent, a full-bank
+  retry is deferred until navigation is stopped.
+- After a successful return home, the existing gate-open and four-leg/two-cycle
+  encoder-checked shimmy remain in place. At the end of unloading the gate
+  closes and navigation switches to strategy 4, `Reactive wander`, to head back
+  into the arena without resuming the planned route or stopping. The algorithm
+  dropdown now includes this strategy.
+- Verification: Teensy 4.0 firmware build passed. `ArenaView.py` passes Python
+  byte-compilation and `git diff --check` is clean. The focused GUI unit tests
+  could not run because PyQt6 is unavailable in this environment. Firmware was
+  not uploaded or hardware-tested. The latest recording did not reach home, so
+  the unload-and-roam transition remains unverified on the physical robot; its
+  home-staging turn timeout is unchanged by this work.
+
+2026-09-28 — Tighter weight-centering and earlier approach slowdown
+- Reviewed `RobotRun_2026-09-28_01-42-02.rdbg` and the short follow-up run
+  `RobotRun_2026-09-28_01-44-37.rdbg`. In the first, 500 mm site search began
+  as intended, an inner-pair lock was made at 30 s, and the robot drove through
+  the site, but the lock used an 80 mm raw-distance tolerance and could be made
+  from a short-lived good pair. The second run began with the far-left bottom
+  TOF offline and was blocked by a close frontal return before it reached the
+  search region, so it provides no valid centering result.
+- Inner TOF centering now makes a full correction above 50 mm mismatch, makes
+  a gentler correction between 25 and 50 mm, and commits to a drive-through
+  only after the mismatch is within 25 mm and remains there for 300 ms after a
+  fresh paired inner-TOF observation. The smaller correction uses 90/75 rather
+  than 100/75 drive, reducing centreline overshoot. Every restart, stop, and
+  loss of the pair clears the centering hold state.
+- Weight-site approach now starts slowing at 800 mm: it uses 75% before the
+  search boundary, then switches to the collection-safe 65% as soon as the
+  500 mm early-search trigger becomes active. This includes the lateral search
+  sweep and the actual collection vector; normal mission legs retain their
+  existing speeds.
+
+2026-09-28 — Mission clearance controls and tighter route tracking
+- Reviewed `RobotRun_2026-09-28_01-55-55.rdbg` and
+  `RobotRun_2026-09-28_01-57-57.rdbg`. The first run never cleared its first
+  route leg: it repeatedly reported the leg blocked while its forward range
+  was roughly 254–320 mm. The second repeatedly inserted/skipped route
+  corners, reversed, and restarted bypasses before reaching the planned
+  weight-search sequence. In both runs the desktop map had a dummy extra
+  berth of 0 mm, so the large avoidance behaviour was not caused by the dummy
+  setting.
+- The firmware was imposing an undocumented 400 mm mission stop distance even
+  when the visible front-stop control was set lower. That floor has been
+  removed. `Mission front wall stop` is now the actual stop threshold, with a
+  70 mm minimum hard-contact floor; default is 150 mm. This makes the value
+  on the Arena View the value used by the robot.
+- Added `Wall clearance (edge)` to the Arena View Navigation tuning tab and
+  `Mapped wall clearance (robot edge)` to the normal Parameters page. It is
+  the absolute gap from the outer chassis edge to a mapped wall (default
+  30 mm), rather than an indirect gap-margin setting. The desktop planner and
+  firmware now use the same calculation.
+- The mission editor control is now `Dummy clearance (robot edge)`. It is an
+  absolute chassis-edge gap from a dummy weight, independent of the wall
+  clearance. Existing saved layouts using `dummy_extra_mm` load without losing
+  their value, and the firmware still accepts that previous upload field.
+- Added editable `Route line tolerance` (default 100 mm). A transit waypoint
+  can only be skipped when the robot is inside this tolerance; it can no
+  longer cut directly to a following leg from up to 240 mm off the planned
+  line.
+- Removed two hidden map-planner margins: the desktop path generator no longer
+  first adds 100 mm or 60 mm to the requested wall clearance, and on-robot
+  rerouting no longer adds an unshown 20 mm. A route is therefore planned and
+  re-planned at the exact wall and dummy clearances displayed in the GUI.
+- Verification: `ArenaView.py` byte-compiles, `git diff --check` is clean,
+  and the Teensy 4.0 PlatformIO build passed. These values need a physical
+  run; start with front wall stop 120–150 mm, wall clearance 20–40 mm, dummy
+  clearance 75–125 mm, and route line tolerance 75–100 mm.

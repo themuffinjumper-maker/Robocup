@@ -1157,7 +1157,8 @@ class MissionLayout:
     HOME_WIDTH_MM = 650.0
     HOME_HEIGHT_MM = 650.0
     ROBOT_RADIUS_MM = 215.0
-    SAFETY_MARGIN_MM = 90.0
+    # Physical clearance from the robot's outer edge to a wall.
+    SAFETY_MARGIN_MM = 30.0
     GRID_MM = 100.0
     MAX_ROUTE_POINTS = 64
     REFERENCE_LINE_COUNT = 7
@@ -1171,7 +1172,8 @@ class MissionLayout:
     def __init__(self):
         self.my_home = "green"
         self.fallback_strategy = 0
-        self.dummy_extra_mm = 150.0
+        # Physical clearance from the robot's outer edge to a dummy weight.
+        self.dummy_clearance_mm = 100.0
         self.start = {"x": 325.0, "y": 325.0, "heading_deg": 0.0}
         self.weights = []
         self.obstacles = []
@@ -1314,8 +1316,9 @@ class MissionLayout:
                 continue
             dummy_rect = (item["x"] - 120, item["y"] - 120,
                           item["x"] + 120, item["y"] + 120)
+            dummy_clearance = self.ROBOT_RADIUS_MM + self.dummy_clearance_mm
             if self._inside_rect(x, y, self._inflate_rect(
-                    dummy_rect, clearance + self.dummy_extra_mm)):
+                    dummy_rect, dummy_clearance)):
                 return True
         return False
 
@@ -1428,27 +1431,18 @@ class MissionLayout:
                    for a, b in zip(path, path[1:]))
 
     def _travel_path(self, start, goal):
-        """Prefer room for an arc, falling back to the normal safe corridor."""
-        base_margin = self.SAFETY_MARGIN_MM
-        try:
-            for extra in (100.0, 60.0, 0.0):
-                self.SAFETY_MARGIN_MM = base_margin + extra
-                path = self._astar(start, goal)
-                self.SAFETY_MARGIN_MM = base_margin
-                if not path:
-                    continue
-                if not self._segment_clear(start, path[0]) or \
-                        not self._segment_clear(path[-1], goal):
-                    continue
-                if math.dist(start, path[0]) > 1.0:
-                    path.insert(0, (float(start[0]), float(start[1])))
-                if math.dist(path[-1], goal) > 1.0:
-                    path.append((float(goal[0]), float(goal[1])))
-                if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])):
-                    return path
-        finally:
-            self.SAFETY_MARGIN_MM = base_margin
-        return None
+        """Plan at precisely the clearance displayed to the operator."""
+        path = self._astar(start, goal)
+        if not path:
+            return None
+        if not self._segment_clear(start, path[0]) or \
+                not self._segment_clear(path[-1], goal):
+            return None
+        if math.dist(start, path[0]) > 1.0:
+            path.insert(0, (float(start[0]), float(start[1])))
+        if math.dist(path[-1], goal) > 1.0:
+            path.append((float(goal[0]), float(goal[1])))
+        return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
 
     def docking_path(self, start, home):
         """Route to a clear turning point, then a straight reversing corridor."""
@@ -1631,13 +1625,13 @@ class MissionLayout:
                              min(4900, int(round(x1))), min(2400, int(round(y1))),
                              kind])
         return {"features": features, "rotated_walls": rotated_walls,
-                "dummy_extra_mm": int(round(self.dummy_extra_mm))}
+                "dummy_clearance_mm": int(round(self.dummy_clearance_mm))}
 
     def to_dict(self):
         return {
             "my_home": self.my_home,
             "fallback_strategy": self.fallback_strategy,
-            "dummy_extra_mm": self.dummy_extra_mm,
+            "dummy_clearance_mm": self.dummy_clearance_mm,
             "start": self.start,
             "weights": self.weights,
             "obstacles": self.obstacles,
@@ -1650,8 +1644,11 @@ class MissionLayout:
         if data.get("my_home") in ("green", "blue"):
             self.my_home = data["my_home"]
         self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
-        self.dummy_extra_mm = max(0.0, min(500.0,
-            float(data.get("dummy_extra_mm", 150.0))))
+        # Read the previous field too, so existing layouts retain their
+        # selected dummy berth after this update.
+        self.dummy_clearance_mm = max(0.0, min(500.0,
+            float(data.get("dummy_clearance_mm",
+                           data.get("dummy_extra_mm", 100.0)))))
         start = data.get("start", {})
         self.start = {
             "x": float(start.get("x", 325.0)),
@@ -2790,12 +2787,12 @@ class ArenaView(QWidget):
         self.mission_dummy_extra.setRange(0, 500)
         self.mission_dummy_extra.setDecimals(0)
         self.mission_dummy_extra.setSuffix(" mm")
-        self.mission_dummy_extra.setValue(self.mission_layout.dummy_extra_mm)
+        self.mission_dummy_extra.setValue(self.mission_layout.dummy_clearance_mm)
         self.mission_dummy_extra.setToolTip(
-            "Extra distance from a dummy weight beyond the robot radius and normal safety margin.")
+            "Absolute distance from the robot's outer edge to a dummy weight.")
         self.mission_dummy_extra.valueChanged.connect(
             self._mission_dummy_extra_changed)
-        selection_form.addRow("Dummy extra berth", self.mission_dummy_extra)
+        selection_form.addRow("Dummy clearance (robot edge)", self.mission_dummy_extra)
         inspector_layout.addWidget(selection_group)
 
         visibility_group = QGroupBox("Live weight visibility")
@@ -3034,7 +3031,7 @@ class ArenaView(QWidget):
         self._save_mission_layout()
 
     def _mission_dummy_extra_changed(self, value):
-        self.mission_layout.dummy_extra_mm = float(value)
+        self.mission_layout.dummy_clearance_mm = float(value)
         self._mission_layout_changed()
 
     def _navigation_strategy_changed(self, index):
@@ -3048,9 +3045,8 @@ class ArenaView(QWidget):
         self.mission_layout.ROBOT_RADIUS_MM = (
             self.navigation_tuning_controls["robot_width_mm"].value() * 0.5
         )
-        self.mission_layout.SAFETY_MARGIN_MM = max(
-            40.0, self.navigation_tuning_controls["gap_margin_mm"].value()
-        )
+        self.mission_layout.SAFETY_MARGIN_MM = self.navigation_tuning_controls[
+            "wall_clearance_mm"].value()
         if self.mission_layout.plan():
             target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
             length = MissionLayout._path_length(
@@ -3068,30 +3064,33 @@ class ArenaView(QWidget):
 
     def _build_navigation_tuning_panel(self):
         self.navigation_tuning_tabs = QTabWidget()
-        self.navigation_tuning_tabs.setMaximumHeight(245)
+        self.navigation_tuning_tabs.setMaximumHeight(285)
         page = QWidget()
         grid = QGridLayout(page)
         self.navigation_strategy = QComboBox()
         self.navigation_strategy.addItems([
             "Balanced coverage", "Gap explorer", "Conservative wall-safe",
-            "Pre-laid mission"
+            "Pre-laid mission", "Reactive wander"
         ])
         self.navigation_strategy.setCurrentIndex(max(0, min(
-            3, int(self.settings.value("navigation/strategy", 0)))))
+            4, int(self.settings.value("navigation/strategy", 0)))))
         self.navigation_strategy.currentIndexChanged.connect(
             self._navigation_strategy_changed
         )
         grid.addWidget(QLabel("Algorithm"), 0, 0)
         grid.addWidget(self.navigation_strategy, 0, 1)
         definitions = [
-            ("front_avoid_mm", "Front stop", 300, 100, 1000),
+            ("front_avoid_mm", "Front wall stop", 150, 70, 600),
             ("matrix_wall_mm", "8×8 wall consensus", 400, 200, 800),
             ("side_avoid_mm", "Side clearance", 200, 80, 800),
             ("wall_follow_mm", "Wall-follow distance", 200, 80, 1000),
             ("lane_spacing_mm", "Sweep spacing", 200, 80, 1000),
             ("robot_width_mm", "Robot width", 430, 100, 1200),
+            ("wall_clearance_mm", "Wall clearance (edge)", 30, 0, 300),
+            ("route_line_tolerance_mm", "Route line tolerance", 100, 30, 300),
             ("gap_margin_mm", "Gap safety margin", 80, 0, 500),
             ("gap_depth_mm", "Open-gap depth", 550, 250, 3000),
+            ("weight_search_radius_mm", "Weight search radius", 500, 150, 800),
             ("matrix_floor_rows", "Ignore bottom 8×8 rows", 2, 0, 4),
             ("matrix_fov_deg", "8×8 horizontal FOV", 40, 20, 90),
             ("gap_confirm_frames", "Gap confirmation frames", 2, 1, 5),
@@ -3110,7 +3109,7 @@ class ArenaView(QWidget):
             self.navigation_tuning_controls[name] = control
         apply_button = QPushButton("APPLY NAVIGATION TUNING")
         apply_button.clicked.connect(self._apply_navigation_tuning)
-        grid.addWidget(apply_button, 5, 0, 1, 6)
+        grid.addWidget(apply_button, 6, 0, 1, 6)
         self.navigation_tuning_tabs.addTab(page, "Navigation tuning")
 
     def _start_run(self):
@@ -3196,11 +3195,17 @@ class ArenaView(QWidget):
         payload = self.mission_layout.map_payload()
         bottom_names = ("bottom_left_left", "bottom_mid_left",
                         "bottom_mid_right", "bottom_right_right")
+        top_names = ("top_left_left", "top_mid_left",
+                     "top_mid_right", "top_right_right")
         specs = {item.get("name"): item for item in self.model.sensor_specs}
         if all(name in specs for name in bottom_names):
             payload["bottom_sensors"] = [
                 int(round(specs[name][field]))
                 for name in bottom_names for field in ("x", "y", "angle")]
+        if all(name in specs for name in top_names):
+            payload["top_sensors"] = [
+                int(round(specs[name][field]))
+                for name in top_names for field in ("x", "y", "angle")]
         ultrasound = {item.get("telemetry_name"): item
                       for item in self.model.ultrasound_specs}
         if all(name in ultrasound for name in ("a", "b")):
@@ -3229,8 +3234,8 @@ class ArenaView(QWidget):
             y = float(layout.start["y"])
         layout.ROBOT_RADIUS_MM = (
             self.navigation_tuning_controls["robot_width_mm"].value() * 0.5)
-        layout.SAFETY_MARGIN_MM = (10.0 if manual_pose else max(
-            40.0, self.navigation_tuning_controls["gap_margin_mm"].value()))
+        layout.SAFETY_MARGIN_MM = (10.0 if manual_pose else
+            self.navigation_tuning_controls["wall_clearance_mm"].value())
         if layout.blocked(x, y):
             self.mission_status.setText(
                 "RETURN HOME unavailable: current pose is inside mapped "
@@ -3384,8 +3389,11 @@ class ArenaView(QWidget):
             text, colour = f"{distance:g} mm · invalid", "#f59e0b"
         else:
             text, colour = f"{distance:g} mm", "#22c55e"
-        label.setText(text)
-        label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
+        if label.text() != text:
+            label.setText(text)
+        if label.property("_value_colour") != colour:
+            label.setProperty("_value_colour", colour)
+            label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
 
     def _rebuild_raw_ultrasound_rows(self):
         while self.raw_ultrasound_grid.count():
@@ -3434,8 +3442,11 @@ class ArenaView(QWidget):
         else:
             text, colour = "—", "#9ca3af"
 
-        label.setText(text)
-        label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
+        if label.text() != text:
+            label.setText(text)
+        if label.property("_value_colour") != colour:
+            label.setProperty("_value_colour", colour)
+            label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
 
     def _refresh_raw_matrix(self, message):
         available = bool(message.get("available"))
@@ -3451,14 +3462,17 @@ class ArenaView(QWidget):
             return
         address = _number(message.get("address"))
         address_text = f"0x{int(address):02X}" if address is not None else "?"
-        self.raw_matrix_status.setText(
-            f"Frame {message.get('frame', '?')} · {message.get('bus', 'I2C')} · "
-            f"address {address_text}"
-        )
+        status = (f"Frame {message.get('frame', '?')} · {message.get('bus', 'I2C')} · "
+                  f"address {address_text}")
+        if self.raw_matrix_status.text() != status:
+            self.raw_matrix_status.setText(status)
         for row in range(8):
             for col in range(8):
                 value = _number(values[row * 8 + col])
-                self.raw_matrix_cells[row][col].setText("—" if value is None else f"{value:g}")
+                text = "—" if value is None else f"{value:g}"
+                cell = self.raw_matrix_cells[row][col]
+                if cell.text() != text:
+                    cell.setText(text)
 
     def reload_sensor_layout(self):
         """Join firmware telemetry names to the user's persisted port guide."""
@@ -3778,10 +3792,13 @@ class ArenaView(QWidget):
             attempts = int(_number(m.latest.get("tof.recovery_attempts")) or 0)
             expander = m.latest.get("tof.expander_available")
             cause = ("I2C0 expander is not responding. " if expander is False
-                     else "Automatic XSHUT-bank reset is retrying. ")
+                     else "Recovery is deferred until navigation stops. "
+                     if m.latest.get("mission.active") is True else
+                     "Automatic XSHUT-bank reset is retrying. ")
             point_tof_warning = (
-                f"POINT TOFS OFFLINE ({online}/{len(m.sensor_specs)}): {cause}"
-                f"Recovery attempts: {attempts}. Weight centring is unavailable. "
+                f"POINT TOFS DEGRADED ({online}/{len(m.sensor_specs)}): {cause}"
+                f"Recovery attempts: {attempts}. Mission travel continues using "
+                "8x8 TOF and side ultrasounds; point-TOF weight centring may be reduced. "
             )
         ultrasound_valid = sum(
             m.latest.get(f"ultrasound.{spec['telemetry_name']}.valid") is True

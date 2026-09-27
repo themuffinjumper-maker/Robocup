@@ -339,6 +339,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionOdometryRejectedSteps_ = 0;
         missionFeatureCount_ = 0;
         missionBottomSensorGeometryValid_ = false;
+        missionTopSensorGeometryValid_ = false;
+        missionTopLocationConfirmations_ = 0;
         missionUltrasoundGeometryValid_ = false;
         missionReturnHome_ = false;
         missionAutoReturnHome_ = false;
@@ -366,10 +368,13 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             return;
         }
         JsonArray values = message["features"].as<JsonArray>();
-        const int dummyExtraMm = message["dummy_extra_mm"] | 150;
-        if (dummyExtraMm < 0 || dummyExtraMm > 500)
+        // dummy_extra_mm was the old desktop field.  Keep accepting it so a
+        // saved layout made with an older GUI still uploads cleanly.
+        const int dummyClearanceMm = message["dummy_clearance_mm"] |
+            (message["dummy_extra_mm"] | 100);
+        if (dummyClearanceMm < 0 || dummyClearanceMm > 500)
         {
-            link_.error("Dummy extra berth must be 0-500 mm");
+            link_.error("Dummy clearance must be 0-500 mm");
             return;
         }
         if (values.size() % 5 != 0 || values.size() / 5 > MAX_MISSION_FEATURES)
@@ -428,6 +433,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         }
         MissionBottomSensorPose sensorPoses[4] = {};
         bool sensorGeometryValid = false;
+        MissionBottomSensorPose topSensorPoses[4] = {};
+        bool topSensorGeometryValid = false;
         int16_t ultrasoundLateral[2] = {};
         int16_t ultrasoundForward[2] = {};
         bool ultrasoundGeometryValid = false;
@@ -456,6 +463,30 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             }
             sensorGeometryValid = true;
         }
+        if (message["top_sensors"].is<JsonArray>())
+        {
+            JsonArray sensors = message["top_sensors"].as<JsonArray>();
+            if (sensors.size() != 12U)
+            {
+                link_.error("Mission top sensor geometry requires four x,y,angle triples");
+                return;
+            }
+            for (uint8_t i = 0; i < 4; ++i)
+            {
+                const int lateral = sensors[3U * i].as<int>();
+                const int forward = sensors[3U * i + 1U].as<int>();
+                const int angle = sensors[3U * i + 2U].as<int>();
+                if (abs(lateral) > 600 || abs(forward) > 600 || abs(angle) > 180)
+                {
+                    link_.error("Mission top sensor geometry is outside robot bounds");
+                    return;
+                }
+                topSensorPoses[i].lateralMm = lateral;
+                topSensorPoses[i].forwardMm = forward;
+                topSensorPoses[i].angleDeg = angle;
+            }
+            topSensorGeometryValid = true;
+        }
         if (message["ultrasound_offsets"].is<JsonArray>())
         {
             JsonArray offsets = message["ultrasound_offsets"].as<JsonArray>();
@@ -480,10 +511,17 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         }
         for (uint8_t i = 0; i < count; ++i) missionFeatures_[i] = parsed[i];
         missionFeatureCount_ = count;
-        missionDummyExtraMm_ = static_cast<uint16_t>(dummyExtraMm);
+        missionDummyClearanceMm_ = static_cast<uint16_t>(dummyClearanceMm);
         for (uint8_t i = 0; i < 4; ++i)
             missionBottomSensors_[i] = sensorPoses[i];
         missionBottomSensorGeometryValid_ = sensorGeometryValid;
+        for (uint8_t i = 0; i < 4; ++i)
+            missionTopSensors_[i] = topSensorPoses[i];
+        missionTopSensorGeometryValid_ = topSensorGeometryValid;
+        memset(missionLastTopLandmarkSampleMs_, 0, sizeof(missionLastTopLandmarkSampleMs_));
+        memset(missionTopLandmarkMatches_, 0, sizeof(missionTopLandmarkMatches_));
+        for (uint8_t i = 0; i < 4; ++i)
+            missionTopLandmarkIds_[i] = -1;
         for (uint8_t i = 0; i < 2; ++i)
         {
             missionUltrasoundLateralMm_[i] = ultrasoundLateral[i];
@@ -594,6 +632,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionWeightVectorOvershootMm_ = 0;
         missionInnerWeightLocked_ = false;
         missionInnerAlignStartedMs_ = 0;
+        missionInnerCentreStableSinceMs_ = 0;
         missionBlockedSinceMs_ = 0;
         missionLastRerouteMs_ = 0;
         missionReroutePoseValid_ = false;
@@ -976,12 +1015,12 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             link_.error("Pre-laid mission strategy requires a planned route from Arena View");
             return;
         }
+        // Point TOFs improve weight detection, but they are not the only
+        // navigation sensors. Do not reject a mission just because this bank
+        // is offline: matrix TOF + side ultrasound remain available for travel.
         if (navigationStrategy_ == 3 &&
             (tofSensorCount_ == 0 || tofReadyCount_ != tofSensorCount_))
-        {
-            link_.error("Point TOFs unavailable; wait for automatic I2C0 recovery before starting mission");
-            return;
-        }
+            link_.log("WARNING", "Starting mission with degraded point TOFs; using remaining ranging sensors");
         navigationActive_ = true;
         // B is the storage-release gate: keep it shut throughout travel.
         hx12kB_.setAngle(50.0f);
@@ -1032,6 +1071,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionWeightVectorOvershootMm_ = 0;
         missionInnerWeightLocked_ = false;
         missionInnerAlignStartedMs_ = 0;
+        missionInnerCentreStableSinceMs_ = 0;
         missionBlockedSinceMs_ = 0;
         missionLastRerouteMs_ = 0;
         missionRerouteCount_ = 0;
@@ -1363,10 +1403,16 @@ void BluetoothDebugWorkflow::handleParameter(JsonDocument& message)
         navigationLaneSpacingMm_ = parameter["value"].as<uint16_t>();
     else if (strcmp(name, "navigation.robot_width_mm") == 0)
         navigationRobotWidthMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.wall_clearance_mm") == 0)
+        navigationWallClearanceMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.route_line_tolerance_mm") == 0)
+        navigationRouteLineToleranceMm_ = parameter["value"].as<uint16_t>();
     else if (strcmp(name, "navigation.gap_margin_mm") == 0)
         navigationGapMarginMm_ = parameter["value"].as<uint16_t>();
     else if (strcmp(name, "navigation.gap_depth_mm") == 0)
         navigationGapDepthMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.weight_search_radius_mm") == 0)
+        navigationWeightSearchRadiusMm_ = parameter["value"].as<uint16_t>();
     else if (strcmp(name, "navigation.matrix_floor_rows") == 0)
         navigationMatrixFloorRows_ = parameter["value"].as<uint8_t>();
     else if (strcmp(name, "navigation.matrix_fov_deg") == 0)
@@ -1681,6 +1727,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.matrix_close_zones"] = navigationMatrixCloseZones_;
     data["navigation.matrix_usable_zones"] = navigationMatrixUsableZones_;
     data["navigation.matrix_broad_wall"] = navigationMatrixBroadWall_;
+    data["navigation.matrix_wall_rejected_by_top_tof"] =
+        navigationMatrixWallRejectedByTopTof_;
     if (navigationState_ == NAV_SWEEP)
     {
         const bool remainingSideValid = navigationSweepTurnRight_
@@ -1803,6 +1851,9 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.skipped_route_points"] = missionSkippedWaypoints_;
     data["mission.search_active"] = missionSearchWaypoint_ == missionWaypointIndex_;
     data["mission.search_step"] = missionSearchStep_;
+    data["mission.search_center_x_mm"] = missionSearchCenterXmm_;
+    data["mission.search_center_y_mm"] = missionSearchCenterYmm_;
+    data["mission.search_radius_mm"] = navigationWeightSearchRadiusMm_;
     data["mission.search_samples"] = missionSearchSamples_;
     data["mission.search_valid_range_samples"] = missionSearchCoverageSamples_;
     data["mission.search_sites_checked"] = missionSearchSitesChecked_;
@@ -1811,6 +1862,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.landmark_recovery_count"] = missionLandmarkRecoveryCount_;
     data["mission.landmark_recovery_residual_mm"] = missionLandmarkRecoveryResidualMm_;
     data["mission.landmark_corrections"] = missionLandmarkCorrections_;
+    data["mission.top_tof_landmark_corrections"] = missionTopLandmarkCorrections_;
+    data["mission.top_tof_location_confirmations"] = missionTopLocationConfirmations_;
     data["mission.last_landmark_id"] = missionLastLandmarkId_;
     data["weight.detected"] = weightSectorMask_ != 0;
     data["weight.sector_mask"] = weightSectorMask_;
@@ -1818,6 +1871,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["weight.valid_mask"] = weightValidMask_;
     data["weight.gap_mask"] = weightGapMask_;
     data["weight.target_mask"] = weightTargetMask_;
+    data["weight.target_confidence"] = weightTargetConfidence_;
     data["weight.map_wall_mask"] = weightMapWallMask_;
     data["weight.nearest_mm"] = weightNearestMm_;
     data["weight.direction"] = weightDirection_;
@@ -1917,6 +1971,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["tof.expander_available"] = Tof::expanderAvailable();
     data["tof.recovery_attempts"] = tofRecoveryAttempts_;
     data["tof.last_recovery_success_ms"] = lastTofRecoverySuccessMs_;
+    data["tof.last_recovery_duration_ms"] = lastTofRecoveryDurationMs_;
     data["tof.navigation_hold"] = missionTofRecoveryHold_;
     for (uint8_t i = 0; i < tofSensorCount_; ++i)
     {
@@ -2168,7 +2223,9 @@ void BluetoothDebugWorkflow::initialiseTofSensors()
     {
         tofAvailable_[i] = Tof::available(i);
         tofTimedOut_[i] = !tofAvailable_[i];
+        tofFresh_[i] = false;
         tofDistanceMm_[i] = -1;
+        tofLastSampleMs_[i] = 0;
         if (tofAvailable_[i])
             ++tofReadyCount_;
     }
@@ -2182,9 +2239,11 @@ void BluetoothDebugWorkflow::initialiseTofSensors()
 
 void BluetoothDebugWorkflow::readTofSensors()
 {
+    const uint32_t now = millis();
     tofReadyCount_ = 0;
     for (uint8_t i = 0; i < tofSensorCount_; ++i)
     {
+        tofFresh_[i] = false;
         tofAvailable_[i] = Tof::available(i);
         if (!tofAvailable_[i])
         {
@@ -2193,8 +2252,19 @@ void BluetoothDebugWorkflow::readTofSensors()
             continue;
         }
 
-        tofDistanceMm_[i] = Tof::read(i);
-        tofTimedOut_[i] = Tof::timedOut(i) || tofDistanceMm_[i] < 0;
+        int16_t sampleMm = -1;
+        if (Tof::readIfReady(i, sampleMm))
+        {
+            tofFresh_[i] = true;
+            tofLastSampleMs_[i] = now;
+            tofDistanceMm_[i] = sampleMm;
+            tofTimedOut_[i] = Tof::timedOut(i) || sampleMm < 0;
+        }
+        // Continuous sensors normally update every 50 ms. Keep the most
+        // recent value between conversions, but declare it stale if no new
+        // result has arrived for 250 ms so it cannot steer from old data.
+        if (tofLastSampleMs_[i] == 0 || now - tofLastSampleMs_[i] > 250U)
+            tofTimedOut_[i] = true;
         if (!tofTimedOut_[i] && tofDistanceMm_[i] >= 0)
             ++tofReadyCount_;
     }
@@ -2202,6 +2272,7 @@ void BluetoothDebugWorkflow::readTofSensors()
     {
         tofBadPolls_ = 0;
         missionTofRecoveryHold_ = false;
+        tofDegradedLogged_ = false;
     }
     else if (tofBadPolls_ < 255)
         ++tofBadPolls_;
@@ -2212,43 +2283,102 @@ void BluetoothDebugWorkflow::recoverTofSensorsIfNeeded()
 {
     if (tofSensorCount_ == 0 || tofBadPolls_ < 10)
         return;
-    // Preserve the mission state while the bus resets. The robot must not
-    // drive blind, but a transient TOF outage should not drop it into idle.
-    if (navigationActive_ && navigationStrategy_ == 3)
+    // Recover only one unavailable/stale sensor at a time. Rebooting the
+    // entire XSHUT bank used to take several seconds and interrupted every
+    // healthy range sensor; leaving one failed sensor untouched meant the
+    // robot could lose an entire weight-sensing sector for the rest of a run.
+    const uint32_t now = millis();
+    const uint32_t retryIntervalMs = navigationActive_ ? 2500U : 1500U;
+    if (now - lastTofRecoveryAttemptMs_ < retryIntervalMs)
+        return;
+
+    uint8_t failedIndex = 255;
+    for (uint8_t offset = 0; offset < tofSensorCount_; ++offset)
     {
-        dcMotor203Second_.stop();
-        dcMotor203SecondActive_ = false;
-        if (!missionTofRecoveryHold_)
-            link_.log("WARNING", "Point TOF bank offline; holding navigation for automatic recovery");
-        missionTofRecoveryHold_ = true;
+        const uint8_t index = static_cast<uint8_t>(
+            (tofRecoverySensorCursor_ + offset) % tofSensorCount_);
+        if (!tofAvailable_[index] || tofTimedOut_[index])
+        {
+            failedIndex = index;
+            tofRecoverySensorCursor_ = static_cast<uint8_t>(
+                (index + 1U) % tofSensorCount_);
+            break;
+        }
+    }
+    if (failedIndex == 255)
+    {
+        missionTofRecoveryHold_ = false;
+        tofDegradedLogged_ = false;
+        return;
     }
 
-    const uint32_t now = millis();
-    if (now - lastTofRecoveryAttemptMs_ < 10000U)
-        return;
     lastTofRecoveryAttemptMs_ = now;
     if (tofRecoveryAttempts_ < 65535U)
         ++tofRecoveryAttempts_;
-    const bool allReady = Tof::retry();
-    tofReadyCount_ = 0;
-    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    const bool expanderReady = Tof::expanderAvailable();
+    const bool recovered = expanderReady
+        ? Tof::retry(failedIndex)
+        : (!navigationActive_ && Tof::retry());
+    lastTofRecoveryDurationMs_ = millis() - now;
+    if (!expanderReady && navigationActive_)
     {
-        tofAvailable_[i] = Tof::available(i);
-        tofTimedOut_[i] = !tofAvailable_[i];
-        tofDistanceMm_[i] = -1;
-        if (tofAvailable_[i])
-            ++tofReadyCount_;
+        missionTofRecoveryHold_ = false;
+        if (!tofDegradedLogged_)
+        {
+            link_.log("WARNING", "TOF expander unavailable; reconnect will retry without resetting the moving sensor bank");
+            tofDegradedLogged_ = true;
+        }
+        return;
     }
-    if (allReady && tofReadyCount_ == tofSensorCount_)
+
+    if (!expanderReady)
     {
-        tofBadPolls_ = 1; // Resume only after an actual post-reset range poll.
-        lastTofRecoverySuccessMs_ = millis();
-        link_.log("INFO", "Point TOF bank recovered; all XSHUT sensors readdressed");
+        tofReadyCount_ = 0;
+        for (uint8_t i = 0; i < tofSensorCount_; ++i)
+        {
+            tofAvailable_[i] = Tof::available(i);
+            tofTimedOut_[i] = !tofAvailable_[i];
+            tofFresh_[i] = false;
+            tofDistanceMm_[i] = -1;
+            tofLastSampleMs_[i] = 0;
+            if (tofAvailable_[i])
+                ++tofReadyCount_;
+        }
     }
     else
-        link_.log("WARNING", Tof::expanderAvailable()
-            ? "Point TOF retry incomplete; checking XSHUT sensors again in 10 s"
-            : "I2C0 SX1509 expander not responding; retrying point TOF bank in 10 s");
+    {
+        tofAvailable_[failedIndex] = Tof::available(failedIndex);
+        tofTimedOut_[failedIndex] = !recovered;
+        tofFresh_[failedIndex] = false;
+        tofDistanceMm_[failedIndex] = -1;
+        tofLastSampleMs_[failedIndex] = 0;
+        tofReadyCount_ = 0;
+        for (uint8_t i = 0; i < tofSensorCount_; ++i)
+            if (tofAvailable_[i] && !tofTimedOut_[i])
+                ++tofReadyCount_;
+    }
+
+    if (recovered)
+    {
+        lastTofRecoverySuccessMs_ = millis();
+        char message[72];
+        snprintf(message, sizeof(message), "Reinitialized TOF %s; range polling resumed",
+                 tofSensorNames_[failedIndex]);
+        link_.log("INFO", message);
+        if (tofReadyCount_ == tofSensorCount_)
+        {
+            tofBadPolls_ = 1; // Require a fresh post-reset range sample.
+            missionTofRecoveryHold_ = false;
+            tofDegradedLogged_ = false;
+        }
+    }
+    else
+    {
+        char message[80];
+        snprintf(message, sizeof(message), "TOF %s reconnect failed; will retry",
+                 tofSensorNames_[failedIndex]);
+        link_.log("WARNING", message);
+    }
 }
 
 void BluetoothDebugWorkflow::updateWeightDetection()
@@ -2264,26 +2394,31 @@ void BluetoothDebugWorkflow::updateWeightDetection()
     constexpr uint16_t MAX_WEIGHT_RANGE_MM = 1200;
     constexpr uint16_t MIN_TOP_BOTTOM_GAP_MM = 150;
     constexpr uint8_t CONFIRM_POLLS = 3;
-    constexpr float TARGET_RADIUS_MM = 300.0f;
+    constexpr uint32_t EVIDENCE_INTERVAL_MS = 90;
+    constexpr uint32_t EVIDENCE_DROPOUT_GRACE_MS = 350;
+    constexpr float TARGET_RADIUS_MM = 500.0f;
 
     weightSectorMask_ = 0;
     weightValidMask_ = 0;
     weightGapMask_ = 0;
+    weightFreshMask_ = 0;
     weightTargetMask_ = 0;
+    weightTargetConfidence_ = 0.0f;
     weightMapWallMask_ = 0;
     weightNearestMm_ = 0;
     weightDirection_ = 0;
     weightInnerLeftMm_ = 0xFFFF;
     weightInnerRightMm_ = 0xFFFF;
-    // The broad 300 mm visibility gate is not accurate enough for steering.
-    // 170 mm plus the 130 mm arrival radius still keeps a sensed approach
-    // within the requested 300 mm of the planned target.
+    // A graded 500 mm target region starts search early, but confidence fades
+    // quadratically from the planned weight location to avoid treating the
+    // outer edge as an equally certain sighting.
     const bool postCollectionLook = missionVerifyPhase_ != 0 ||
         missionWeightVectorCompletedWaypoint_ == missionWaypointIndex_;
-    float bestBearingErrorMm = postCollectionLook ? 321.0f : 301.0f;
+    float bestBearingErrorMm = postCollectionLook ? 521.0f : 501.0f;
     bool bestBearingInner = false;
     float innerHitX[2] = {};
     float innerHitY[2] = {};
+    bool innerWeightSampleFresh = false;
     auto expectedMappedWallRange = [&](uint8_t sector) -> float {
         if (!missionBottomSensorGeometryValid_ || !missionPoseInitialised_)
             return 5000.0f;
@@ -2347,6 +2482,13 @@ void BluetoothDebugWorkflow::updateWeightDetection()
     };
     for (uint8_t sector = 0; sector < 4; ++sector)
     {
+        if (weightEvidenceWaypoint_[sector] != missionWaypointIndex_)
+        {
+            weightEvidence_[sector] = 0;
+            weightLastEvidenceMs_[sector] = 0;
+            weightLastQualifiedMs_[sector] = 0;
+            weightEvidenceWaypoint_[sector] = missionWaypointIndex_;
+        }
         int8_t bottomIndex = -1;
         int8_t topIndex = -1;
         for (uint8_t i = 0; i < tofSensorCount_; ++i)
@@ -2359,6 +2501,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
 
         bool validPair = false;
         bool heightGap = false;
+        bool pairFresh = false;
         uint16_t bottomMm = 0;
         if (sector >= 1 && sector <= 2 && bottomIndex >= 0 &&
             tofAvailable_[bottomIndex] && !tofTimedOut_[bottomIndex] &&
@@ -2383,9 +2526,13 @@ void BluetoothDebugWorkflow::updateWeightDetection()
                 heightGap = top >= bottom + MIN_TOP_BOTTOM_GAP_MM;
             }
         }
+        if (bottomIndex >= 0 && topIndex >= 0)
+            pairFresh = tofFresh_[bottomIndex] || tofFresh_[topIndex];
         const uint8_t bit = static_cast<uint8_t>(1U << sector);
         if (validPair) weightValidMask_ |= bit;
         if (heightGap) weightGapMask_ |= bit;
+        if (validPair && heightGap && pairFresh)
+            weightFreshMask_ |= bit;
 
         // Compare the measured hit point, not the robot centre or the ray
         // angle from that centre, with the pre-laid weight location. These
@@ -2420,7 +2567,15 @@ void BluetoothDebugWorkflow::updateWeightDetection()
                 {
                     nearPlannedWeight = true;
                     if (waypoint == missionWaypointIndex_)
+                    {
                         currentTargetErrorMm = errorMm;
+                        const float radiusRatio = min(1.0f,
+                            errorMm / TARGET_RADIUS_MM);
+                        const float confidence = 1.0f -
+                            radiusRatio * radiusRatio;
+                        weightTargetConfidence_ = max(
+                            weightTargetConfidence_, confidence);
+                    }
                 }
             }
         }
@@ -2439,19 +2594,37 @@ void BluetoothDebugWorkflow::updateWeightDetection()
             }
         }
 
-        if (lowObject)
+        if (lowObject && pairFresh)
         {
-            if (weightEvidence_[sector] < CONFIRM_POLLS)
-                ++weightEvidence_[sector];
+            weightLastQualifiedMs_[sector] = millis();
+            if (weightEvidence_[sector] == 0 ||
+                millis() - weightLastEvidenceMs_[sector] >= EVIDENCE_INTERVAL_MS)
+            {
+                if (weightEvidence_[sector] < CONFIRM_POLLS)
+                    ++weightEvidence_[sector];
+                weightLastEvidenceMs_[sector] = millis();
+            }
+            if (sector == 1 || sector == 2)
+                innerWeightSampleFresh = true;
         }
-        else
+        else if (pairFresh || weightLastQualifiedMs_[sector] == 0 ||
+                 millis() - weightLastQualifiedMs_[sector] > EVIDENCE_DROPOUT_GRACE_MS)
+        {
             weightEvidence_[sector] = 0;
+            weightLastEvidenceMs_[sector] = 0;
+        }
 
-        // An outer sensor can see a passing weight for only a few polls.
-        // Two qualified, mapped-to-target returns are enough for recovery;
-        // ordinary wall/floor echoes still require three confirmations.
-        const uint8_t requiredPolls = (sector == 0 || sector == 3) &&
-            nearPlannedWeight && bottomMm <= 450U ? 2U : CONFIRM_POLLS;
+        // A hit near the site centre is much more likely to be the planned
+        // weight than one near the 500 mm perimeter. Allow a prompt central
+        // cue, retain normal confirmation through the middle band, and ask
+        // for repeated fresh evidence at the low-confidence edge.
+        uint8_t requiredPolls = CONFIRM_POLLS;
+        if (nearPlannedWeight && currentTargetErrorMm <= 200.0f)
+            requiredPolls = 2U;
+        else if (nearPlannedWeight && currentTargetErrorMm >= 400.0f)
+            requiredPolls = 5U;
+        else if (nearPlannedWeight && currentTargetErrorMm > 300.0f)
+            requiredPolls = 4U;
         if (weightEvidence_[sector] >= requiredPolls)
         {
             weightSectorMask_ |= static_cast<uint8_t>(1U << sector);
@@ -2465,9 +2638,10 @@ void BluetoothDebugWorkflow::updateWeightDetection()
             // recorded runs passed the broad 300 mm visibility gate but lay
             // 244-284 mm from the actual targets; it must not redirect drive.
             const bool inner = sector == 1 || sector == 2;
-            const bool outerTargetHit = !inner && bottomMm <= 450U &&
-                currentTargetErrorMm <= (postCollectionLook ? 320.0f : 300.0f);
-            if ((inner ? currentTargetErrorMm <= 220.0f : outerTargetHit) &&
+            const bool outerTargetHit = !inner && bottomMm <= 500U &&
+                currentTargetErrorMm <= 500.0f;
+            if (pairFresh && lowObject &&
+                (inner ? currentTargetErrorMm <= 500.0f : outerTargetHit) &&
                 ((inner && !bestBearingInner) ||
                  (inner == bestBearingInner &&
                   currentTargetErrorMm < bestBearingErrorMm)))
@@ -2489,6 +2663,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
         }
     }
     if ((weightSectorMask_ & 0x06U) == 0x06U &&
+        innerWeightSampleFresh &&
         missionWaypointIndex_ < missionWaypointCount_)
     {
         // Similar raw distances do not prove that both beams saw the same
@@ -2591,6 +2766,7 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionCollectionFollowThroughUntilMs_ = 0;
     missionVerifyPhase_ = 0;
     missionInnerWeightLocked_ = false;
+    missionInnerCentreStableSinceMs_ = 0;
     missionTargetAligned_ = false;
     missionPointTurnActive_ = false;
     missionTurnFinishing_ = false;
@@ -2713,21 +2889,93 @@ void BluetoothDebugWorkflow::updateMissionPose(uint32_t now)
         ++missionOdometryRejectedSteps_;
 }
 
+float BluetoothDebugWorkflow::expectedMappedSurfaceRange(
+    float x, float y, float ux, float uy, int8_t* surfaceId) const
+{
+    float nearest = 5000.0f;
+    int8_t nearestId = -127;
+    auto consider = [&](float distance, int8_t id) {
+        if (distance > 1.0f && distance < nearest)
+        {
+            nearest = distance;
+            nearestId = id;
+        }
+    };
+
+    // Four persistent arena walls. Only accept an intersection that lands
+    // within the physical arena rectangle.
+    if (ux > 0.0001f)
+    {
+        const float d = (4900.0f - x) / ux;
+        if (y + d * uy >= 0.0f && y + d * uy <= 2400.0f) consider(d, -10);
+    }
+    if (ux < -0.0001f)
+    {
+        const float d = -x / ux;
+        if (y + d * uy >= 0.0f && y + d * uy <= 2400.0f) consider(d, -11);
+    }
+    if (uy > 0.0001f)
+    {
+        const float d = (2400.0f - y) / uy;
+        if (x + d * ux >= 0.0f && x + d * ux <= 4900.0f) consider(d, -12);
+    }
+    if (uy < -0.0001f)
+    {
+        const float d = -y / uy;
+        if (x + d * ux >= 0.0f && x + d * ux <= 4900.0f) consider(d, -13);
+    }
+
+    auto rayRect = [&](float x0, float y0, float x1, float y1) {
+        float enter = -5000.0f, leave = 5000.0f;
+        if (fabsf(ux) < 0.0001f)
+        {
+            if (x < x0 || x > x1) return 5000.0f;
+        }
+        else
+        {
+            const float a = (x0 - x) / ux, b = (x1 - x) / ux;
+            enter = max(enter, min(a, b));
+            leave = min(leave, max(a, b));
+        }
+        if (fabsf(uy) < 0.0001f)
+        {
+            if (y < y0 || y > y1) return 5000.0f;
+        }
+        else
+        {
+            const float a = (y0 - y) / uy, b = (y1 - y) / uy;
+            enter = max(enter, min(a, b));
+            leave = min(leave, max(a, b));
+        }
+        if (leave < enter) return 5000.0f;
+        return enter > 1.0f ? enter : leave > 1.0f ? leave : 5000.0f;
+    };
+    for (uint8_t i = 0; i < missionFeatureCount_; ++i)
+    {
+        const MissionFeature& feature = missionFeatures_[i];
+        if (feature.kind != 1) continue;
+        const float distance = feature.rotatedWall
+            ? rayRotatedWall(x, y, ux, uy, feature.wallX, feature.wallY,
+                             feature.rotationDeg)
+            : rayRect(feature.x0, feature.y0, feature.x1, feature.y1);
+        consider(distance, static_cast<int8_t>(i));
+    }
+    if (surfaceId != nullptr) *surfaceId = nearestId;
+    return nearest;
+}
+
 void BluetoothDebugWorkflow::updateNavigation()
 {
     weightBearingSteeringActive_ = false;
     missionFrontTargetVisible_ = false;
     missionTargetCommitActive_ = false;
+    navigationMatrixWallRejectedByTopTof_ = false;
     missionFrontTargetRangeErrorMm_ = 0;
     missionFrontTargetMappedWallMm_ = 0;
     if (!navigationActive_)
         return;
-    if (missionTofRecoveryHold_)
-    {
-        dcMotor203Second_.stop();
-        dcMotor203SecondActive_ = false;
-        return;
-    }
+    // missionTofRecoveryHold_ remains in telemetry for compatibility with old
+    // recordings. Point-TOF recovery no longer pauses navigation.
     const uint32_t now = millis();
     if (!debugMode_ || stopped_)
     {
@@ -2979,11 +3227,59 @@ void BluetoothDebugWorkflow::updateNavigation()
             sortSmall(matrixBroadValues, matrixBroadValueCount);
             const uint16_t broadMedian =
                 matrixBroadValues[matrixBroadValueCount / 2];
-            // This is independent evidence from dozens of zones, not one
-            // candidate in the later three-sensor median. Make it authoritative.
-            front = min(front, broadMedian);
+            // A broad matrix return can be a floor/angle artefact. Only
+            // override it when both central top TOFs independently match the
+            // mapped surface farther ahead; this is evidence that the robot
+            // is where the map says it is and the matrix short return is false.
+            if (missionPoseInitialised_ && missionTopSensorGeometryValid_)
+            {
+                int8_t leftIndex = -1, rightIndex = -1;
+                for (uint8_t i = 0; i < tofSensorCount_; ++i)
+                {
+                    if (strcmp(tofSensorNames_[i], "top_mid_left") == 0)
+                        leftIndex = static_cast<int8_t>(i);
+                    else if (strcmp(tofSensorNames_[i], "top_mid_right") == 0)
+                        rightIndex = static_cast<int8_t>(i);
+                }
+                if (leftIndex >= 0 && rightIndex >= 0 &&
+                    tofAvailable_[leftIndex] && !tofTimedOut_[leftIndex] &&
+                    tofAvailable_[rightIndex] && !tofTimedOut_[rightIndex])
+                {
+                    const float heading = missionArenaHeadingDeg_ * DEG_TO_RAD;
+                    const MissionBottomSensorPose& leftPose = missionTopSensors_[1];
+                    const MissionBottomSensorPose& rightPose = missionTopSensors_[2];
+                    const float leftX = missionPoseXmm_ +
+                        cosf(heading) * leftPose.forwardMm - sinf(heading) * leftPose.lateralMm;
+                    const float leftY = missionPoseYmm_ +
+                        sinf(heading) * leftPose.forwardMm + cosf(heading) * leftPose.lateralMm;
+                    const float rightX = missionPoseXmm_ +
+                        cosf(heading) * rightPose.forwardMm - sinf(heading) * rightPose.lateralMm;
+                    const float rightY = missionPoseYmm_ +
+                        sinf(heading) * rightPose.forwardMm + cosf(heading) * rightPose.lateralMm;
+                    const float leftAngle = (missionArenaHeadingDeg_ + leftPose.angleDeg) * DEG_TO_RAD;
+                    const float rightAngle = (missionArenaHeadingDeg_ + rightPose.angleDeg) * DEG_TO_RAD;
+                    int8_t leftSurface = -1, rightSurface = -1;
+                    const float leftExpected = expectedMappedSurfaceRange(
+                        leftX, leftY, cosf(leftAngle), sinf(leftAngle), &leftSurface);
+                    const float rightExpected = expectedMappedSurfaceRange(
+                        rightX, rightY, cosf(rightAngle), sinf(rightAngle), &rightSurface);
+                    const float leftObserved = tofDistanceMm_[leftIndex];
+                    const float rightObserved = tofDistanceMm_[rightIndex];
+                    const bool leftConfirms = leftExpected > broadMedian + 180.0f &&
+                        leftObserved > broadMedian + 180.0f &&
+                        fabsf(leftExpected - leftObserved) <= 220.0f;
+                    const bool rightConfirms = rightExpected > broadMedian + 180.0f &&
+                        rightObserved > broadMedian + 180.0f &&
+                        fabsf(rightExpected - rightObserved) <= 220.0f;
+                    navigationMatrixWallRejectedByTopTof_ =
+                        leftConfirms && rightConfirms && leftSurface == rightSurface;
+                }
+            }
+            if (!navigationMatrixWallRejectedByTopTof_)
+                front = min(front, broadMedian);
         }
-        navigationMatrixBroadWall_ = broadCloseWall;
+        navigationMatrixBroadWall_ = broadCloseWall &&
+            !navigationMatrixWallRejectedByTopTof_;
 
         // Treat an outer flank as genuinely open only when at least two of its
         // three horizontal columns contain a stable median return farther than
@@ -3253,14 +3549,14 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
 
         const float absoluteError = fabsf(error);
-        if (absoluteError <= 8.0f)
+        if (absoluteError <= 10.0f)
         {
             setDrive(0, 0);
             if (navigationTurnSettledSinceMs_ == 0)
                 navigationTurnSettledSinceMs_ = now;
             // Do not start the next forward leg while rotational inertia is
             // still carrying the chassis through the target heading.
-            return now - navigationTurnSettledSinceMs_ >= 180U;
+            return now - navigationTurnSettledSinceMs_ >= 250U;
         }
         navigationTurnSettledSinceMs_ = 0;
 
@@ -3284,7 +3580,8 @@ void BluetoothDebugWorkflow::updateNavigation()
         // Both wheels remain powered throughout the turn. Below 75% this
         // drivetrain stalls, so use 75% for the final approach and let the
         // IMU settle once, instead of a repeated on/off pulse train.
-        const int16_t power = absoluteError > 55.0f ? 100 : 85;
+        const int16_t power = absoluteError > 55.0f ? 100 :
+                              absoluteError > 25.0f ? 90 : 75;
         setDrive(turnRight ? -power : power,
                  turnRight ? power : -power);
         return false;
@@ -3672,8 +3969,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
                 continue;
             }
-            if (expected < 250.0f || expected > 2400.0f ||
-                fabsf(residual) > 110.0f)
+            if (expected < 120.0f || expected > 2600.0f ||
+                fabsf(residual) > 300.0f)
             {
                 missionLandmarkMatches_[side] = 0;
                 continue;
@@ -3683,15 +3980,16 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionLandmarkIds_[side] = landmark;
                 missionLandmarkMatches_[side] = 1;
             }
-            else if (missionLandmarkMatches_[side] < 3)
+            else if (missionLandmarkMatches_[side] < 4)
                 ++missionLandmarkMatches_[side];
-            if (missionLandmarkMatches_[side] >= 3 &&
+            if (missionLandmarkMatches_[side] >= 4 &&
                 now - missionLastLandmarkCorrectionMs_[side] >= 500U)
             {
-                // An incorrect match must not drag the estimated pose by
-                // hundreds of millimetres while following one long wall.
-                const float correction = constrain(residual * 0.05f,
-                                                   -3.0f, 3.0f);
+                // Repeated agreement with one known wall is a pose landmark,
+                // not just a tiny odometry trim. Apply a bounded fraction of
+                // residual so encoder/IMU drift can be recovered gradually.
+                const float correction = constrain(residual * 0.18f,
+                                                   -18.0f, 18.0f);
                 missionPoseXmm_ = constrain(missionPoseXmm_ + correction * ux,
                                             0.0f, 4900.0f);
                 missionPoseYmm_ = constrain(missionPoseYmm_ + correction * uy,
@@ -3702,6 +4000,98 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
         }
 
+        // Use the four top-facing point TOFs as independent map landmarks.
+        // They only correct pose when a fresh range matches a wall already in
+        // the arena model; an unexplained short return remains an obstacle,
+        // never a reason to move the estimated robot to a different place.
+        missionTopLocationConfirmations_ = 0;
+        if (missionTopSensorGeometryValid_)
+        {
+            static const char* TOP_NAMES[4] = {
+                "top_left_left", "top_mid_left",
+                "top_mid_right", "top_right_right"
+            };
+            const float bodyHeading = missionArenaHeadingDeg_ * DEG_TO_RAD;
+            for (uint8_t slot = 0; slot < 4; ++slot)
+            {
+                int8_t tofIndex = -1;
+                for (uint8_t i = 0; i < tofSensorCount_; ++i)
+                    if (strcmp(tofSensorNames_[i], TOP_NAMES[slot]) == 0)
+                    {
+                        tofIndex = static_cast<int8_t>(i);
+                        break;
+                    }
+                if (tofIndex < 0 || !tofAvailable_[tofIndex] ||
+                    tofTimedOut_[tofIndex] || tofDistanceMm_[tofIndex] < 80 ||
+                    tofDistanceMm_[tofIndex] > 3500 ||
+                    tofLastSampleMs_[tofIndex] == 0 ||
+                    now - tofLastSampleMs_[tofIndex] > 250U)
+                {
+                    missionTopLandmarkMatches_[slot] = 0;
+                    missionTopLandmarkIds_[slot] = -1;
+                    continue;
+                }
+
+                const MissionBottomSensorPose& sensor = missionTopSensors_[slot];
+                const float sensorX = missionPoseXmm_ +
+                    cosf(bodyHeading) * sensor.forwardMm -
+                    sinf(bodyHeading) * sensor.lateralMm;
+                const float sensorY = missionPoseYmm_ +
+                    sinf(bodyHeading) * sensor.forwardMm +
+                    cosf(bodyHeading) * sensor.lateralMm;
+                const float rayAngle =
+                    (missionArenaHeadingDeg_ + sensor.angleDeg) * DEG_TO_RAD;
+                const float ux = cosf(rayAngle), uy = sinf(rayAngle);
+                int8_t surface = -127;
+                const float expected = expectedMappedSurfaceRange(
+                    sensorX, sensorY, ux, uy, &surface);
+                const float observed = tofDistanceMm_[tofIndex];
+                const float residual = expected - observed;
+                const bool mapMatch = surface != -127 && expected >= 100.0f &&
+                    expected <= 3000.0f && fabsf(residual) <= 350.0f;
+                if (mapMatch && fabsf(residual) <= 220.0f &&
+                    missionTopLocationConfirmations_ < 4)
+                    ++missionTopLocationConfirmations_;
+
+                const uint32_t sampleMs = tofLastSampleMs_[tofIndex];
+                if (sampleMs == missionLastTopLandmarkSampleMs_[slot])
+                    continue;
+                missionLastTopLandmarkSampleMs_[slot] = sampleMs;
+                if (!mapMatch ||
+                    (missionLastPointTurnMs_ != 0 &&
+                     now - missionLastPointTurnMs_ < 500U))
+                {
+                    missionTopLandmarkMatches_[slot] = 0;
+                    missionTopLandmarkIds_[slot] = -1;
+                    continue;
+                }
+                if (missionTopLandmarkIds_[slot] != surface)
+                {
+                    missionTopLandmarkIds_[slot] = surface;
+                    missionTopLandmarkMatches_[slot] = 1;
+                }
+                else if (missionTopLandmarkMatches_[slot] < 4)
+                    ++missionTopLandmarkMatches_[slot];
+
+                if (missionTopLandmarkMatches_[slot] >= 4 &&
+                    now - missionLastTopLandmarkCorrectionMs_[slot] >= 500U)
+                {
+                    const float correction = constrain(residual * 0.10f,
+                                                       -15.0f, 15.0f);
+                    missionPoseXmm_ = constrain(missionPoseXmm_ + correction * ux,
+                                                0.0f, 4900.0f);
+                    missionPoseYmm_ = constrain(missionPoseYmm_ + correction * uy,
+                                                0.0f, 2400.0f);
+                    missionLastTopLandmarkCorrectionMs_[slot] = now;
+                    if (missionTopLandmarkCorrections_ < 65535U)
+                        ++missionTopLandmarkCorrections_;
+                    if (missionLandmarkCorrections_ < 65535U)
+                        ++missionLandmarkCorrections_;
+                    missionLastLandmarkId_ = surface;
+                }
+            }
+        }
+
         auto pointFreeAt = [&](float x, float y, float clearance) -> bool {
             if (x < clearance || y < clearance ||
                 x > 4900.0f - clearance || y > 2400.0f - clearance)
@@ -3709,10 +4099,12 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
+                // A dummy's value is deliberately independent of the wall
+                // setting: it is the requested gap from the robot's outer
+                // edge, rather than a hidden extra margin.
                 const float featureClearance = feature.kind == 2
-                    ? max(clearance, 0.5f * navigationRobotWidthMm_ +
-                          max(40.0f, static_cast<float>(navigationGapMarginMm_))) +
-                      missionDummyExtraMm_ : clearance;
+                    ? 0.5f * navigationRobotWidthMm_ + missionDummyClearanceMm_
+                    : clearance;
                 if (feature.rotatedWall)
                 {
                     const float angle = feature.rotationDeg * DEG_TO_RAD;
@@ -3732,13 +4124,12 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             return true;
         };
-        // Match the desktop planner's robot-radius plus gap-margin model;
-        // a fixed 305 mm rejected otherwise valid staging points near the
-        // arena boundary and repeatedly replanned the weight approach.
+        // Match the desktop planner: wall clearance is measured from the
+        // robot edge and is never silently enlarged by gap-margin settings.
         const float mapClearanceMm = missionReturnHome_
             ? 0.5f * static_cast<float>(navigationRobotWidthMm_) + 10.0f
             : 0.5f * static_cast<float>(navigationRobotWidthMm_) +
-              max(40.0f, static_cast<float>(navigationGapMarginMm_));
+              static_cast<float>(navigationWallClearanceMm_);
         auto pointFree = [&](float x, float y) -> bool {
             return pointFreeAt(x, y, mapClearanceMm);
         };
@@ -3764,8 +4155,25 @@ void BluetoothDebugWorkflow::updateNavigation()
             // Home is against an arena end. Face into the long open lane
             // before moving; the first route point can be only ~130 mm away
             // and must not trigger an immediate turn beside the home wall.
-            const float launchArenaHeading = missionHomeYmm_ > 1200.0f
+            float launchArenaHeading = missionHomeYmm_ > 1200.0f
                 ? 270.0f : 90.0f;
+            // Use the first meaningful uploaded transit leg for the home
+            // exit direction. The previous fixed long-axis heading aimed at
+            // a nearby wall in three recent starts, so the robot stayed in
+            // the launch hold while its front range remained below 380 mm.
+            for (uint8_t i = 0; i < missionWaypointCount_; ++i)
+            {
+                const MissionWaypoint& firstLeg = missionWaypoints_[i];
+                if ((firstLeg.flags & 0x04) != 0) continue;
+                const float dx = firstLeg.xMm - missionStartXmm_;
+                const float dy = firstLeg.yMm - missionStartYmm_;
+                if (hypotf(dx, dy) < 450.0f) continue;
+                launchArenaHeading = normaliseHeading(atan2f(dy, dx) * RAD_TO_DEG);
+                break;
+            }
+            const float launchHeadingRad = launchArenaHeading * DEG_TO_RAD;
+            const float launchUx = cosf(launchHeadingRad);
+            const float launchUy = sinf(launchHeadingRad);
             const float launchImuHeading = normaliseHeading(
                 missionStartImuHeadingDeg_ + headingDelta(
                     missionStartArenaHeadingDeg_, launchArenaHeading));
@@ -3809,9 +4217,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 {
                     const MissionWaypoint& passed =
                         missionWaypoints_[missionWaypointIndex_];
-                    const float along = launchArenaHeading == 270.0f
-                        ? missionStartYmm_ - passed.yMm
-                        : passed.yMm - missionStartYmm_;
+                    const float along =
+                        (passed.xMm - missionStartXmm_) * launchUx +
+                        (passed.yMm - missionStartYmm_) * launchUy;
                     if (along > exitMm - 120.0f) break;
                     ++missionWaypointIndex_;
                     ++missionSkippedWaypoints_;
@@ -3822,12 +4230,16 @@ void BluetoothDebugWorkflow::updateNavigation()
             const float headingError = fabsf(headingDelta(
                 imu_.headingDeg(), launchImuHeading));
             const float aheadMm = min(170.0f, 500.0f - exitMm);
-            const float aheadY = missionPoseYmm_ +
-                (launchArenaHeading == 270.0f ? -aheadMm : aheadMm);
+            const float aheadX = missionPoseXmm_ + aheadMm * launchUx;
+            const float aheadY = missionPoseYmm_ + aheadMm * launchUy;
+            // Home-exit front check is intentionally much closer than normal
+            // mission obstacle avoidance: the robot has to clear the dock
+            // wall before it can follow the uploaded route.
+            constexpr uint16_t launchFrontStopMm = 70U;
             if (headingError > 15.0f ||
-                (front != 0xFFFF && front < 380U) ||
+                (front != 0xFFFF && front < launchFrontStopMm) ||
                 !segmentFreeAt(missionPoseXmm_, missionPoseYmm_,
-                               missionPoseXmm_, aheadY,
+                               aheadX, aheadY,
                                0.5f * navigationRobotWidthMm_ + 10.0f))
             {
                 setDrive(0, 0);
@@ -4064,7 +4476,9 @@ void BluetoothDebugWorkflow::updateNavigation()
         // corridor. A small visibility graph over inflated obstacle corners
         // gives a bounded, map-checked replacement for that dead end.
         auto rerouteAroundMap = [&]() -> bool {
-            const float CLEARANCE = mapClearanceMm + 20.0f;
+            // Replanning uses exactly the operator-selected map clearance;
+            // do not silently make an otherwise passable gap 20 mm smaller.
+            const float CLEARANCE = mapClearanceMm;
             constexpr uint8_t MAX_NODES = 2 + 4 * MAX_MISSION_FEATURES;
             // In the 15:16 run, forty identical corner sets were inserted
             // while odometry stayed at one pose. A new route requires actual
@@ -4085,9 +4499,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 const MissionFeature& feature = missionFeatures_[i];
                 const float featureClearance = feature.kind == 2
-                    ? max(CLEARANCE, 0.5f * navigationRobotWidthMm_ +
-                          max(40.0f, static_cast<float>(navigationGapMarginMm_)) +
-                          missionDummyExtraMm_ + 20.0f) : CLEARANCE;
+                    ? 0.5f * navigationRobotWidthMm_ +
+                      missionDummyClearanceMm_ : CLEARANCE;
                 const float xs[2] = {feature.x0 - featureClearance,
                                      feature.x1 + featureClearance};
                 const float ys[2] = {feature.y0 - featureClearance,
@@ -4342,12 +4755,14 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 if (missionAutoReturnHome_)
                 {
-                    // The existing mission continues exploring after this
-                    // intermediate home visit, so latch the gate again.
+                    // The planned collection pass is complete. Close the
+                    // gate after the unload shake, then leave home in the
+                    // unplanned reactive-wander mode rather than replaying
+                    // the route or stopping at the dock.
                     hx12kB_.setAngle(50.0f);
                     missionAutoReturnHome_ = false;
                     missionReturnHome_ = false;
-                    navigationStrategy_ = missionFallbackStrategy_;
+                    navigationStrategy_ = 4;
                     const float inwardArenaHeading = normaliseHeading(atan2f(
                         1200.0f - missionPoseYmm_, 2450.0f - missionPoseXmm_) * RAD_TO_DEG);
                     const float inwardImuHeading = normaliseHeading(
@@ -4361,7 +4776,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                     navigationSweepProgressMm_ = 0.0f;
                     navigationExpectedSweepLengthValid_ = false;
                     missionBlockedSinceMs_ = 0;
-                    link_.log("INFO", "Returned home; turning into arena before exploration");
+                    link_.log("INFO", "Home unload complete; gate closed; heading out to roam the arena");
                     return;
                 }
                 stopNavigation("Return-home route complete; motors stopped");
@@ -4432,7 +4847,11 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const float fromY = missionPoseYmm_ - routeWaypoint.yMm;
                 const float alongMm = (fromX * legX + fromY * legY) / legMm;
                 const float lateralMm = fabsf(fromX * legY - fromY * legX) / legMm;
-                if (alongMm > 130.0f && lateralMm < 240.0f &&
+                // Never cut across to the next leg when we are visibly off
+                // the intended route.  The tolerance is exposed in the GUI
+                // so line tracking can be tightened without recompiling.
+                if (alongMm > 130.0f &&
+                    lateralMm < static_cast<float>(navigationRouteLineToleranceMm_) &&
                     pointFreeAt(missionPoseXmm_, missionPoseYmm_, mapClearanceMm) &&
                     segmentFree(missionPoseXmm_, missionPoseYmm_,
                                 next.xMm, next.yMm))
@@ -4548,7 +4967,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         const MissionWaypoint& waypoint = missionWaypoints_[missionWaypointIndex_];
         const float routeDx = static_cast<float>(waypoint.xMm) - missionPoseXmm_;
         const float routeDy = static_cast<float>(waypoint.yMm) - missionPoseYmm_;
-        const bool searchActive = missionSearchWaypoint_ == missionWaypointIndex_ &&
+        bool searchActive = missionSearchWaypoint_ == missionWaypointIndex_ &&
             !missionReturnHome_ && (waypoint.flags & 0x01) != 0;
         auto beginSiteSearch = [&]() {
             missionSearchWaypoint_ = missionWaypointIndex_;
@@ -4559,18 +4978,39 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionSearchStartedMs_ = now;
             missionSearchDwellStartedMs_ = 0;
             missionSearchLastEvidenceMs_ = 0;
-            missionSearchApproachHeadingDeg_ =
-                missionWeightVectorCompletedWaypoint_ == missionWaypointIndex_
-                ? missionWeightVectorHeadingDeg_ :
-                (hypotf(routeDx, routeDy) >= 100.0f
-                    ? normaliseHeading(atan2f(routeDy, routeDx) * RAD_TO_DEG)
-                    : missionArenaHeadingDeg_);
+            const bool haveRecentWeightBearing =
+                weightBearingWaypoint_ == missionWaypointIndex_ &&
+                weightBearingSector_ <= 4U &&
+                now - weightBearingSeenMs_ <= 2500U;
+            missionSearchCenterXmm_ = haveRecentWeightBearing
+                ? weightBearingHitXmm_ : static_cast<float>(waypoint.xMm);
+            missionSearchCenterYmm_ = haveRecentWeightBearing
+                ? weightBearingHitYmm_ : static_cast<float>(waypoint.yMm);
+            missionSearchApproachHeadingDeg_ = haveRecentWeightBearing
+                ? normaliseHeading(atan2f(
+                    missionSearchCenterYmm_ - missionPoseYmm_,
+                    missionSearchCenterXmm_ - missionPoseXmm_) * RAD_TO_DEG)
+                : missionWeightVectorCompletedWaypoint_ == missionWaypointIndex_
+                    ? missionWeightVectorHeadingDeg_ :
+                    (hypotf(routeDx, routeDy) >= 100.0f
+                        ? normaliseHeading(atan2f(routeDy, routeDx) * RAD_TO_DEG)
+                        : missionArenaHeadingDeg_);
             // A previous pass was not an independently confirmed pickup.
             // Allow a new sensor lock during the search instead of treating
             // this waypoint as permanently collected.
             missionWeightVectorCompletedWaypoint_ = 255;
-            link_.log("INFO", "Searching around planned weight site before moving on");
+            link_.log("INFO", "Entered 500 mm weight-site search region; confidence fades toward its edge");
         };
+        // Begin the site sweep as soon as the robot is within 500 mm of the
+        // planned weight, rather than waiting until it reaches the waypoint.
+        // Range-based confidence still controls how strongly a sighting can
+        // influence steering as the robot moves through the search region.
+        if (!searchActive && !missionReturnHome_ &&
+            (waypoint.flags & 0x01) != 0 && routeRangeMm <= 500.0f)
+        {
+            beginSiteSearch();
+            searchActive = true;
+        }
         auto finishSiteSearch = [&](bool incomplete) {
             // The inductor is downstream of the intake. In the last run it
             // confirmed the collected weight six seconds after this search
@@ -4625,15 +5065,20 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionPendingPickupWasIncomplete_ = false;
             if (!missionReturnHome_ && (waypoint.flags & 0x01) != 0 &&
                 (searchActive || missionWeightVectorActive_ ||
+                 (missionVerifyPhase_ != 0 &&
+                  missionVerifyWaypoint_ == missionWaypointIndex_) ||
                  routeRangeMm <= 220.0f))
             {
-                // The inductor is direct evidence that a weight entered the
-                // mechanism. Do not keep searching the already-collected site.
+                // The inductor can confirm after the drive-through has ended,
+                // while the one-second pickup verification is running. Treat
+                // that phase as belonging to the current site rather than
+                // logging a confirmed physical pickup as unassigned.
                 setDrive(0, 0);
                 missionWeightVectorActive_ = false;
                 missionCollectionFollowThroughUntilMs_ = 0;
                 missionInnerWeightLocked_ = false;
                 missionVerifyPhase_ = 0;
+                missionVerifyWaypoint_ = 255;
                 missionSearchWaypoint_ = 255;
                 missionSearchStep_ = 0;
                 missionVerifyRetries_ = 0;
@@ -4787,7 +5232,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             now - weightBearingSeenMs_ <= 800U)
             missionSearchLastEvidenceMs_ = now;
         if (searchActive && !missionWeightVectorActive_ &&
-            now - missionSearchStartedMs_ >= 28000U)
+            now - missionSearchStartedMs_ >= 40000U)
         {
             setDrive(0, 0);
             finishSiteSearch(true);
@@ -4811,7 +5256,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const bool needsAnotherLook = recentlySeen || missionSearchSamples_ < 2U ||
                     missionSearchCoverageSamples_ < 2U;
                 if (needsAnotherLook && missionSearchPasses_ < 1U &&
-                    now - missionSearchStartedMs_ < 22000U)
+                    now - missionSearchStartedMs_ < 35000U)
                 {
                     missionSearchStep_ = 0;
                     ++missionSearchPasses_;
@@ -4826,15 +5271,23 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
             }
         }
-        float searchX = waypoint.xMm, searchY = waypoint.yMm;
+        float searchX = missionSearchCenterXmm_, searchY = missionSearchCenterYmm_;
         if (searchActive && missionSearchStep_ < 2U)
         {
             const float angle = missionSearchApproachHeadingDeg_ * DEG_TO_RAD;
-            const float backward = missionSearchPasses_ == 0 ? 180.0f : 130.0f;
-            const float lateral = (missionSearchStep_ == 0 ? -1.0f : 1.0f) *
-                (missionSearchPasses_ == 0 ? 150.0f : 100.0f);
-            searchX -= backward * cosf(angle) + lateral * sinf(angle);
-            searchY -= backward * sinf(angle) - lateral * cosf(angle);
+            const float searchRadius = missionSearchPasses_ == 0
+                ? static_cast<float>(navigationWeightSearchRadiusMm_)
+                : max(100.0f,
+                    static_cast<float>(navigationWeightSearchRadiusMm_) * 0.70f);
+            const float backward = min(
+                missionSearchPasses_ == 0 ? 180.0f : 130.0f,
+                searchRadius);
+            const float lateral = sqrtf(max(
+                0.0f, searchRadius * searchRadius - backward * backward));
+            const float signedLateral =
+                (missionSearchStep_ == 0 ? -1.0f : 1.0f) * lateral;
+            searchX -= backward * cosf(angle) + signedLateral * sinf(angle);
+            searchY -= backward * sinf(angle) - signedLateral * cosf(angle);
             if (!pointFreeAt(searchX, searchY, targetClearanceMm) ||
                 !segmentFreeAt(missionPoseXmm_, missionPoseYmm_,
                                searchX, searchY, targetClearanceMm))
@@ -4863,13 +5316,23 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWeightVectorCompletedWaypoint_ != missionWaypointIndex_ &&
             front != 0xFFFF && front >= 100U)
         {
-            if (abs(innerDeltaMm) > 80)
+            // The old 80 mm one-shot threshold was too broad: a brief
+            // matching pair could be accepted while the intake was still
+            // visibly offset. Use a tight enter/settle band and require
+            // fresh paired evidence to remain settled before drive-through.
+            constexpr int16_t INNER_CORRECT_DELTA_MM = 50;
+            constexpr int16_t INNER_SETTLED_DELTA_MM = 25;
+            constexpr uint32_t INNER_SETTLED_HOLD_MS = 300U;
+            const int16_t absoluteInnerDeltaMm = abs(innerDeltaMm);
+            if (absoluteInnerDeltaMm > INNER_CORRECT_DELTA_MM)
             {
                 if (missionInnerAlignStartedMs_ == 0)
                     missionInnerAlignStartedMs_ = now;
+                missionInnerCentreStableSinceMs_ = 0;
                 if (now - missionInnerAlignStartedMs_ >= 2500U)
                 {
                     missionInnerAlignStartedMs_ = 0;
+                    missionInnerCentreStableSinceMs_ = 0;
                     setDrive(0, 0);
                     if (!searchActive)
                         beginSiteSearch();
@@ -4880,14 +5343,40 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
                 // Steer toward the nearer inner return with both motors
                 // powered continuously. The drivetrain stalls below 75%,
-                // so the inner wheel runs at 75% and the outer at 100%.
+                // so retain that floor while making the large correction.
                 missionTargetAligned_ = false;
                 missionTargetAlignSinceMs_ = 0;
                 setDrive(innerDeltaMm > 0 ? -100 : -75,
                          innerDeltaMm > 0 ? -75 : -100);
                 return;
             }
+            if (absoluteInnerDeltaMm > INNER_SETTLED_DELTA_MM)
+            {
+                // Make the last small correction gentler. This prevents the
+                // 100/75 correction from overshooting across the centreline
+                // and repeatedly re-triggering the opposite direction.
+                missionInnerAlignStartedMs_ = now;
+                missionInnerCentreStableSinceMs_ = 0;
+                missionTargetAligned_ = false;
+                missionTargetAlignSinceMs_ = 0;
+                setDrive(innerDeltaMm > 0 ? -90 : -75,
+                         innerDeltaMm > 0 ? -75 : -90);
+                return;
+            }
             missionInnerAlignStartedMs_ = 0;
+            const bool freshInnerPair = (weightFreshMask_ & 0x06U) == 0x06U;
+            if (freshInnerPair && missionInnerCentreStableSinceMs_ == 0)
+                missionInnerCentreStableSinceMs_ = now;
+            if (missionInnerCentreStableSinceMs_ == 0 ||
+                now - missionInnerCentreStableSinceMs_ < INNER_SETTLED_HOLD_MS)
+            {
+                // Pause while the two inward-facing TOFs prove that this is
+                // a stable centre, rather than launching on one good frame.
+                setDrive(0, 0);
+                return;
+            }
+            missionInnerAlignStartedMs_ = 0;
+            missionInnerCentreStableSinceMs_ = 0;
             const MissionBottomSensorPose& midLeft = missionBottomSensors_[1];
             const MissionBottomSensorPose& midRight = missionBottomSensors_[2];
             const float hitForwardMm = 0.5f * (
@@ -4934,7 +5423,10 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
         }
         else if (!innerPairNear)
+        {
             missionInnerAlignStartedMs_ = 0;
+            missionInnerCentreStableSinceMs_ = 0;
+        }
         if (missionOuterCueWaypoint_ != missionWaypointIndex_)
         {
             missionOuterCueWaypoint_ = missionWaypointIndex_;
@@ -4956,7 +5448,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         const bool freshDirectionCue = !missionReturnHome_ &&
             (waypoint.flags & 0x01) != 0 && missionAvoidPhase_ == 0 &&
             missionWeightVectorCompletedWaypoint_ != missionWaypointIndex_ &&
-            routeRangeMm <= 450.0f &&
+            routeRangeMm <= 500.0f &&
             weightBearingSector_ < 4U &&
             weightBearingWaypoint_ == missionWaypointIndex_ &&
             now - weightBearingSeenMs_ <= 350U &&
@@ -4977,7 +5469,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         const float backY = missionPoseYmm_ - 160.0f * cueUy;
         const bool reverseCandidate = freshDirectionCue && outerSideHit &&
             (missionOuterReverseTriedMask_ & cueBit) == 0U &&
-            routeRangeMm <= 350.0f && forwardToHit <= 450.0f &&
+            routeRangeMm <= 500.0f && forwardToHit <= 500.0f &&
             pointFreeAt(backX, backY, targetClearanceMm) &&
             segmentFreeAt(missionPoseXmm_, missionPoseYmm_, backX,
                           backY, targetClearanceMm);
@@ -5111,6 +5603,19 @@ void BluetoothDebugWorkflow::updateNavigation()
             const float vy = aimY - missionPoseYmm_;
             const float hitDistance = hypotf(vx, vy);
             const float standoffMm = outerHint ? 450.0f : 350.0f;
+            if (searchActive)
+            {
+                // Once a sensor has localized a weight, search around that
+                // measured hit instead of snapping back to the planned route
+                // coordinate (which may be offset from the physical object).
+                missionSearchCenterXmm_ = aimX;
+                missionSearchCenterYmm_ = aimY;
+                const float bearingX = aimX - missionPoseXmm_;
+                const float bearingY = aimY - missionPoseYmm_;
+                if (hypotf(bearingX, bearingY) >= 50.0f)
+                    missionSearchApproachHeadingDeg_ = normaliseHeading(
+                        atan2f(bearingY, bearingX) * RAD_TO_DEG);
+            }
             if (!outerHint && hitDistance < standoffMm + 40.0f)
             {
                 setDrive(0, 0);
@@ -5149,7 +5654,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         const float arrivalMm = missionAvoidPhase_ != 0 ? 130.0f :
                                 seekWeightHint ? 40.0f :
                                 searchActive ? 85.0f :
-                                (waypoint.flags & 0x01) != 0 ? 70.0f : 120.0f;
+                                (waypoint.flags & 0x01) != 0 ? 70.0f : 80.0f;
 
         const float vectorProgressMm = missionWeightVectorActive_ ?
             (missionPoseXmm_ - missionWeightVectorStartXmm_) *
@@ -5261,10 +5766,12 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (!searchActive && !missionWeightVectorActive_ &&
             missionAvoidPhase_ == 0 && (waypoint.flags & 0x01) == 0 &&
             missionWaypointIndex_ + 1 < missionWaypointCount_ &&
-            distanceToWaypoint < 450.0f)
+            distanceToWaypoint < 320.0f)
         {
             float previewX = waypoint.xMm, previewY = waypoint.yMm;
-            float remainingMm = 300.0f;
+            // Keep the lookahead short enough to stay close to the uploaded
+            // line, while still rounding small planner corner clusters.
+            float remainingMm = 180.0f;
             // Several planned corners can be only 100 mm apart. Preview
             // across them, but stop before a weight, docking leg or wall.
             for (uint8_t next = missionWaypointIndex_ + 1;
@@ -5390,8 +5897,10 @@ void BluetoothDebugWorkflow::updateNavigation()
             fabsf(mappedWallMm - static_cast<float>(front)) <= 200.0f;
         missionTargetCommitActive_ = missionInnerWeightLocked_ ||
             missionFrontTargetVisible_ || mappedWallEcho || sensedWeightCorridor;
+        // The configured front stop is authoritative.  A former hidden
+        // 400 mm floor made routes stop/reverse despite a lower GUI setting.
         const uint16_t missionStopMm = max(FRONT_AVOID_MM,
-                                           static_cast<uint16_t>(400U));
+                                           static_cast<uint16_t>(70U));
         // A noisy frontal range near 400 mm made the last run alternate
         // STOP/GO and repeatedly restart bypasses. Release only after a
         // stable, clearly larger reading; keep the 100 mm hard wall limit.
@@ -5418,8 +5927,9 @@ void BluetoothDebugWorkflow::updateNavigation()
         const bool closeWallBlocked = missionTargetCommitActive_ &&
             (mappedWallMm < 100.0f ||
              (front < 100U && !missionFrontTargetVisible_));
-        const bool hardFrontWall = front != 0xFFFF &&
-            front < (missionTargetCommitActive_ ? 100U : 180U);
+        const uint16_t hardWallMm = max(static_cast<uint16_t>(70U),
+            min(FRONT_AVOID_MM, static_cast<uint16_t>(180U)));
+        const bool hardFrontWall = front != 0xFFFF && front < hardWallMm;
         // A 240-260 mm return is not grounds for reversing a pivot away
         // from a wall; that threshold created the repeated reverse/advance
         // loop at the first weight site. A genuinely close wall still backs out.
@@ -5591,17 +6101,22 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
 
         const float headingError = headingDelta(imu_.headingDeg(), targetBnoHeadingDeg);
-        bool slowWeightApproach = !missionReturnHome_ &&
-            (searchActive || missionWeightVectorActive_ ||
-             ((waypoint.flags & 0x01) != 0 && routeRangeMm <= 700.0f));
-        if (!slowWeightApproach && !missionReturnHome_ &&
+        bool approachingWeightSite = !missionReturnHome_ &&
+            ((waypoint.flags & 0x01) != 0 && routeRangeMm <= 800.0f);
+        if (!approachingWeightSite && !missionReturnHome_ &&
             missionWaypointIndex_ + 1 < missionWaypointCount_ &&
             (missionWaypoints_[missionWaypointIndex_ + 1].flags & 0x01) != 0)
         {
             const MissionWaypoint& site = missionWaypoints_[missionWaypointIndex_ + 1];
-            slowWeightApproach = hypotf(site.xMm - missionPoseXmm_,
-                                        site.yMm - missionPoseYmm_) <= 700.0f;
+            approachingWeightSite = hypotf(site.xMm - missionPoseXmm_,
+                                           site.yMm - missionPoseYmm_) <= 800.0f;
         }
+        // Decelerate into the site rather than arriving at the 500 mm search
+        // trigger at full drive speed. Once that trigger actually fires, use
+        // the collection-safe 65% speed for all search/weight manoeuvres.
+        const bool slowWeightApproach = !missionReturnHome_ &&
+            (approachingWeightSite || searchActive || missionWeightVectorActive_);
+        const bool weightSearchSpeed = searchActive || missionWeightVectorActive_;
         if (fabsf(headingError) > 16.0f &&
             (commandedA * commandedB < 0 || missionPointTurnActive_ ||
              (targetLeg && !missionTargetAligned_)))
@@ -5739,10 +6254,10 @@ void BluetoothDebugWorkflow::updateNavigation()
         // Hysteresis avoids alternating between a stationary point turn and
         // forward drive at the same 18-degree boundary each sensor update.
         if (!missionPointTurnActive_ &&
-            fabsf(headingError) > (slowWeightApproach ? 25.0f : 70.0f))
+            fabsf(headingError) > (slowWeightApproach ? 25.0f : 45.0f))
             missionPointTurnActive_ = true;
         else if (missionPointTurnActive_ &&
-                 fabsf(headingError) <= (slowWeightApproach ? 10.0f : 35.0f))
+                 fabsf(headingError) <= (slowWeightApproach ? 10.0f : 24.0f))
             missionPointTurnActive_ = false;
         if (missionPointTurnActive_)
         {
@@ -5775,8 +6290,9 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionTurnDirection_ = 0;
             missionTurnFinishing_ = false;
             missionTurnPulseUntilMs_ = 0;
-            const int16_t basePower = slowWeightApproach ? 65 :
-                (distanceToWaypoint < 350.0f ? 90 : 100);
+            const int16_t basePower = weightSearchSpeed ? 65 :
+                (slowWeightApproach ? 75 :
+                (distanceToWaypoint < 350.0f ? 90 : 100));
             if (fabsf(headingError) > 12.0f && !slowWeightApproach)
             {
                 const float differential = constrain(
