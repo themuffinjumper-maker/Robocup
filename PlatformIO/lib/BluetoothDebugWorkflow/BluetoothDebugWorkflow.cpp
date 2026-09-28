@@ -2,6 +2,7 @@
 
 #include <config.h>
 #include <debug_config.generated.h>
+#include <local_mission.generated.h>
 #include <imxrt.h>
 #include <Wire.h>
 
@@ -115,15 +116,30 @@ void BluetoothDebugWorkflow::begin()
     aioExpanderReady_ = aioExpander_.begin(AioConfig::EXPANDER_I2C_ADDRESS, Wire);
     if (aioExpanderReady_)
     {
-        // A button wired between AIO9 signal and GND is active-low. The
-        // SX1509's internal pull-up gives a defined idle HIGH level.
-        aioExpander_.pinMode(AioConfig::TEST_BUTTON_PIN, INPUT_PULLUP);
+        // Local competition starts on a LOW-to-HIGH edge. Give that profile a
+        // defined LOW idle with the SX1509 pulldown; leave the established
+        // active-low diagnostic wiring unchanged when the profile is absent.
+        if (LocalMissionConfig::ENABLED)
+        {
+            aioExpander_.pinMode(AioConfig::TEST_BUTTON_PIN, INPUT);
+            aioExpander_.digitalWrite(AioConfig::TEST_BUTTON_PIN, LOW);
+        }
+        else
+            aioExpander_.pinMode(AioConfig::TEST_BUTTON_PIN, INPUT_PULLUP);
         aio9ButtonRawHigh_ = aioExpander_.digitalRead(AioConfig::TEST_BUTTON_PIN) == HIGH;
         lastAio9ButtonSampleMs_ = millis();
+        localCompetition_.begin(aio9ButtonRawHigh_, lastAio9ButtonSampleMs_);
+        snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "%s",
+                 !LocalMissionConfig::ENABLED ? "DISABLED" : "ARMED");
         link_.log("INFO", "AIO9 button input ready on SX1509 I2C0");
     }
     else
+    {
+        localCompetition_.begin(false, millis());
+        snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "%s",
+                 LocalMissionConfig::ENABLED ? "NO_AIO9" : "DISABLED");
         link_.log("WARNING", "AIO SX1509 not detected at 0x3E on I2C0; AIO9 button unavailable");
+    }
     const bool tof8x8Ready = tof8x8_.begin();
     Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
@@ -227,6 +243,7 @@ void BluetoothDebugWorkflow::update()
     updateUltrasoundSensors();
 }
 
+
 void BluetoothDebugWorkflow::dispatch(JsonDocument& message, void* context)
 {
     static_cast<BluetoothDebugWorkflow*>(context)->handleMessage(message);
@@ -247,15 +264,26 @@ void BluetoothDebugWorkflow::handleMessage(JsonDocument& message)
     ++receivedMessages_;
     const char* type = message["type"] | "";
 
+    // When a local mission profile is embedded, the Bluetooth bridge is a
+    // telemetry monitor only. Do not let even a stale GUI packet mutate
+    // robot state; this guard intentionally does not cover our internal
+    // handleCommand() calls made by the AIO9 supervisor.
+    if (LocalMissionConfig::ENABLED &&
+        (strcmp(type, "command") == 0 || strcmp(type, "drive") == 0 ||
+         strcmp(type, "parameter") == 0))
+        return;
+
     if (strcmp(type, "hello") == 0)
     {
         link_.log("INFO", "Robot Debug GUI connected");
         sendState();
-        sendDefinitions();
+        if (!LocalMissionConfig::ENABLED)
+            sendDefinitions();
     }
     else if (strcmp(type, "request_definitions") == 0)
     {
-        if (!definitionsPending_ && (newSession || now - lastDefinitionsMs_ >= 5000U))
+        if (!LocalMissionConfig::ENABLED && !definitionsPending_ &&
+            (newSession || now - lastDefinitionsMs_ >= 5000U))
             sendDefinitions();
     }
     else if (strcmp(type, "heartbeat") == 0)
@@ -1988,6 +2016,14 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["system.debug_mode"] = debugMode_;
     data["system.stopped"] = stopped_;
     data["system.navigation_controller_version"] = 25;
+    data["local_competition.enabled"] = LocalMissionConfig::ENABLED;
+    data["local_competition.state"] = localCompetitionStatus_;
+    data["local_competition.elapsed_ms"] = localRunActive_
+        ? localCompetition_.elapsedMs(now) : 0U;
+    data["local_competition.remaining_ms"] = localRunActive_
+        ? localCompetition_.remainingMs(now) : 0U;
+    data["local_competition.aio9_high"] = aio9ButtonRawHigh_;
+    data["local_competition.aio9_available"] = aioExpanderReady_;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
     data["bluetooth.messages_received"] = receivedMessages_;
     data["bluetooth.rx_bytes"] = link_.receivedBytes();
@@ -2288,7 +2324,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     if (aioExpanderReady_)
     {
         data["digital.aio9_button.raw_high"] = aio9ButtonRawHigh_;
-        data["digital.aio9_button.pressed"] = !aio9ButtonRawHigh_;
+        data["digital.aio9_button.pressed"] = LocalMissionConfig::ENABLED
+            ? aio9ButtonRawHigh_ : !aio9ButtonRawHigh_;
     }
     for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
     {
@@ -5247,6 +5284,11 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 if (missionAutoReturnHome_)
                 {
+                    if (localRunActive_)
+                    {
+                        finishLocalCompetition();
+                        return;
+                    }
                     // The planned collection pass is complete. Close the
                     // gate after the unload shake, then leave home in the
                     // unplanned reactive-wander mode rather than replaying

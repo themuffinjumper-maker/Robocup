@@ -15,4 +15,5 @@ void setup()
 void loop()
 {
     debugGui.update();
+    debugGui.updateLocalCompetition();
 }

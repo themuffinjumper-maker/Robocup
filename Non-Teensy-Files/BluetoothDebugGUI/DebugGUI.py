@@ -406,6 +406,8 @@ class RobotDebugGUI(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self.monitor_only_toggle.toggled.connect(self.set_monitor_only)
+        self.set_monitor_only(self.monitor_only_toggle.isChecked(), persist=False)
         QApplication.instance().installEventFilter(self)
         self.load_local_debug_config()
 
@@ -995,6 +997,17 @@ class RobotDebugGUI(QMainWindow):
             self.exit_debug_button
         )
 
+        self.monitor_only_toggle = QCheckBox("Monitor only — no command TX")
+        saved_monitor_only = str(
+            self.settings.value("app/monitor_only", "true")
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self.monitor_only_toggle.setChecked(saved_monitor_only)
+        self.monitor_only_toggle.setToolTip(
+            "Hide command/parameter controls and block all GUI command and parameter writes. "
+            "Telemetry and recording remain active."
+        )
+        connection_layout.addWidget(self.monitor_only_toggle)
+
         main_layout.addWidget(
             connection_group
         )
@@ -1053,6 +1066,9 @@ class RobotDebugGUI(QMainWindow):
         self.tabs.addTab(self.arena_view, "Arena View")
 
     def apply_arena_parameter(self, name, value):
+        if self.monitor_only:
+            self.add_log("BLOCKED", f"Monitor-only mode blocked parameter write: {name}")
+            return
         self.parameter_values[name] = value
         self.recorder.record_parameter(name, value)
         self.bluetooth.set_parameter(name, value)
@@ -1301,9 +1317,8 @@ class RobotDebugGUI(QMainWindow):
             1,
         )
 
-        splitter.addWidget(
-            command_panel
-        )
+        self.dashboard_command_panel = command_panel
+        splitter.addWidget(command_panel)
 
         splitter.setSizes(
             [
@@ -2265,6 +2280,33 @@ class RobotDebugGUI(QMainWindow):
             self.on_robot_state
         )
 
+    def set_monitor_only(self, enabled, persist=True):
+        """Read telemetry without allowing any UI path to transmit controls."""
+        enabled = bool(enabled)
+        self.monitor_only = enabled
+        if persist:
+            self.settings.setValue("app/monitor_only", enabled)
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) in ("Parameters", "Commands"):
+                self.tabs.setTabVisible(index, not enabled)
+        if hasattr(self, "dashboard_command_panel"):
+            self.dashboard_command_panel.setVisible(not enabled)
+        if hasattr(self, "arena_view"):
+            self.arena_view.set_read_only_mode(enabled)
+        self.enter_debug_button.setVisible(not enabled)
+        self.exit_debug_button.setVisible(not enabled)
+        if enabled and self.keyboard_drive_enabled.isChecked():
+            self.keyboard_drive_keys.clear()
+            self.keyboard_drive_enabled.blockSignals(True)
+            self.keyboard_drive_enabled.setChecked(False)
+            self.keyboard_drive_enabled.blockSignals(False)
+        self.keyboard_drive_enabled.setEnabled(
+            not enabled and self.bluetooth.is_connected())
+        self.statusBar().showMessage(
+            "Monitor only — telemetry is live; command and parameter transmission is blocked"
+            if enabled else "Interactive debug controls enabled"
+        )
+
     def update_link_health(self):
         now = time.monotonic()
         cutoff = now - 1.0
@@ -2492,7 +2534,7 @@ class RobotDebugGUI(QMainWindow):
                 True
             )
 
-            self.keyboard_drive_enabled.setEnabled(True)
+            self.keyboard_drive_enabled.setEnabled(not self.monitor_only)
 
             # Still disabled until the user starts recording.
             self.log_fault_button.setEnabled(
@@ -2952,6 +2994,9 @@ class RobotDebugGUI(QMainWindow):
         name: str,
         editor: ValueEditor,
     ):
+        if self.monitor_only:
+            self.add_log("BLOCKED", f"Monitor-only mode blocked parameter write: {name}")
+            return
         value = editor.value()
         self.parameter_values[name] = value
 
@@ -3072,6 +3117,9 @@ class RobotDebugGUI(QMainWindow):
         name: str,
         arguments: dict,
     ):
+        if self.monitor_only:
+            self.add_log("BLOCKED", f"Monitor-only mode blocked command: {name}")
+            return
         self.recorder.record_command(
             name,
             arguments,
@@ -3106,6 +3154,11 @@ class RobotDebugGUI(QMainWindow):
     # =================================================================
 
     def set_keyboard_drive_enabled(self, enabled: bool):
+        if enabled and self.monitor_only:
+            self.keyboard_drive_enabled.blockSignals(True)
+            self.keyboard_drive_enabled.setChecked(False)
+            self.keyboard_drive_enabled.blockSignals(False)
+            return
         if not enabled:
             self.keyboard_drive_keys.clear()
             self._send_keyboard_drive_output(0, 0, force=True)
@@ -3137,6 +3190,10 @@ class RobotDebugGUI(QMainWindow):
         return channel_a, channel_b
 
     def _send_keyboard_drive_output(self, channel_a, channel_b, force=False, quiet=False):
+        if self.monitor_only:
+            self.keyboard_drive_keys.clear()
+            self.keyboard_drive_last_output = (0, 0)
+            return
         output = (int(channel_a), int(channel_b))
         if output == self.keyboard_drive_last_output and not force:
             return

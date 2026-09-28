@@ -17,7 +17,8 @@ from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -2753,6 +2754,13 @@ class ArenaView(QWidget):
             "QPushButton { background:#0369a1; color:white; font-weight:bold; padding:6px 12px; }")
         plan.clicked.connect(self._plan_mission_route)
         tools.addWidget(plan)
+        self.export_local_mission_button = QPushButton("EXPORT LOCAL FIRMWARE CONFIG")
+        self.export_local_mission_button.setToolTip(
+            "Save this arena, rotated obstacles, route, sensor poses, and navigation tuning "
+            "to PlatformIO/local_mission.json for the next Teensy build."
+        )
+        self.export_local_mission_button.clicked.connect(self._export_local_mission)
+        tools.addWidget(self.export_local_mission_button)
         page_layout.addLayout(tools)
 
         body = QHBoxLayout()
@@ -3252,6 +3260,95 @@ class ArenaView(QWidget):
                 int(round(ultrasound[name][field]))
                 for name in ("a", "b") for field in ("x", "y")]
         return payload
+
+    def _export_local_mission(self):
+        """Export exactly the planned mission data consumed by local firmware."""
+        if not self.navigation_tuning_controls:
+            QMessageBox.warning(self, "Local mission export",
+                                "Navigation tuning controls are not ready yet.")
+            return
+        if not self.mission_layout.route and not self._plan_mission_route():
+            return
+
+        mission = self.mission_layout.command_payload()
+        map_payload = self._mission_map_payload()
+        real_targets = sum(1 for item in self.mission_layout.weights
+                           if not item.get("dummy", False))
+        if real_targets == 0 or not mission["points"]:
+            QMessageBox.warning(
+                self, "Local mission export",
+                "Add at least one real weight and plan a route before exporting."
+            )
+            return
+        if len(mission["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS or \
+                len(map_payload["features"]) // 5 > 24:
+            QMessageBox.warning(
+                self, "Local mission export",
+                "This mission exceeds the Teensy's route/map capacity. Simplify the route or arena."
+            )
+            return
+
+        parameters = [{"name": "navigation.strategy", "value": 3}]
+        for name, control in self.navigation_tuning_controls.items():
+            # The drum recovery controls are deliberately excluded: that
+            # proven subsystem is protected from unrelated configuration edits.
+            if name.startswith("jam_"):
+                continue
+            parameters.append({
+                "name": "navigation." + name,
+                "value": int(control.value()),
+            })
+
+        export = {
+            "schema_version": 1,
+            "enabled": True,
+            "arena": {
+                "width_mm": int(MissionLayout.WIDTH_MM),
+                "height_mm": int(MissionLayout.HEIGHT_MM),
+            },
+            "map": map_payload,
+            "mission": mission,
+            "parameters": parameters,
+            "sensor_layout": {
+                "point_tofs": self.model.sensor_specs,
+                "ultrasounds": self.model.ultrasound_specs,
+                "matrix_tof": self.model.matrix_spec,
+            },
+        }
+        project_root = Path(__file__).resolve().parents[2]
+        output_path = project_root / "PlatformIO" / "local_mission.json"
+        try:
+            output_path.write_text(
+                json.dumps(export, indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Local mission export",
+                f"Could not write the firmware mission file:\n{exc}"
+            )
+            return
+
+        self.mission_status.setText(
+            f"Local mission exported to {output_path}. Build/upload the teensy40 "
+            "environment to embed it; firmware will remain idle until AIO9 rises HIGH."
+        )
+
+    def set_read_only_mode(self, enabled):
+        """Hide/disable arena-page controls that can send robot commands."""
+        enabled = bool(enabled)
+        for name in (
+            "start_run_button", "stop_run_button", "run_navigation_button",
+            "stop_navigation_button", "return_home_button", "run_motors_button",
+            "stop_motors_button", "open_gate_button", "close_gate_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not enabled)
+                button.setVisible(not enabled)
+        tuning = getattr(self, "navigation_tuning_tabs", None)
+        if tuning is not None:
+            tuning.setVisible(not enabled)
 
     def _return_home(self):
         latest = self.model.latest

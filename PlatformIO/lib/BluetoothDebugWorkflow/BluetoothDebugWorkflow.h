@@ -8,6 +8,7 @@
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
+#include <LocalCompetition.h>
 #include <RobotDebug.h>
 #include <SparkFunSX1509.h>
 #include <Tof.h>
@@ -20,6 +21,9 @@ public:
 
     void begin();
     void update();
+    // Optional local-autonomy hook, deliberately called as one line from
+    // main.cpp so the whole competition supervisor can be unplugged easily.
+    void updateLocalCompetition();
 
 private:
     static constexpr uint8_t MAX_TOF_SENSORS = 8;
@@ -43,6 +47,10 @@ private:
     Tof8x8 tof8x8_;
     SX1509 aioExpander_;
     JsonDocument config_;
+    LocalCompetition localCompetition_;
+    bool localRunActive_ = false;
+    bool localMissionReturning_ = false;
+    char localCompetitionStatus_[24] = "DISABLED";
 
     bool debugMode_ = false;
     bool stopped_ = true;
@@ -522,6 +530,9 @@ private:
     void handleMessage(JsonDocument& message);
     void handleCommand(JsonDocument& message);
     void handleParameter(JsonDocument& message);
+    bool loadLocalMission();
+    void requestLocalReturnHome();
+    void finishLocalCompetition();
     void sendDefinitions();
     void updateDefinitionBroadcast(uint32_t now);
     bool bluetoothPeerAlive(uint32_t now) const;

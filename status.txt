@@ -6966,3 +6966,44 @@ Not verified here:
   build passed (FLASH code 226,168 B; RAM1 variables 74,592 B); `git diff
   --check` passed. Route tracking and weight-vector behavior need confirmation
   in the next arena recording.
+
+2026-09-29 — Standalone local competition mission mode
+------------------------------------------------------
+- Added an optional local-competition firmware layer, kept separate from the
+  ordinary startup and debug workflow. `main.cpp` only calls its update hook;
+  the timer/button supervisor lives in `PlatformIO/lib/LocalCompetition/`, and
+  the mission routines live in `BluetoothDebugWorkflowLocal.cpp`.
+- Power-up remains idle: the local mission does not start motors, sorting, or
+  navigation until AIO9 makes a debounced LOW-to-HIGH transition. In the
+  enabled local profile, AIO9 is configured with a pull-down. The button must
+  connect AIO9 to 3.3 V when pressed; do not apply 5 V. The local input is the
+  SX1509 AIO9 pin on I2C0, not raw Teensy D9. If the local profile is not
+  embedded, the previous active-low AIO9 diagnostic configuration remains.
+- Added **EXPORT LOCAL FIRMWARE CONFIG** to Arena View / Mission Planner. It
+  saves the planned route, arena features (including rotated walls), point-TOF
+  geometry, ultrasound offsets, and adjustable navigation parameters to
+  `PlatformIO/local_mission.json`. Jam/drum recovery parameters are excluded
+  to preserve that protected subsystem. Rebuild after each export so the
+  PlatformIO pre-build script embeds the updated JSON in flash.
+- On AIO9 start, firmware loads the embedded map, route, and navigation
+  parameters internally, enables sorting, sets bank 1 to 100%, and starts the
+  planned navigation without needing a Bluetooth command. At 90 seconds, it
+  skips remaining weight targets and invokes the normal map-aware home/dock,
+  gate-open, and unload-shake sequence; after unloading it closes the gate and
+  stops using the existing stop path.
+- In the desktop app, **Monitor only — no command TX** is enabled by default.
+  Command/parameter tabs and Arena View actuation/tuning controls are hidden,
+  and GUI command, parameter, and keyboard-drive sends are blocked. Firmware
+  independently drops incoming Bluetooth command/drive/parameter packets
+  while an enabled local mission is embedded; Bluetooth remains available for
+  telemetry and recording. The debug/manual workflow can be restored by
+  exporting a config with `enabled: false` and rebuilding.
+- Added setup, export, flash, button wiring, timer, and Bluetooth-monitor
+  instructions in `PlatformIO/LOCAL_COMPETITION.md`.
+- Verification: Teensy 4.0 PlatformIO firmware build passed after the local
+  routines were split into their own source file (FLASH code 218,616 B;
+  RAM1 variables 73,536 B). Python syntax compilation for `DebugGUI.py` and
+  `ArenaView.py` passed, as did `git diff --check`. No firmware was uploaded
+  and no hardware/arena run has been performed. The exporter must be used
+  before the competition profile is enabled in the next build.
+- The existing drum jam-detection/reversal logic was not edited.
