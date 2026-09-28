@@ -18,6 +18,19 @@ readable; their 8x8 frames are recovered from raw serial where possible, but
 they cannot contain GUI snapshots or embedded wiring/layout data that were
 never recorded.
 
+**Planned Arena** replays the pre-laid mission layout separately from the
+discovered Arena View. New recordings save the exact editor weights, obstacles,
+start and route. The cyan line is the commanded route, the orange trace is the
+recorded mission pose, and the blue marker is the pose at the current replay
+time. For older recordings lacking an editor-layout snapshot, the view is
+labelled as reconstructed from the uploaded mission map and plan commands;
+those target waypoints only approximate the original weight centres.
+At each replay time the red forward ray is the observed TOF distance and the
+cyan dashed ray is the next wall predicted by the pre-laid physical arena
+layout. A large difference is explicitly marked as an obstacle or possible
+pose/map mismatch; the comparison is approximate because the navigation
+forward value can come from either a point TOF or the 8x8 sensor.
+
 ## Purpose
 
 This project has two distinct operating modes:

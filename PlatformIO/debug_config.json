@@ -85,22 +85,33 @@
       "description": "Delay between telemetry packets",
       "datatype": "int",
       "unit": "ms",
-      "value": 1000,
-      "min": 750,
-      "max": 2000,
+      "value": 2000,
+      "min": 1000,
+      "max": 5000,
       "step": 50
     },
     {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative, 3 frontier A*, 4 reactive wander)","datatype":"int","value":0,"min":0,"max":4,"step":1},
-    {"name":"navigation.front_avoid_mm","label":"Navigation front stop","datatype":"int","unit":"mm","value":300,"min":100,"max":1000,"step":25},
+    {"name":"navigation.front_avoid_mm","label":"Mission front wall stop","datatype":"int","unit":"mm","value":150,"min":70,"max":600,"step":10},
+    {"name":"navigation.matrix_wall_mm","label":"8x8 broad-wall consensus","datatype":"int","unit":"mm","value":400,"min":200,"max":800,"step":25},
     {"name":"navigation.side_avoid_mm","label":"Navigation side clearance","datatype":"int","unit":"mm","value":200,"min":80,"max":800,"step":25},
     {"name":"navigation.wall_follow_mm","label":"Wall-follow distance","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
     {"name":"navigation.lane_spacing_mm","label":"Sweep lane spacing","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
-    {"name":"navigation.robot_width_mm","label":"Robot physical width","datatype":"int","unit":"mm","value":430,"min":100,"max":1200,"step":10},
-    {"name":"navigation.gap_margin_mm","label":"Gap safety margin","datatype":"int","unit":"mm","value":80,"min":0,"max":500,"step":10},
+    {"name":"navigation.robot_width_mm","label":"Robot width (gap measurement)","datatype":"int","unit":"mm","value":290,"min":100,"max":1200,"step":10},
+    {"name":"navigation.robot_length_mm","label":"Robot length (front ranging)","datatype":"int","unit":"mm","value":430,"min":100,"max":1200,"step":10},
+    {"name":"navigation.wall_clearance_mm","label":"Mapped wall clearance (robot edge)","datatype":"int","unit":"mm","value":30,"min":0,"max":300,"step":10},
+    {"name":"navigation.route_line_tolerance_mm","label":"Route line tolerance","datatype":"int","unit":"mm","value":100,"min":30,"max":300,"step":10},
+    {"name":"navigation.gap_margin_mm","label":"Extra required gap width","datatype":"int","unit":"mm","value":60,"min":0,"max":500,"step":10},
     {"name":"navigation.gap_depth_mm","label":"Minimum depth considered open","datatype":"int","unit":"mm","value":550,"min":250,"max":3000,"step":25},
+    {"name":"navigation.weight_search_radius_mm","label":"Weight-site search radius","datatype":"int","unit":"mm","value":500,"min":150,"max":800,"step":25},
+    {"name":"navigation.weight_approach_clearance_mm","label":"Weight approach front clearance","datatype":"int","unit":"mm","value":180,"min":70,"max":600,"step":10},
+    {"name":"navigation.weight_inner_lock_mm","label":"Either inner TOF pickup-lock range","datatype":"int","unit":"mm","value":130,"min":70,"max":250,"step":5},
     {"name":"navigation.matrix_floor_rows","label":"Ignored lower 8x8 rows","datatype":"int","value":2,"min":0,"max":4,"step":1},
     {"name":"navigation.matrix_fov_deg","label":"8x8 horizontal field of view","datatype":"int","unit":"deg","value":40,"min":20,"max":90,"step":1},
-    {"name":"navigation.gap_confirm_frames","label":"Gap confirmation frames","datatype":"int","value":2,"min":1,"max":5,"step":1}
+    {"name":"navigation.gap_confirm_frames","label":"Gap confirmation frames","datatype":"int","value":2,"min":1,"max":5,"step":1},
+    {"name":"drum.jam_reverse_time_ms","label":"Jam reverse duration","description":"How long the drum reverses after a current jam is confirmed","datatype":"int","unit":"ms","value":500,"min":50,"max":2000,"step":50},
+    {"name":"drum.jam_reverse_percent","label":"Jam reverse speed","description":"Negative percentage is reverse; zero disables the reverse kick","datatype":"int","unit":"%","value":-100,"min":-100,"max":0,"step":5},
+    {"name":"drum.jam_drop_adc_counts","label":"Jam sensitivity (ADC drop)","description":"Filtered ADC-count drop from the running baseline that starts the reverse kick","datatype":"int","unit":"counts","value":40,"min":2,"max":100,"step":1},
+    {"name":"drum.jam_confirm_time_ms","label":"Jam confirmation time","description":"How long the ADC drop must persist before reversing","datatype":"int","unit":"ms","value":400,"min":20,"max":1000,"step":10}
   ],
   "commands": [
     {
@@ -179,11 +190,11 @@
       "name": "set_dc_motor_203_speed",
       "label": "Set first 203 motor speed (D27/D26)",
       "category": "203 DC Motor",
+      "description": "Bank 1 drum motors run together at the same signed percentage. Negative reverses both; zero stops both.",
       "action": "dc_motor_203_speed",
       "debug_mode_required": true,
       "args": [
-        {"name": "channel_a_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0},
-        {"name": "channel_b_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0}
+        {"name": "speed_percent", "label": "Both motors (%)", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0}
       ]
     },
     {
@@ -219,10 +230,18 @@
       "args": []
     },
     {
+      "name": "zero_current_sensor",
+      "label": "Zero D23 current sensor",
+      "category": "Current sensor",
+      "description": "With the robot stopped and no current through the measured circuit, calibrate the ACS712-30A zero point. The module must be powered from 5 V; its analog output reaches D23 through the 12k/12k divider.",
+      "action": "current_sensor_zero",
+      "args": []
+    },
+    {
       "name": "autonomous_navigation",
       "label": "Autonomous navigation",
       "category": "Navigation",
-      "description": "Uses 100% base drive, finds and follows walls at 200 mm, then maps the arena in 200 mm parallel sweep lanes. Every completed turn is checked before forward motion: a still-blocked front causes another turn, while a close wall on all three sides triggers a reverse escape. Navigation uses the top TOFs and 8x8 forward view plus left/right ultrasound; bottom TOFs remain weight-sensing only.",
+      "description": "Uses the adjustable navigation controls for wall stopping, wall following, sweep spacing, robot geometry and gap width. The 8x8 TOF measures and centres verified openings; side ultrasounds and top TOFs corroborate mapped walls. Bottom TOFs are reserved for weight finding, paired intake centring and verified weight checkpoints.",
       "action": "navigation_toggle",
       "debug_mode_required": true,
       "args": [],
@@ -257,6 +276,19 @@
       "args": []
     },
     {
+      "name": "storage_release_gate",
+      "label": "Storage release gate",
+      "category": "HX12K",
+      "description": "HX12K B (D32): closed during navigation at 50°, open at home at 10°. Manual buttons work while navigation is stopped.",
+      "action": "hx12k_storage_gate",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "OPEN GATE", "arguments": {"open": true}},
+        {"label": "CLOSE GATE", "arguments": {"open": false}}
+      ]
+    },
+    {
       "name": "set_bumper_servos",
       "label": "Bumper servos",
       "category": "HX12K",
@@ -288,6 +320,14 @@
       "category": "TOF",
       "description": "Read every TOF sensor listed in tof_sensors and publish each distance separately.",
       "action": "tof_read_all",
+      "args": []
+    },
+    {
+      "name": "recover_failed_tof",
+      "label": "Recover one failed point TOF",
+      "category": "TOF",
+      "description": "With navigation stopped, power-cycles and reinitialises one failed point-TOF socket without resetting healthy sensors. The dashboard shows per-sensor recovery failures and retry timing.",
+      "action": "tof_recover_failed",
       "args": []
     }
   ]

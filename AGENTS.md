@@ -1,0 +1,3 @@
+# Project guardrail: working drum jam recovery
+
+The user confirmed on 2026-09-29 that the current drum stall detection and automatic reverse-recovery system is working. Treat this subsystem as protected. Do not change its trigger logic, ADC sampling or calibration, thresholds, timing, reverse command, motor percentages, related GUI parameters, or associated wiring/configuration as part of other work. Do not refactor it incidentally. Change it only when the user explicitly asks for a change to this subsystem; if a requested task appears to require altering it, explain the conflict and ask first.

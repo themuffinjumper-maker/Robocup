@@ -10,6 +10,7 @@ void RobotDebug::update()
     while (stream_.available() > 0)
     {
         const char c = static_cast<char>(stream_.read());
+        ++receivedBytes_;
         if (c == '\n')
         {
             finishLine();
@@ -32,6 +33,7 @@ void RobotDebug::finishLine()
     if (droppingLine_)
     {
         droppingLine_ = false;
+        ++invalidLines_;
         error("Incoming message exceeded 767 bytes");
         return;
     }
@@ -44,11 +46,13 @@ void RobotDebug::finishLine()
     length_ = 0;
     if (result)
     {
+        ++invalidLines_;
         error("Malformed JSON message");
         return;
     }
     if (!message.is<JsonObject>())
     {
+        ++invalidLines_;
         error("Message must be a JSON object");
         return;
     }

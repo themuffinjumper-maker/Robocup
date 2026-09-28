@@ -38,6 +38,7 @@ DEFAULT_ENTRIES = [
     {"kind": "Servo", "device": "HX12K D", "connector": "Digital Raw 1 / level shift", "pins": "D30", "notes": "Level-shifted servo output"},
     {"kind": "Sensor", "device": "Dual encoder board", "connector": "Digital Raw 2", "pins": "E1 A:D2 B:D3 / E2 A:D4 B:D5", "notes": "Quadrature; 3.3 V signals only"},
     {"kind": "Sensor", "device": "Inductive proximity sensor", "connector": "Digital", "pins": "D21", "notes": "Active-low digital input; INPUT_PULLUP; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "Keyestudio ACS712-30A current sensor", "connector": "Analog", "pins": "D23 / A9", "notes": "Module 5 V; OUT via 12k/12k divider; common GND; ADC input 3.3 V maximum"},
     {"kind": "Sensor", "device": "Ultrasound Left (A)", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D14 / ECHO D24", "notes": "Left ultrasonic range sensor; channel A; 3.3 V maximum"},
     {"kind": "Sensor", "device": "Ultrasound Right (B)", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D22 / ECHO D20", "notes": "Right ultrasonic range sensor; channel B; 3.3 V maximum"},
     {"kind": "Sensor", "device": "TOF Long Top Mid Left", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
@@ -265,6 +266,14 @@ class WiringGuide(QWidget):
                                             if entry["connector"] == port))
                 self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
                 self.settings.setValue("wiring_guide/xshut6_xshut7_migrated", True)
+                self.settings.sync()
+
+            if not self.settings.value("wiring_guide/current_d23_migrated", False, type=bool):
+                if not any("D23" in entry["pins"].upper() for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Keyestudio ACS712-30A current sensor"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/current_d23_migrated", True)
                 self.settings.sync()
 
             return cleaned

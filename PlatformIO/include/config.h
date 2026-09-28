@@ -88,6 +88,11 @@ namespace Pins {
     constexpr uint8_t ULTRASOUND_B_ECHO = 20;
 
     constexpr uint8_t INDUCTIVE_PROXIMITY = 21;
+    // Keyestudio ACS712-30A analog output, divided by 12k/12k before D23/A9.
+    // On Teensy 4.0 this is ADC1 channel 14 (not ADC2). Power the sensor from
+    // 5 V; never let the divided ADC input exceed the Teensy's 3.3 V rail.
+    constexpr uint8_t CURRENT_SENSOR = A9;
+    constexpr float CURRENT_ADC_REFERENCE_V = 3.286f; // measured Teensy 3V3 rail
 
 } // namespace Pins
 

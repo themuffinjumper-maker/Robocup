@@ -75,6 +75,7 @@ class SerialWorker(QThread):
 
     connected = pyqtSignal(str)
     disconnected = pyqtSignal()
+    link_recovery = pyqtSignal(str)
 
     raw_received = pyqtSignal(str)
     message_received = pyqtSignal(dict)
@@ -97,6 +98,10 @@ class SerialWorker(QThread):
 
         self._tx_queue: queue.Queue[str] = queue.Queue()
         self._rx_buffer = bytearray()
+        self._last_robot_message: float | None = None
+        self._last_hello_sent = 0.0
+        self._last_heartbeat_sent = 0.0
+        self._last_silence_recovery = 0.0
 
     # -----------------------------------------------------------------
 
@@ -114,6 +119,7 @@ class SerialWorker(QThread):
             self.disconnected.emit()
             return
 
+        self._last_hello_sent = time.monotonic()
         self.connected.emit(self.port)
 
         try:
@@ -121,6 +127,8 @@ class SerialWorker(QThread):
 
                 self._process_transmit_queue()
                 self._process_receive()
+                self._maintain_link()
+                time.sleep(0.005)
 
         except Exception as exc:
             if not self._stop_event.is_set():
@@ -142,32 +150,28 @@ class SerialWorker(QThread):
         if self._serial is None:
             return
 
-        while not self._tx_queue.empty():
+        try:
+            text = self._tx_queue.get_nowait()
+        except queue.Empty:
+            return
 
-            try:
-                text = self._tx_queue.get_nowait()
-            except queue.Empty:
-                return
-
-            try:
-                payload = text.encode("utf-8")
-                offset = 0
-                while offset < len(payload):
-                    # The CH9143 BLE bridge is markedly more reliable when a
-                    # line longer than one radio payload is paced into modest
-                    # UART chunks, especially while telemetry is arriving.
-                    chunk = payload[offset:offset + 20]
-                    written = self._serial.write(chunk)
-                    if written is None or written <= 0:
-                        raise serial.SerialTimeoutException(
-                            "Serial write made no progress"
-                        )
-                    offset += written
-                    if offset < len(payload):
-                        time.sleep(0.003)
-                self._serial.flush()
-            except Exception as exc:
-                self.error.emit(f"Transmit error: {exc}")
+        try:
+            payload = text.encode("utf-8")
+            offset = 0
+            while offset < len(payload):
+                # Pace longer commands through the BLE bridge.
+                chunk = payload[offset:offset + 20]
+                written = self._serial.write(chunk)
+                if written is None or written <= 0:
+                    raise serial.SerialTimeoutException(
+                        "Serial write made no progress"
+                    )
+                offset += written
+                if offset < len(payload):
+                    time.sleep(0.003)
+            self._serial.flush()
+        except Exception as exc:
+            self.error.emit(f"Transmit error: {exc}")
 
     # -----------------------------------------------------------------
 
@@ -194,6 +198,8 @@ class SerialWorker(QThread):
                 try:
                     message = json.loads(text)
                     if isinstance(message, dict):
+                        if message.get("type") != "link_probe":
+                            self._last_robot_message = time.monotonic()
                         self.message_received.emit(message)
                 except json.JSONDecodeError:
                     # Complete non-JSON lines remain visible in Raw Serial.
@@ -207,6 +213,51 @@ class SerialWorker(QThread):
         except serial.SerialException as exc:
             self.error.emit(str(exc))
             self._stop_event.set()
+
+    def _maintain_link(self):
+        """Retry a lost handshake and keep an established radio session alive."""
+        now = time.monotonic()
+        if (self._last_robot_message is not None and
+                now - self._last_robot_message >= 8.0 and
+                now - self._last_silence_recovery >= 8.0):
+            # A paired CH9143 can leave its USB COM port open while its serial
+            # stream has stopped. Reopening the same port clears that stale
+            # bridge session; discard queued commands so an old drive command
+            # can never be replayed when the radio comes back.
+            self._last_silence_recovery = now
+            self.link_recovery.emit(
+                f"No robot data for 8 seconds; reopening {self.port}"
+            )
+            while True:
+                try:
+                    self._tx_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                if self._serial is not None and self._serial.is_open:
+                    self._serial.close()
+                self._rx_buffer.clear()
+                self._serial = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    timeout=0.05,
+                    write_timeout=0.5,
+                )
+                self._last_hello_sent = 0.0
+                self._last_heartbeat_sent = 0.0
+            except Exception as exc:
+                self._serial = None
+                self.error.emit(f"Could not reopen {self.port}: {exc}")
+
+        if self._last_robot_message is None or now - self._last_robot_message > 3.0:
+            if now - self._last_hello_sent >= 2.0:
+                self.send_text(json.dumps({
+                    "type": "hello", "client": "RobotDebugGUI", "protocol": 1,
+                }, separators=(",", ":")))
+                self._last_hello_sent = now
+        elif now - self._last_heartbeat_sent >= 3.0:
+            self.send_text('{"type":"heartbeat"}')
+            self._last_heartbeat_sent = now
 
     # -----------------------------------------------------------------
 
@@ -254,6 +305,7 @@ class BluetoothSerial(QObject):
     error_received = pyqtSignal(str)
 
     robot_state_received = pyqtSignal(dict)
+    link_recovery = pyqtSignal(str)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -316,6 +368,8 @@ class BluetoothSerial(QObject):
         self.worker.disconnected.connect(
             self._on_disconnected
         )
+
+        self.worker.link_recovery.connect(self.link_recovery)
 
         self.worker.raw_received.connect(
             self.raw_received

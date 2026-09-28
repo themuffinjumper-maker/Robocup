@@ -50,3 +50,8 @@ press Run Robot, then use **Set HX12K servo angles**. Tick only the outputs you
 want to move and set an independent angle for each. Begin near the centre (67.5
 degrees) with linkages disconnected. **Disable HX12K output**, global STOP, and
 leaving Debug Mode detach all four pulse outputs.
+
+Output **B** (Teensy D32 via the level shifter) is now the storage-release
+gate: 50 degrees closed, 10 degrees open. The debug GUI has paired OPEN GATE
+and CLOSE GATE buttons in the HX12K command card and Arena View. Check the
+physical direction with the linkage clear before trying an autonomous unload.

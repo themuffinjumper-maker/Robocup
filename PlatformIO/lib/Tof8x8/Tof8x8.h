@@ -16,12 +16,14 @@ public:
     // when the sensor is absent or configured for UART.
     bool begin();
 
-    // Refreshes the complete row-major frame. Values are millimetres.
+    // Advances a non-blocking I2C request. Returns true only when a new
+    // complete row-major frame has arrived; call frequently from loop().
     bool read();
 
     bool available() const;
     bool lastReadSucceeded() const;
     uint32_t frameNumber() const;
+    uint32_t lastFrameMs() const;
     uint8_t detectedAddress() const;
     uint8_t addressAckMask() const;
     bool address52Acknowledged() const;
@@ -37,8 +39,14 @@ private:
     bool available_ = false;
     bool lastReadSucceeded_ = false;
     uint32_t frameNumber_ = 0;
+    uint32_t lastFrameMs_ = 0;
+    uint32_t pendingSinceMs_ = 0;
+    uint32_t nextRequestMs_ = 0;
+    uint32_t lastPollMs_ = 0;
+    bool awaitingFrame_ = false;
     uint8_t detectedAddress_ = 0;
     uint8_t addressAckMask_ = 0;
     bool address52Acknowledged_ = false;
     uint8_t i2cAckBits_[16] = {};
+    bool readBytes(uint8_t* destination, uint16_t length);
 };

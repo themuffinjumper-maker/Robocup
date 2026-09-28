@@ -27,8 +27,10 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -66,7 +68,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 GUI_DIR = HERE.parent / "BluetoothDebugGUI"
 if str(GUI_DIR) not in sys.path:
     sys.path.insert(0, str(GUI_DIR))
-from ArenaView import ArenaView
+from ArenaView import ArenaView, MissionLayout, MissionLayoutCanvas
 
 
 @dataclass
@@ -106,6 +108,9 @@ class DataVisualiser(QMainWindow):
         self.replay_time = 0.0
         self.replay_duration = 0.0
         self.replay_latest = {}
+        self._replay_wall_clock = None
+        self._replay_advancing = False
+        self._replay_dashboard_at = -1.0
 
         self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(width=1))
         self.cursor_line.setZValue(1000)
@@ -331,6 +336,24 @@ class DataVisualiser(QMainWindow):
             show_controls=False,
         )
         self.replay_tabs.addTab(self.replay_arena, "Arena View")
+
+        planned_page = QWidget()
+        planned_layout = QVBoxLayout(planned_page)
+        self.replay_mission_note = QLabel(
+            "Pre-laid arena · cyan planned route · orange recorded path · "
+            "blue recorded robot pose · yellow live waypoint · purple verified weight bearing")
+        planned_layout.addWidget(self.replay_mission_note)
+        self.replay_mission_comparison = QLabel(
+            "Waiting for recorded pose and forward range")
+        planned_layout.addWidget(self.replay_mission_comparison)
+        self.replay_mission_layout = MissionLayout()
+        self.replay_mission_telemetry = SimpleNamespace(latest={})
+        self.replay_mission_canvas = MissionLayoutCanvas(
+            self.replay_mission_layout, self.replay_mission_telemetry, planned_page)
+        self.replay_mission_canvas.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        planned_layout.addWidget(self.replay_mission_canvas, 1)
+        self.replay_tabs.addTab(planned_page, "Planned Arena")
 
         plot_note = QLabel("The Plots tab is synchronized to this replay clock. "
                            "Its blue cursor follows playback and every recorded numeric signal remains selectable.")
@@ -613,6 +636,7 @@ class DataVisualiser(QMainWindow):
         self.replay_slider.blockSignals(False)
         self._apply_recorded_arena_configuration(self.replay_arena)
         self._apply_recorded_arena_configuration(self.replay_end_arena)
+        self._load_recorded_mission()
         self._load_replay_wiring()
         self._reset_replay()
         self._build_end_view()
@@ -648,6 +672,80 @@ class DataVisualiser(QMainWindow):
         view._sync()
         view.reset_map()
 
+    def _load_recorded_mission(self):
+        """Prefer the exact saved layout; recover older runs from sent commands."""
+        meta = self.get_metadata(self.conn)
+        try:
+            recorded = json.loads(meta.get("mission_layout_json", "{}"))
+        except (TypeError, ValueError):
+            recorded = {}
+        exact = isinstance(recorded, dict) and isinstance(
+            recorded.get("weights"), list)
+        self.replay_mission_layout = MissionLayout()
+        if exact:
+            self.replay_mission_layout.load_dict(recorded)
+            self.replay_mission_layout.route = list(recorded.get("route", []))
+            self.replay_mission_note.setText(
+                "Exact saved pre-laid arena · cyan planned route · orange "
+                "recorded path · blue current pose")
+        else:
+            plan = None
+            map_data = None
+            for name, payload in self.conn.execute(
+                    "SELECT command,arguments_json FROM commands ORDER BY elapsed_s"):
+                try:
+                    arguments = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if name == "mission_map_set":
+                    map_data = arguments
+                elif name == "mission_plan_set":
+                    plan = arguments
+            if isinstance(plan, dict):
+                layout = self.replay_mission_layout
+                layout.start = {
+                    "x": float(plan.get("start_x_mm", 325)),
+                    "y": float(plan.get("start_y_mm", 325)),
+                    "heading_deg": float(plan.get("start_heading_deg", 0)),
+                }
+                points = plan.get("points", [])
+                for index in range(0, len(points) - 2, 3):
+                    x, y, target = points[index:index + 3]
+                    layout.route.append({"x": float(x), "y": float(y),
+                                         "target": bool(target)})
+                    if target:
+                        layout.add_weight(float(x), float(y))
+                # add_weight clears the route while editing; restore the
+                # recorded command route once the target markers are made.
+                layout.route = [
+                    {"x": float(points[index]), "y": float(points[index + 1]),
+                     "target": bool(points[index + 2])}
+                    for index in range(0, len(points) - 2, 3)]
+                if isinstance(map_data, dict):
+                    features = map_data.get("features", [])
+                    for index in range(0, len(features) - 4, 5):
+                        x0, y0, x1, y1, kind = features[index:index + 5]
+                        if kind != 1:
+                            continue
+                        obstacle = layout.add_obstacle(
+                            "wall", (x0 + x1) / 2, (y0 + y1) / 2)
+                        obstacle["w"] = float(x1 - x0)
+                        obstacle["h"] = float(y1 - y0)
+                    layout.route = [
+                        {"x": float(points[index]), "y": float(points[index + 1]),
+                         "target": bool(points[index + 2])}
+                        for index in range(0, len(points) - 2, 3)]
+                self.replay_mission_note.setText(
+                    "Reconstructed from recorded mission commands: target "
+                    "waypoints approximate weight positions; original editor "
+                    "layout was not saved in this older recording. "
+                    "Cyan = planned route; orange = recorded path.")
+            else:
+                self.replay_mission_note.setText(
+                    "No pre-laid mission layout or route in this recording")
+        self.replay_mission_canvas.layout_model = self.replay_mission_layout
+        self.replay_mission_canvas.update()
+
     def _load_replay_wiring(self):
         meta = self.get_metadata(self.conn)
         try:
@@ -668,12 +766,21 @@ class DataVisualiser(QMainWindow):
     def _reset_replay(self):
         self.replay_index = 0
         self.replay_time = 0.0
+        self._replay_dashboard_at = -1.0
         self.replay_latest = {}
+        self.replay_mission_telemetry.latest.clear()
+        self.replay_mission_canvas.replay_path.clear()
+        self.replay_mission_canvas.replay_observed_ray = None
+        self.replay_mission_canvas.replay_expected_ray = None
+        self.replay_mission_comparison.setText(
+            "Waiting for recorded pose and forward range")
         self.replay_dashboard.setRowCount(0)
         self.replay_parameters.setRowCount(0)
         self.replay_commands.clear(); self.replay_logs.clear(); self.replay_raw.clear()
         self.replay_recorded_tab.setText("Recorded tab: —")
         self.replay_arena.reset_map()
+        if self.conn is not None:
+            self._load_recorded_mission()
         for row in self.replay_matrix_cells:
             for cell in row: cell.setText("—")
 
@@ -688,18 +795,29 @@ class DataVisualiser(QMainWindow):
     def toggle_replay(self):
         if self.replay_timer.isActive():
             self.replay_timer.stop(); self.replay_play.setText("Play")
+            self._replay_wall_clock = None
         else:
             if self.replay_time >= self.replay_duration:
                 self.replay_slider.setValue(0)
+            self._replay_wall_clock = time.monotonic()
             self.replay_timer.start(50); self.replay_play.setText("Pause")
 
     def advance_replay(self):
         speed = float(self.replay_speed.currentData() or 1.0)
-        value = self.replay_slider.value() + max(1, int(50 * speed))
+        now = time.monotonic()
+        elapsed = 0.05 if self._replay_wall_clock is None else max(
+            0.0, now - self._replay_wall_clock)
+        self._replay_wall_clock = now
+        value = self.replay_slider.value() + max(1, int(elapsed * 1000 * speed))
         if value >= self.replay_slider.maximum():
             value = self.replay_slider.maximum()
             self.replay_timer.stop(); self.replay_play.setText("Play")
-        self.replay_slider.setValue(value)
+            self._replay_wall_clock = None
+        self._replay_advancing = True
+        try:
+            self.replay_slider.setValue(value)
+        finally:
+            self._replay_advancing = False
 
     def seek_replay(self, milliseconds: int):
         target = milliseconds / 1000.0
@@ -712,13 +830,100 @@ class DataVisualiser(QMainWindow):
             self.replay_index += 1
         self.replay_time = target
         self.replay_clock.setText(f"{target:.2f} / {self.replay_duration:.2f} s")
-        self._refresh_replay_dashboard()
+        if (not self._replay_advancing or target - self._replay_dashboard_at >= 0.2
+                or target >= self.replay_duration):
+            self._refresh_replay_dashboard()
+            self._replay_dashboard_at = target
+        self._update_planned_comparison()
+        self.replay_mission_canvas.update()
         self.cursor_line.setPos(target); self.cursor_line.show(); self.update_cursor_values()
+
+    def _update_planned_comparison(self):
+        """Contrast the forward range with physical walls in the saved map."""
+        latest = self.replay_mission_telemetry.latest
+        keys = ("mission.pose_x_mm", "mission.pose_y_mm",
+                "mission.heading_deg", "navigation.front_mm")
+        values = [latest.get(key) for key in keys]
+        canvas = self.replay_mission_canvas
+        canvas.replay_observed_ray = None
+        canvas.replay_expected_ray = None
+        if not all(isinstance(value, (int, float)) for value in values):
+            self.replay_mission_comparison.setText(
+                "Waiting for recorded pose and forward range")
+            return
+        x, y, heading, observed = (float(value) for value in values)
+        if observed < 30 or observed > 3500:
+            self.replay_mission_comparison.setText(
+                "No valid forward range at this replay time")
+            return
+        matrix = self.replay_arena.model.matrix_spec
+        lateral = float(matrix.get("x", 0))
+        forward = float(matrix.get("y", 0))
+        body_angle = math.radians(heading)
+        sensor_x = x + math.cos(body_angle) * forward - math.sin(body_angle) * lateral
+        sensor_y = y + math.sin(body_angle) * forward + math.cos(body_angle) * lateral
+        ray_angle = math.radians(heading + float(matrix.get("angle", 0)))
+        ux, uy = math.cos(ray_angle), math.sin(ray_angle)
+
+        def intersect(rect):
+            x0, y0, x1, y1 = rect
+            near, far = -5000.0, 5000.0
+            for origin, direction, low, high in (
+                    (sensor_x, ux, x0, x1), (sensor_y, uy, y0, y1)):
+                if abs(direction) < 1e-5:
+                    if origin < low or origin > high:
+                        return None
+                    continue
+                a, b = (low - origin) / direction, (high - origin) / direction
+                near, far = max(near, min(a, b)), min(far, max(a, b))
+            hit = near if near > 0 else far
+            return hit if far >= near and hit > 0 else None
+
+        layout = self.replay_mission_layout
+        width, height = layout.WIDTH_MM, layout.HEIGHT_MM
+        physical = [(-1, -1, 0, height + 1),
+                    (width, -1, width + 1, height + 1),
+                    (0, -1, width, 0),
+                    (0, height, width, height + 1)]
+        physical.extend(layout._obstacle_rect(item)
+                        for item in layout.obstacles)
+        hits = [distance for rect in physical
+                if (distance := intersect(rect)) is not None]
+        expected = min(hits) if hits else None
+        origin = (sensor_x, sensor_y)
+        canvas.replay_observed_ray = (
+            origin, (sensor_x + observed * ux, sensor_y + observed * uy))
+        if expected is None:
+            self.replay_mission_comparison.setText(
+                f"Forward TOF saw {observed:.0f} mm · no mapped wall on "
+                "this ray (red line = observed)")
+            return
+        canvas.replay_expected_ray = (
+            origin, (sensor_x + expected * ux, sensor_y + expected * uy))
+        difference = expected - observed
+        if difference > 250:
+            verdict = "CLOSER THAN MAP — obstacle or pose/map mismatch"
+        elif difference < -250:
+            verdict = "FARTHER THAN MAP — wall may be missed or pose shifted"
+        else:
+            verdict = "roughly consistent with mapped wall"
+        self.replay_mission_comparison.setText(
+            f"Forward TOF saw {observed:.0f} mm (red); mapped wall along "
+            f"8×8 axis ≈{expected:.0f} mm (cyan) · {verdict}")
 
     def _apply_replay_event(self, elapsed, kind, payload):
         if kind == "telemetry":
             name, value, robot_time = payload
             self.replay_latest[name] = value
+            self.replay_mission_telemetry.latest[name] = value
+            if name == "mission.pose_y_mm":
+                x = self.replay_mission_telemetry.latest.get("mission.pose_x_mm")
+                y = value
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    path = self.replay_mission_canvas.replay_path
+                    if not path or math.hypot(x - path[-1][0],
+                                              y - path[-1][1]) >= 10.0:
+                        path.append((float(x), float(y)))
             self.replay_arena.receive_telemetry(name, value, robot_time)
         elif kind == "matrix" and isinstance(payload, dict):
             self.replay_arena.receive_matrix(payload)
@@ -734,6 +939,16 @@ class DataVisualiser(QMainWindow):
             self.replay_logs.append(f"[{elapsed:8.3f}] [{payload[0]}] {payload[1]}")
         elif kind == "command":
             self.replay_commands.append(f"[{elapsed:8.3f}] {payload[0]} {payload[1]}")
+            if payload[0] == "mission_plan_set":
+                try:
+                    plan = json.loads(payload[1])
+                    points = plan.get("points", [])
+                    self.replay_mission_layout.route = [
+                        {"x": float(points[index]), "y": float(points[index + 1]),
+                         "target": bool(points[index + 2])}
+                        for index in range(0, len(points) - 2, 3)]
+                except (TypeError, ValueError, KeyError):
+                    pass
         elif kind == "parameter":
             try: value = json.loads(payload[1])
             except Exception: value = payload[1]
@@ -748,6 +963,10 @@ class DataVisualiser(QMainWindow):
             snap = payload[0] if isinstance(payload, list) else payload
             if isinstance(snap, dict):
                 self.replay_recorded_tab.setText(f"Recorded tab: {snap.get('active_tab','—')}")
+                layout = snap.get("mission_layout")
+                if isinstance(layout, dict) and isinstance(layout.get("weights"), list):
+                    self.replay_mission_layout.load_dict(layout)
+                    self.replay_mission_layout.route = list(layout.get("route", []))
                 for name, value in snap.get("parameters", {}).items():
                     self.replay_latest.setdefault(f"parameter:{name}", value)
 
