@@ -26,10 +26,8 @@ private:
     static constexpr uint8_t MAX_ULTRASOUND_SENSORS = 2;
     HardwareSerialIMXRT& bluetoothPort_;
     uint8_t bluetoothRxBuffer_[2048] = {};
-    // 8 KiB is large enough for one complete telemetry frame plus the 2 KiB
-    // command-response reserve.  Keep this below 32 KiB: Teensy's UART ring
-    // head/tail counters are 16-bit and the larger field test buffer prevented
-    // Serial1 from producing any bytes after boot on this board.
+    // Telemetry and definitions are paced into small complete JSON lines.
+    // This ring size has already worked with the Teensy Serial1 driver.
     uint8_t bluetoothTxBuffer_[8192] = {};
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
@@ -83,6 +81,28 @@ private:
     bool continuousVelocityActive_ = false;
     int16_t commandedVelocity_ = 0;
     bool dcMotor203Active_ = false;
+    bool drumJamBackoffActive_ = false;
+    bool drumJamLatched_ = false;
+    uint32_t drumJamLowSinceMs_ = 0;
+    uint32_t drumJamClearSinceMs_ = 0;
+    uint32_t drumJamBackoffUntilMs_ = 0;
+    uint32_t drumJamCooldownUntilMs_ = 0;
+    uint32_t drumJamMonitorStartedMs_ = 0;
+    uint32_t drumJamLastSampleMs_ = 0;
+    uint16_t drumJamBackoffTimeMs_ = 500;
+    int16_t drumJamBackoffPercent_ = -100;
+    uint16_t drumJamDropAdcCounts_ = 40;
+    uint16_t drumJamConfirmTimeMs_ = 400;
+    float drumJamStartupCurrentSumA_ = 0.0f;
+    float drumJamStartupAdcSum_ = 0.0f;
+    uint16_t drumJamStartupSampleCount_ = 0;
+    int16_t drumJamResumeA_ = 0;
+    int16_t drumJamResumeB_ = 0;
+    float drumJamBaselineA_ = 10.0f;
+    float drumJamBaselineAdc_ = 0.0f;
+    bool drumJamBaselineInitialized_ = false;
+    uint8_t drumJamAttemptsInEpisode_ = 0;
+    uint16_t drumJamRecoveryCount_ = 0;
     bool dcMotor203SecondActive_ = false;
     bool dcMotor203SecondDeadman_ = false;
     uint32_t lastDcMotor203SecondCommandMs_ = 0;
@@ -92,16 +112,21 @@ private:
     uint32_t lastElectricalDiagnosticsMs_ = 0;
     uint32_t lastCurrentSampleMs_ = 0;
     uint16_t currentSensorRawAdc_ = 0;
-    uint16_t currentSensorAdc1FirstRaw_ = 0;
-    uint16_t currentSensorAdc1RepeatRaw_ = 0;
-    uint16_t currentSensorAdc2Raw_ = 0;
-    bool currentSensorAdc2Valid_ = false;
-    uint32_t lastCurrentAdcCompareMs_ = 0;
     float currentSensorFilteredVolts_ = 0.0f;
     bool currentSensorSampleValid_ = false;
     // ACS712-30A at 5 V: 2.5 V zero and 66 mV/A; 12k/12k halves both.
     float currentSensorZeroVolts_ = 1.25f;
     uint32_t lastDefinitionsMs_ = 0;
+    uint32_t lastDefinitionSendMs_ = 0;
+    uint32_t lastPeerMessageMs_ = 0;
+    uint32_t lastLinkProbeMs_ = 0;
+    uint32_t lastTelemetryChunkMs_ = 0;
+    uint16_t nextTelemetryField_ = 0;
+    uint8_t nextDefinition_ = 0;
+    bool peerSeen_ = false;
+    bool definitionsPending_ = false;
+    bool telemetryPending_ = false;
+    JsonDocument pendingTelemetry_;
     uint32_t receivedMessages_ = 0;
     uint32_t lastUpdateStartedUs_ = 0;
     uint32_t maxUpdateGapUs_ = 0;
@@ -367,6 +392,7 @@ private:
     uint8_t missionLandmarkRecoveryMatches_ = 0;
     float missionLandmarkRecoveryXmm_ = 0.0f;
     float missionLandmarkRecoveryYmm_ = 0.0f;
+    uint32_t missionPoseRecoveryHoldUntilMs_ = 0;
     uint16_t missionLandmarkRecoveryCount_ = 0;
     uint16_t missionLandmarkRecoveryResidualMm_ = 0;
     // Axis-aligned features uploaded with the route. Kind 0 is a no-go area;
@@ -428,6 +454,10 @@ private:
     bool missionWallReverseActive_ = false;
     bool missionWallReverseFailed_ = false;
     bool missionWallReverseNoProgress_ = false;
+    bool missionWallRecoveryDetourRequested_ = false;
+    int8_t missionWallRecoveryPreferredSide_ = 0;
+    uint16_t navigationClosePointTofMm_ = 0;
+    int8_t navigationClosePointTofSide_ = 0;
     uint32_t missionWallReverseStartedMs_ = 0;
     uint8_t missionWallReverseWaypoint_ = 255;
     uint8_t missionWallReverseRepeatCount_ = 0;
@@ -489,8 +519,11 @@ private:
     void handleCommand(JsonDocument& message);
     void handleParameter(JsonDocument& message);
     void sendDefinitions();
+    void updateDefinitionBroadcast(uint32_t now);
+    bool bluetoothPeerAlive(uint32_t now) const;
     void sendState();
     void sendTelemetry();
+    void sendNextTelemetryChunk(uint32_t now);
     void initialiseTofSensors();
     void initialiseDigitalInputs();
     void initialiseUltrasoundSensors();
@@ -508,6 +541,9 @@ private:
     void sendTof8x8Frame();
     void updateAutomaticServoRead();
     void updateArmSorting(uint32_t now);
+    void updateDrumJamRecovery(uint32_t now);
+    void cancelDrumJamRecovery();
+    void setDcMotor203Speed(int16_t channelAPercent, int16_t channelBPercent);
     void setSortingBumpers(bool enabled);
     void setSortingGate(bool positive, bool force = false);
     void disarmArmSorting(bool restoreOutputs);

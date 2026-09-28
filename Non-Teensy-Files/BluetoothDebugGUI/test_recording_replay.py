@@ -135,7 +135,9 @@ class RecordingReplayTests(unittest.TestCase):
                            "BluetoothDebugWorkflow.h").read_text()
         transport = (HERE.parents[1] / "PlatformIO" / "lib" /
                      "RobotDebug" / "RobotDebug.cpp").read_text()
-        self.assertIn("bluetoothTxBuffer_[8192]", workflow_header)
+        self.assertIn("bluetoothTxBuffer_[12288]", workflow_header)
+        self.assertIn("link_.send(message, 768);", source)
+        self.assertNotIn("measureJson(chunk) > 3000U", source)
         self.assertIn("addMemoryForWrite", source)
         self.assertNotIn("delay(3)", transport)
         self.assertNotIn("stream_.flush()", transport)

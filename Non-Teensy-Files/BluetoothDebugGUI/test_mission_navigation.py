@@ -41,6 +41,42 @@ class MissionUploadTests(unittest.TestCase):
                 self.assertIn(expected, view.mission_phase_label.text())
             view.close()
 
+    def test_navigation_tuning_is_on_planned_mission_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            self.assertIs(view.navigation_tuning_tabs.parentWidget(),
+                          view.mission_page)
+            self.assertGreaterEqual(
+                view.mission_page.layout().indexOf(view.navigation_tuning_tabs), 0)
+            self.assertIs(view.map_tabs.widget(view.map_tabs.currentIndex()),
+                          view.canvas)
+            view.map_tabs.setCurrentWidget(view.mission_page)
+            self.assertIs(view.map_tabs.currentWidget(), view.mission_page)
+            view.close()
+
+    def test_jam_reverse_controls_persist_and_apply_to_firmware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            sent = []
+            view.parameter_requested.connect(
+                lambda name, value: sent.append((name, value)))
+            view.navigation_tuning_controls["jam_reverse_time_ms"].setValue(750)
+            view.navigation_tuning_controls["jam_reverse_percent"].setValue(-65)
+            view.navigation_tuning_controls["jam_drop_adc_counts"].setValue(9)
+            view.navigation_tuning_controls["jam_confirm_time_ms"].setValue(120)
+            view._apply_navigation_tuning()
+            self.assertEqual(settings.value("navigation/jam_reverse_time_ms"), 750)
+            self.assertEqual(settings.value("navigation/jam_reverse_percent"), -65)
+            self.assertIn(("drum.jam_reverse_time_ms", 750), sent)
+            self.assertIn(("drum.jam_reverse_percent", -65), sent)
+            self.assertIn(("drum.jam_drop_adc_counts", 9), sent)
+            self.assertIn(("drum.jam_confirm_time_ms", 120), sent)
+            view.close()
+
     def test_point_tof_bank_failure_is_visible_on_arena(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "mission.ini"),
@@ -191,6 +227,13 @@ class MissionUploadTests(unittest.TestCase):
         restored = MissionLayout()
         restored.load_dict(layout.to_dict())
         self.assertEqual(restored.dummy_clearance_mm, 50)
+
+    def test_ramp_is_a_forbidden_zone_in_planner_and_uploaded_map(self):
+        layout = MissionLayout()
+        ramp = layout.add_obstacle("ramp", 1800, 1000)
+        self.assertTrue(layout.blocked(ramp["x"], ramp["y"]))
+        ramp_feature = layout.map_payload()["features"][5:10]
+        self.assertEqual(ramp_feature[4], 0)
 
     def test_weight_route_has_straight_staging_and_run_through(self):
         layout = MissionLayout()

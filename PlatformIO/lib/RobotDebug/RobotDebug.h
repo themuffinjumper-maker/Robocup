@@ -17,12 +17,17 @@ public:
     bool send(JsonDocument& message, size_t reserveBytes = 0);
     uint32_t droppedMessages() const { return droppedMessages_; }
     uint32_t droppedBytes() const { return droppedBytes_; }
+    uint32_t receivedBytes() const { return receivedBytes_; }
+    uint32_t invalidLines() const { return invalidLines_; }
 
 private:
     // Includes the combined encoder, TOF, motor, navigation and IMU frame.
     // Normal telemetry now includes navigation phase/heading and can exceed
     // the former 3072-byte allocation once encoder counts gain more digits.
-    static constexpr size_t TX_BUFFER_SIZE = 6144;
+    // The expanded mission + sensor snapshot can exceed 8 KiB. Keep complete
+    // newline-delimited telemetry intact, with capacity matching the CH9143
+    // UART ring, rather than fragmenting JSON into lossy writes.
+    static constexpr size_t TX_BUFFER_SIZE = 12288;
     Stream& stream_;
     MessageHandler handler_;
     void* context_;
@@ -32,6 +37,8 @@ private:
     bool droppingLine_ = false;
     uint32_t droppedMessages_ = 0;
     uint32_t droppedBytes_ = 0;
+    uint32_t receivedBytes_ = 0;
+    uint32_t invalidLines_ = 0;
 
     void finishLine();
 };

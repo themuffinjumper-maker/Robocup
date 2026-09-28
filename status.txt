@@ -1,4 +1,9 @@
 GROUP 7 ROBOCUP PROJECT STATUS
+Protected working subsystem (confirmed 2026-09-29): drum stall detection and
+automatic reverse-recovery now work. Do not change their trigger, ADC baseline,
+thresholds, timing, reverse command, GUI controls, or wiring/configuration during
+other work. Only revisit this system if the user explicitly requests it. See
+AGENTS.md at the repository root for the standing project guardrail.
 Last updated: 2026-09-21 (Pacific/Auckland)
 Repository: C:\Users\alex\Desktop\group7robocup
 Current branch: testing
@@ -6767,3 +6772,92 @@ Not verified here:
   hardware still determines whether a sensor can answer its XSHUT/I2C probe;
   the dashboard now exposes that distinction instead of allowing failed
   sensors to silently invalidate collection logic.
+<<<<<<< Updated upstream
+=======
+
+2026-09-28 — Collection completion, degraded-side recovery, and recording repair
+- Reviewed the two latest recordings from the current session. Both had no
+  raw `tof.*` rows at all even though navigation logs were reporting point-TOF
+  failures, and ultrasound B had only one or two valid readings for an entire
+  run. The newer run did nevertheless demonstrate the new `mid_right` inner
+  lock and an inductive confirmation; the robot then spent too long in
+  return-home/wall-recovery states because it treated the absent side range as
+  a reason not to choose a map-clear bypass.
+- A successful pickup is now unambiguous: after an inward bottom TOF has
+  locked and the existing straight collection pass plus its slow 2.5 s
+  follow-through finishes, the site is immediately marked collected and the
+  mission advances to the next waypoint. The inductive sensor remains logged
+  as downstream confirmation and is attributed to that completed site for up
+  to 30 seconds, but it no longer triggers a second visual verification,
+  retry, or a delay at the weight.
+- Point-TOF telemetry is emitted near the start of each bounded Bluetooth
+  telemetry cycle. This is intentional: the radio may only accept the first
+  large telemetry packet before its UART buffer refills, and the old ordering
+  placed the complete raw point-TOF block after that first packet. Availability,
+  timeouts, ranges, recovery failures, and retry timing will therefore again
+  be present in new recordings.
+- Return-home staging now uses the actual configurable chassis clearance rather
+  than an unshown additional 70 mm restriction. Docking requires only the
+  robot half-width plus 10 mm. If the final reverse corridor has not yet been
+  mapped, the mission routes to a map-clear staging fallback instead of idling
+  permanently at the last target.
+- Side-ultrasound use remains preferred whenever it is valid. When one side is
+  unavailable, a map-verified detour on that side is now a lower-scored but
+  permitted fallback; it does not override a valid close side range. The
+  return-home landmark pause was shortened from 3.5 seconds to 0.9 seconds so
+  a single dead side ultrasound cannot repeatedly freeze the robot at every
+  front-wall detection.
+- Verification: PlatformIO Teensy 4.0 build completed successfully after this
+  change (`FLASH code 213176 B`, `RAM1 variables 65120 B`). Physical testing is
+  still required to validate the new recording order and the one-sided
+  ultrasound fallback in the arena.
+
+2026-09-28 — Close-range TOF obstacle escape and repeated retreat fix
+- Reviewed `2 pointer no home.rdbg` and `3 pointer no home.rdbg`. In the newer
+  run, the robot left the green base, reached a close frontal obstacle at
+  about 19.5 s, and then repeated reverse/replan cycles for over 20 seconds.
+  The same pattern recurred at later obstacles and on return-home legs. The
+  firmware reversed, then resumed the same route without committing to a
+  side bypass; its side-clearance check also consulted the opposite side's
+  ultrasound.
+- The four top point TOFs now contribute a collision cue only at <=220 mm and
+  only from samples no older than 250 ms. This supplements the 8x8 front map
+  without using long-range angled point-TOF returns to steer around distant
+  objects. Bottom point TOFs remain reserved for weight sensing.
+- A completed wall retreat now requests a map-checked lateral-and-forward
+  detour before resuming the route. Close point-TOF bearing biases the chosen
+  detour away from the sensed side; otherwise fresh left/right ultrasound
+  clearance provides the preference. The actual travel-side ultrasound is
+  used for side-step clearance. A retreat with low encoder progress no longer
+  enters the old stopped-idle branch; it proceeds to the side-escape planner.
+- Added `navigation.point_tof_close_mm` and
+  `navigation.point_tof_obstacle_side` telemetry for future recordings.
+- Verification: PlatformIO Teensy 4.0 firmware build passed. No hardware run
+  has yet been made with this change; upload and arena validation remain
+  necessary, especially for the 220 mm close-only threshold and pipe bypass.
+
+2026-09-28 — D23 current-sensor ADC static audit and direct-voltage diagnostic
+- The Teensy 4.0 core pin table maps D23/A9 to ADC1 channel 14. Pins 26/A12
+  and 27/A13 are the ADC2-only analog pins; manually writing ADC2 channel 14
+  does not constitute an independent read of D23. The prior ADC1/ADC2
+  comparison code and the earlier note saying D23 was available to both ADCs
+  were therefore incorrect. The main voltage/current estimate had always
+  been based on `analogRead(D23)` on ADC1, so the bad ADC2 diagnostic does not
+  by itself explain the historical 1.69 V vs 1.272 V discrepancy.
+- Simplified the firmware to the supported `analogRead(A9)` path, configured
+  12-bit reads and 16-sample ADC averaging, and scaled to volts using the
+  measured 3.286 V Teensy rail. Telemetry retains the averaged ADC count,
+  smoothed voltage at the D23 pin, inferred sensor output before the divider,
+  zero voltage, and nominal current estimate. No ADC2 register access remains.
+- Added the standalone, motor-neutral sketch
+  `PlatformIO/examples/CurrentSensorD23/CurrentSensorD23.ino`. It reports a
+  short-averaged ADC1 count, voltage at D23/A9, and the doubled sensor output
+  over USB serial every 100 ms. This isolates the ADC reading from the larger
+  robot firmware when the Teensy is next available.
+- Updated the live diagnostic script to report only the valid D23 raw count,
+  pin voltage, doubled sensor output, zero, and current fields.
+- No live connection or motor test was performed (robot is off/unlinked). A
+  Teensy build is still required after this static change; the standalone
+  sketch must also be uploaded and compared with a meter before the historical
+  ADC-vs-probe mismatch can be considered resolved.
+>>>>>>> Stashed changes

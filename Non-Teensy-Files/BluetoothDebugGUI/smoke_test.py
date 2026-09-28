@@ -24,15 +24,23 @@ def main() -> int:
         # Telemetry is continuous, so discard one line to synchronize if the
         # port was opened halfway through a packet.
         link.readline()
-        for message in (
+        hello = (json.dumps(
             {"type": "hello", "client": "smoke-test", "protocol": 1},
-            {"type": "request_definitions"},
-        ):
-            link.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
-
+            separators=(",", ":"),
+        ) + "\n").encode()
         deadline = time.monotonic() + args.seconds
+        next_hello = 0.0
+        next_heartbeat = 0.0
+        handshake_seen = False
         receive_buffer = bytearray()
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if not handshake_seen and now >= next_hello:
+                link.write(hello)
+                next_hello = now + 2.0
+            elif handshake_seen and now >= next_heartbeat:
+                link.write(b'{"type":"heartbeat"}\n')
+                next_heartbeat = now + 3.0
             chunk = link.read(link.in_waiting or 1)
             if not chunk:
                 continue
@@ -47,6 +55,8 @@ def main() -> int:
                     message = json.loads(line)
                     if isinstance(message, dict):
                         valid_messages.append(message)
+                        if message.get("type") != "link_probe":
+                            handshake_seen = True
                     else:
                         invalid_lines.append(line)
                 except json.JSONDecodeError:

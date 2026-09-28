@@ -41,10 +41,9 @@ def sample(port, seconds, label):
     print(f"{label}: {len(frames)} current-sensor frames")
     for key in (
         "current_sensor.d23.raw_adc",
-        "current_sensor.d23.adc1_first_raw",
-        "current_sensor.d23.adc1_repeat_raw",
-        "current_sensor.d23.adc2_raw",
         "current_sensor.d23.pin_volts",
+        "current_sensor.d23.output_volts",
+        "current_sensor.d23.zero_pin_volts",
         "current_sensor.d23.current_a",
         "dc_motor_203.channel_a_percent",
         "dc_motor_203.channel_b_percent",

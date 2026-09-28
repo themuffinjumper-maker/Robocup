@@ -2257,6 +2257,10 @@ class RobotDebugGUI(QMainWindow):
             self.on_error
         )
 
+        self.bluetooth.link_recovery.connect(
+            self.on_link_recovery
+        )
+
         self.bluetooth.robot_state_received.connect(
             self.on_robot_state
         )
@@ -3300,6 +3304,13 @@ class RobotDebugGUI(QMainWindow):
         self.statusBar().showMessage(
             message
         )
+
+    def on_link_recovery(self, message: str):
+        self.connection_status.setText(
+            f"● RECOVERING — {self.bluetooth.port or ''}"
+        )
+        self.statusBar().showMessage(message)
+        self.add_log("WARNING", message)
 
     # =================================================================
     # Shutdown

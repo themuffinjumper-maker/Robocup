@@ -1605,8 +1605,8 @@ class MissionLayout:
 
     def map_payload(self):
         # Rectangles are deliberately compact: the Teensy command receive
-        # buffer is 768 bytes. The opposite home is a forbidden area, while
-        # walls/ramps/tubes/dummy weights are physical ranging landmarks.
+        # buffer is 768 bytes. Kind 0 features are forbidden zones (the other
+        # team's home and ramps); kind 1 features are physical landmarks.
         features = []
         rectangles = [(self.no_go_home(), 0)]
         rotated_walls = []
@@ -1615,7 +1615,8 @@ class MissionLayout:
                 rotated_walls.extend([len(rectangles), int(round(item["x"])),
                                       int(round(item["y"])),
                                       int(round(float(item.get("rotation", 0)))) % 180])
-            rectangles.append((self._obstacle_rect(item), 1))
+            rectangles.append((self._obstacle_rect(item),
+                               0 if item["kind"] == "ramp" else 1))
         rectangles.extend(((item["x"] - 120, item["y"] - 120,
                             item["x"] + 120, item["y"] + 120), 2)
                           for item in self.weights if item["dummy"])
@@ -1979,15 +1980,22 @@ class MissionLayoutCanvas(QWidget):
                 radius = item["w"] / 2 * scale
                 p.drawEllipse(self._screen(item["x"], item["y"]), radius, radius)
             else:
-                p.drawPolygon(QPolygonF([self._screen(x, y)
-                                         for x, y in model._obstacle_corners(item)]))
+                obstacle_polygon = QPolygonF([self._screen(x, y)
+                                               for x, y in model._obstacle_corners(item)])
+                p.drawPolygon(obstacle_polygon)
+                if item["kind"] == "ramp":
+                    p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
+                    p.setBrush(QColor(127, 29, 29, 115))
+                    p.drawPolygon(obstacle_polygon)
             centre = self._screen(item["x"], item["y"])
             p.setPen(QColor("#111827"))
             size_text = (f"Ø{item['w']:.0f}" if item["kind"] == "tube" else
                          f"{item['w']:.0f}×{item['h']:.0f}")
             p.drawText(QRectF(centre.x() - 80, centre.y() - 17, 160, 34),
                        Qt.AlignmentFlag.AlignCenter,
-                       f"{item['kind'].upper()}\n{size_text} mm")
+                       (f"RAMP — NO-GO ZONE\n{size_text} mm"
+                        if item["kind"] == "ramp" else
+                        f"{item['kind'].upper()}\n{size_text} mm"))
 
         likely_weight = self._likely_visible_planned_weight()
         for index, item in enumerate(model.weights, 1):
@@ -2544,7 +2552,9 @@ class ArenaView(QWidget):
         self.map_tabs.addTab(self.mission_page, "Mission Planner")
         left_layout.addWidget(self.map_tabs, 1)
         self._build_navigation_tuning_panel()
-        left_layout.addWidget(self.navigation_tuning_tabs)
+        # Keep navigation tuning beside the planned route it affects.  The
+        # panel is built after the mission editor, so append it to that page.
+        self.mission_page.layout().addWidget(self.navigation_tuning_tabs)
         self._build_raw_tof_panel()
         left_layout.addWidget(self.raw_tof_group)
         layout.addWidget(left, 1)
@@ -2819,7 +2829,7 @@ class ArenaView(QWidget):
         guide = QLabel(
             "Seven dashed vertical placement lines split the 4.9 m arena into eight equal bays. "
             "Dummy clearance and wall clearance are both measured from the robot edge. "
-            "Walls/ramps/tubes use normal robot clearance. "
+            "Walls/tubes use normal robot clearance; ramps and the opposing base are no-go zones. "
             "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
         guide.setWordWrap(True)
         inspector_layout.addWidget(guide)
@@ -2840,9 +2850,8 @@ class ArenaView(QWidget):
             hasattr(self, "map_tabs") and hasattr(self, "mission_page") and
             self.map_tabs.currentWidget() is self.mission_page
         )
-        # Mission Planner gets the full Arena View working area while editing.
-        if hasattr(self, "navigation_tuning_tabs"):
-            self.navigation_tuning_tabs.setVisible(not mission_visible)
+        # Mission Planner owns the navigation tuning panel; live Arena keeps
+        # its sensor readouts and status sidebar uncluttered.
         if hasattr(self, "raw_tof_group"):
             self.raw_tof_group.setVisible(not mission_visible)
         if hasattr(self, "side_scroll"):
@@ -3109,14 +3118,28 @@ class ArenaView(QWidget):
             ("matrix_floor_rows", "Ignore bottom 8×8 rows", 2, 0, 4),
             ("matrix_fov_deg", "8×8 horizontal FOV", 40, 20, 90),
             ("gap_confirm_frames", "Gap confirmation frames", 2, 1, 5),
+            ("jam_reverse_time_ms", "Jam reverse duration", 500, 50, 2000),
+            ("jam_reverse_percent", "Jam reverse speed (%)", -100, -100, 0),
+            ("jam_drop_adc_counts", "Jam sensitivity (ADC counts)", 40, 2, 100),
+            ("jam_confirm_time_ms", "Jam confirmation time", 400, 20, 1000),
         ]
+        # Migrate the old factory pair, which reacted to ordinary ADC noise.
+        # Leave any other user-tuned values untouched.
+        if (int(self.settings.value("navigation/jam_drop_adc_counts", 40)) == 7 and
+                int(self.settings.value("navigation/jam_confirm_time_ms", 400)) == 80):
+            self.settings.setValue("navigation/jam_drop_adc_counts", 40)
+            self.settings.setValue("navigation/jam_confirm_time_ms", 400)
         self.navigation_tuning_controls = {}
         for index, (name, label, default, minimum, maximum) in enumerate(definitions):
             control = QDoubleSpinBox()
             control.setDecimals(0)
             control.setRange(minimum, maximum)
             control.setValue(float(self.settings.value("navigation/" + name, default)))
-            control.setSuffix(" mm" if name.endswith("_mm") else "")
+            control.setSuffix(
+                " mm" if name.endswith("_mm") else
+                " ms" if name.endswith("_ms") else
+                "%" if name.endswith("_percent") else
+                " counts" if name.endswith("_adc_counts") else "")
             row = 1 + index // 3
             col = (index % 3) * 2
             grid.addWidget(QLabel(label), row, col)
@@ -3124,7 +3147,8 @@ class ArenaView(QWidget):
             self.navigation_tuning_controls[name] = control
         apply_button = QPushButton("APPLY NAVIGATION TUNING")
         apply_button.clicked.connect(self._apply_navigation_tuning)
-        grid.addWidget(apply_button, 7, 0, 1, 6)
+        apply_row = 1 + (len(definitions) + 2) // 3
+        grid.addWidget(apply_button, apply_row, 0, 1, 6)
         self.navigation_tuning_tabs.addTab(page, "Navigation tuning")
 
     def _start_run(self):
@@ -3311,7 +3335,13 @@ class ArenaView(QWidget):
         for name, control in self.navigation_tuning_controls.items():
             value = int(control.value())
             self.settings.setValue("navigation/" + name, value)
-            self.parameter_requested.emit("navigation." + name, value)
+            parameter_name = {
+                "jam_reverse_time_ms": "drum.jam_reverse_time_ms",
+                "jam_reverse_percent": "drum.jam_reverse_percent",
+                "jam_drop_adc_counts": "drum.jam_drop_adc_counts",
+                "jam_confirm_time_ms": "drum.jam_confirm_time_ms",
+            }.get(name, "navigation." + name)
+            self.parameter_requested.emit(parameter_name, value)
         self.model.matrix_floor_rows = int(
             self.navigation_tuning_controls["matrix_floor_rows"].value())
         self.model.matrix_fov_deg = float(
