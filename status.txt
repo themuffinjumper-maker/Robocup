@@ -6861,3 +6861,108 @@ Not verified here:
   sketch must also be uploaded and compared with a meter before the historical
   ADC-vs-probe mismatch can be considered resolved.
 >>>>>>> Stashed changes
+
+2026-09-29 — Latest two runs and AIO9 button-level diagnostic
+- Reviewed `RobotRun_2026-09-29_03-00-48.rdbg` and
+  `RobotRun_2026-09-29_03-02-42.rdbg`. Encoder 1 and encoder 2 both report
+  changing counts and speeds, consistent with the resoldered right motor now
+  moving. Bluetooth telemetry remains continuous in both recordings and
+  neither recording contains a protocol fault.
+- In the 03:00:48 run, the mission reports a bottom-TOF cue, inner-TOF lock,
+  drive-through completion, and advances to the next waypoint. It then enters
+  repeated frontal-obstacle retreat/detour cycles and does not return home.
+- In the 03:02:42 run, two transit waypoints are passed and an outer TOF cues a
+  weight beside the intake. The inner sensor never establishes pickup lock;
+  the robot backs up to recenter twice, repeatedly encounters frontal obstacles,
+  and logs the weight-site search as incomplete. This run therefore does not
+  test post-collection progression or return-home behavior.
+- Added a read-only AIO9 button diagnostic using the supplied SX1509 example:
+  AIO9 is expander pin 9 at address 0x3E on I2C0/Wire, not raw Teensy D9. The
+  expander is sampled every 50 ms, with telemetry
+  `digital.aio9_button.available`, `.level`, `.raw_high`, and `.pressed`.
+  Configure AIO9 with `INPUT_PULLUP`; for a normally-open test button, wire the
+  other contact to GND. Idle should read HIGH / not pressed; pressing should
+  read LOW / pressed. The separate TOF XSHUT expander remains at 0x3F.
+- Verification: PlatformIO Teensy 4.0 build passed (FLASH code 221,496 B;
+  RAM1 variables 74,528 B). The AIO9 input has not yet been tested on the
+  physical board; upload the firmware and watch the new fields in Live
+  Telemetry.
+
+2026-09-29 — Mission encoder/IMU localization corroboration
+-----------------------------------------------------------
+- Mission pose now consumes paired encoder/IMU samples once per 20 Hz motion
+  sample, rather than repeatedly evaluating one sample against main-loop
+  intervals. It integrates the two calibrated wheel distances at the midpoint
+  of the fused heading change.
+- Translation is accepted only after encoder movement has been corroborated by
+  the BNO055 motion event/acceleration latch or observed heading movement. The
+  latch remains active during constant-speed travel and clears after encoder
+  motion has stopped. Encoder counts accumulated while the IMU is unavailable
+  are discarded, so IMU recovery cannot cause a large catch-up position jump.
+- Straight-command travel compares left/right distance and exposes wheel
+  imbalance. After the wheel track has been learned, three consecutive samples
+  where one encoder is nearly stationary but the other moves and the IMU says
+  the chassis did not turn can use the moving encoder as a cautious distance
+  fallback. The mismatch remains visible and confidence stays reduced.
+- Effective wheel track and encoder-yaw polarity are learned from repeated
+  substantial point turns, each compared against the simultaneous BNO055 yaw
+  change. Two consistent turn observations are required; the existing 40 mm
+  GUI default is not used as physical turn geometry. Once learned, encoder yaw
+  contributes to mission heading, while the IMU remains dominant when the
+  sources disagree. Implausible one-sample IMU yaw jumps are bounded.
+- New mission telemetry includes localization confidence/state, encoder-vs-IMU
+  yaw disagreement, learned wheel track, wheel imbalance, encoder-motion and
+  IMU-distance confirmation, fallback use, and rejected distance steps. The
+  existing raw encoder counts/speeds and IMU heading/acceleration remain the
+  underlying samples. Arena View’s status line presents the checks in plain
+  language.
+- The drum jam detection and reverse-recovery system, Bluetooth transport, and
+  motor outputs were not changed. No hardware test or upload was performed.
+- Verification: Teensy 4.0 PlatformIO build passed; ArenaView.py syntax check
+  and `git diff --check` passed. The learned turn geometry and confidence
+  behavior still need observation in a new recorded run; no track estimate is
+  claimed until two repeatable turns agree.
+
+2026-09-29 — Latest planned-mission runs and route tracking/pickup corrections
+-----------------------------------------------------------------------------
+- Reviewed the newest usable recordings, `RobotRun_2026-09-29_04-07-15.rdbg`
+  and `RobotRun_2026-09-29_04-10-07.rdbg` (the 04-06-16 file has no recorded
+  telemetry). In the 04-07 run, ultrasound B remained invalid while A was
+  available; the mission repeatedly logged frontal-obstacle retreats and
+  blocked route recovery. In the 04-10 run, the first navigation segment also
+  repeated frontal-obstacle detours. A later segment reached the first weight
+  search region but did not obtain an inner-TOF collection lock.
+- The 04-10 return-home attempt reached reverse docking, then stopped at the
+  single `12 degree` heading-drift abort. At that point the IMU had drifted
+  from the planned docking heading; stopping abandoned an otherwise recoverable
+  return. Reverse docking now uses continuous, bounded differential correction
+  rather than terminating navigation on that modest error.
+- Planned-route steering previously aimed at the active waypoint (only a
+  short preview near transit corners), so small pose errors accumulated as
+  cross-track drift. Mission steering now projects the robot pose onto the
+  active uploaded route segment and aims a bounded lookahead along the route.
+  The existing `navigation.route_line_tolerance_mm` parameter now affects
+  lookahead length; only ordinary route legs are line-tracked. Local obstacle
+  avoidance and weight sensing/search retain control when active. Small,
+  map-clear transit corners can still be rounded without previewing through a
+  weight or docking waypoint. Telemetry now records whether route tracking is
+  active and the absolute cross-track distance.
+- The single-inner-sensor pickup lock previously reconstructed the weight hit
+  using only forward range, discarding the sensor’s lateral mounting offset
+  and ray angle. It now uses the configured sensor origin and full 2D ray to
+  place the hit point, then turns toward that point and drives through along
+  the actual robot-to-weight vector. After a completed pickup, the measured
+  hit and drive-through endpoint are inserted into the route, so the next
+  planned leg leaves from the actual collection path rather than snapping back
+  to the original target coordinate. The existing single-sensor lock range,
+  collection speed, and intake confirmation behavior were not changed.
+- Tightened the paired encoder/IMU yaw agreement tolerance and made the BNO055
+  heading dominant when the two sources disagree; learned encoder yaw remains
+  a check and is still used to recover from an implausible IMU sample jump.
+  This is intended to reduce slow map-heading bias, not to claim absolute
+  localization accuracy without another recorded hardware run.
+- Drum jam sensing/reversal and Bluetooth transport remain untouched. No
+  hardware was driven and firmware was not uploaded. PlatformIO Teensy 4.0
+  build passed (FLASH code 226,168 B; RAM1 variables 74,592 B); `git diff
+  --check` passed. Route tracking and weight-vector behavior need confirmation
+  in the next arena recording.

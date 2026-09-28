@@ -3857,6 +3857,43 @@ class ArenaView(QWidget):
             ("ENCODER/IMU DISAGREEMENT: map translation held. "
              if m.encoder_imu_disagreement else "")
         )
+        firmware_localization = ""
+        firmware_confidence = _number(
+            m.latest.get("mission.localization_confidence"))
+        if firmware_confidence is not None and m.latest.get("mission.pose_live") is True:
+            confidence_pct = int(round(100.0 * max(0.0, min(1.0,
+                                                          firmware_confidence))))
+            encoder_yaw_valid = m.latest.get("mission.encoder_yaw_valid") is True
+            heading_ok = m.latest.get("mission.heading_agreement") is True
+            wheel_ok = m.latest.get("mission.wheel_travel_agreement") is True
+            distance_ok = m.latest.get("mission.distance_imu_confirmed") is True
+            encoder_motion = m.latest.get("mission.encoder_motion_detected") is True
+            single_wheel_fallback = (
+                m.latest.get("mission.single_wheel_distance_fallback") is True)
+            track_mm = _number(m.latest.get("mission.encoder_track_estimate_mm")) or 0.0
+            wheel_imbalance = _number(
+                m.latest.get("mission.encoder_wheel_imbalance"))
+            encoder_yaw_valid = track_mm >= 100.0
+            turn_status = ("encoder + IMU agree" if heading_ok else
+                           "encoder/IMU turn mismatch" if encoder_yaw_valid else
+                           "learning turn geometry")
+            distance_status = (
+                "encoder mismatch; using corroborated single-wheel distance"
+                if single_wheel_fallback else
+                "wheel-distance mismatch" if not wheel_ok else
+                f"wheel distances agree ({wheel_imbalance * 100:.0f}% imbalance)"
+                if wheel_imbalance is not None else "wheel distances agree")
+            motion_status = (
+                "IMU confirms travel" if distance_ok and encoder_motion else
+                "stationary" if distance_ok else
+                "waiting for IMU motion confirmation")
+            track_status = (f"; learned track {track_mm:.0f} mm"
+                            if encoder_yaw_valid else "")
+            firmware_localization = (
+                f"Robot localization: {confidence_pct}% confidence; "
+                f"{turn_status}; {distance_status}; {motion_status}"
+                f"{track_status}. "
+            )
         self._refresh_mission_weight_visibility()
         phase_names = {
             "idle": "IDLE / STOPPED",
@@ -3926,7 +3963,7 @@ class ArenaView(QWidget):
             f"{m.last_imu_system_status if m.last_imu_system_status is not None else '?'}/"
             f"{m.last_imu_system_error if m.last_imu_system_error_active is True else 'inactive'}; "
             f"self-test {'pass' if m.last_imu_self_test_passed is True else 'not confirmed'}. "
-            f"{m.last_source}. "
+            f"{m.last_source}. {firmware_localization}"
             f"Point TOF online: {online}/{len(m.sensor_specs)}; "
             f"ultrasound valid: {ultrasound_valid}/{len(m.ultrasound_specs)}; "
             f"8x8: {'ready' if m.last_matrix_available and m.last_matrix_valid else 'waiting/invalid'}. "

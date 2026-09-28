@@ -212,6 +212,24 @@ namespace TofConfig {
 
 } // namespace TofConfig
 
+// ============================================================
+// CPU AIO DIGITAL INPUT CONFIG
+// ============================================================
+//
+// The CPU's AIO0-AIO15 headers are pins on a separate SX1509 expander.
+// The supplied 114_LimitSwitch example identifies the default expander
+// address as 0x3E; it shares I2C0/Wire with the TOF expander at 0x3F.
+// AIO9 is expander pin 9, not Teensy digital pin 9.
+// ============================================================
+
+namespace AioConfig {
+
+    constexpr uint8_t EXPANDER_I2C_ADDRESS = 0x3E;
+    constexpr uint8_t TEST_BUTTON_PIN = 9;
+    constexpr uint16_t TEST_BUTTON_SAMPLE_INTERVAL_MS = 50;
+
+} // namespace AioConfig
+
 namespace Tof8x8Config {
 
     constexpr uint8_t I2C_ADDRESS = 0x33;

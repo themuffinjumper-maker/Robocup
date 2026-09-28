@@ -9,6 +9,7 @@
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
 #include <RobotDebug.h>
+#include <SparkFunSX1509.h>
 #include <Tof.h>
 #include <Tof8x8.h>
 #include <UltrasoundSensor.h>
@@ -40,6 +41,7 @@ private:
     Hx12kServo hx12kD_;
     RobotDebug link_;
     Tof8x8 tof8x8_;
+    SX1509 aioExpander_;
     JsonDocument config_;
 
     bool debugMode_ = false;
@@ -169,6 +171,9 @@ private:
     uint8_t digitalInputCount_ = 0;
     char digitalInputNames_[MAX_DIGITAL_INPUTS][25] = {};
     DigitalInputSensor digitalInputs_[MAX_DIGITAL_INPUTS];
+    bool aioExpanderReady_ = false;
+    bool aio9ButtonRawHigh_ = false;
+    uint32_t lastAio9ButtonSampleMs_ = 0;
     uint8_t ultrasoundSensorCount_ = 0;
     char ultrasoundSensorNames_[MAX_ULTRASOUND_SENSORS][25] = {};
     UltrasoundSensor ultrasoundSensors_[MAX_ULTRASOUND_SENSORS];
@@ -317,6 +322,7 @@ private:
     uint32_t missionLaunchStartedMs_ = 0;
     int32_t missionLaunchEncoder1_ = 0;
     int32_t missionLaunchEncoder2_ = 0;
+    uint8_t missionLaunchRealignAttempts_ = 0;
     bool missionLaunchBlocked_ = false;
     float missionPoseXmm_ = 0.0f;
     float missionPoseYmm_ = 0.0f;
@@ -456,8 +462,6 @@ private:
     bool missionWallReverseNoProgress_ = false;
     bool missionWallRecoveryDetourRequested_ = false;
     int8_t missionWallRecoveryPreferredSide_ = 0;
-    uint16_t navigationClosePointTofMm_ = 0;
-    int8_t navigationClosePointTofSide_ = 0;
     uint32_t missionWallReverseStartedMs_ = 0;
     uint8_t missionWallReverseWaypoint_ = 255;
     uint8_t missionWallReverseRepeatCount_ = 0;
