@@ -4935,18 +4935,50 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const float featureClearance = feature.kind == 2
                     ? 0.5f * navigationRobotWidthMm_ +
                       missionDummyClearanceMm_ : CLEARANCE;
-                const float xs[2] = {feature.x0 - featureClearance,
-                                     feature.x1 + featureClearance};
-                const float ys[2] = {feature.y0 - featureClearance,
-                                     feature.y1 + featureClearance};
-                for (uint8_t xi = 0; xi < 2; ++xi)
-                    for (uint8_t yi = 0; yi < 2; ++yi)
-                        if (pointFree(xs[xi], ys[yi]) && nodes < MAX_NODES)
+                // Keep graph vertices just outside the inflated obstacle.
+                // pointFreeAt treats the inflated boundary as occupied, so
+                // placing a node exactly on x0-clearance/y0-clearance made
+                // every corner fail validation and left no detour path.
+                constexpr float CORNER_MARGIN_MM = 10.0f;
+                if (feature.rotatedWall)
+                {
+                    const float angle = feature.rotationDeg * DEG_TO_RAD;
+                    const float c = cosf(angle);
+                    const float s = sinf(angle);
+                    for (const int8_t sx : {-1, 1})
+                        for (const int8_t sy : {-1, 1})
                         {
-                            nx[nodes] = xs[xi];
-                            ny[nodes] = ys[yi];
-                            ++nodes;
+                            const float localX = sx * (300.0f +
+                                featureClearance + CORNER_MARGIN_MM);
+                            const float localY = sy * (65.0f +
+                                featureClearance + CORNER_MARGIN_MM);
+                            const float x = feature.wallX + localX * c - localY * s;
+                            const float y = feature.wallY + localX * s + localY * c;
+                            if (pointFree(x, y) && nodes < MAX_NODES)
+                            {
+                                nx[nodes] = x;
+                                ny[nodes] = y;
+                                ++nodes;
+                            }
                         }
+                }
+                else
+                {
+                    const float xs[2] = {
+                        feature.x0 - featureClearance - CORNER_MARGIN_MM,
+                        feature.x1 + featureClearance + CORNER_MARGIN_MM};
+                    const float ys[2] = {
+                        feature.y0 - featureClearance - CORNER_MARGIN_MM,
+                        feature.y1 + featureClearance + CORNER_MARGIN_MM};
+                    for (uint8_t xi = 0; xi < 2; ++xi)
+                        for (uint8_t yi = 0; yi < 2; ++yi)
+                            if (pointFree(xs[xi], ys[yi]) && nodes < MAX_NODES)
+                            {
+                                nx[nodes] = xs[xi];
+                                ny[nodes] = ys[yi];
+                                ++nodes;
+                            }
+                }
             }
             float distance[MAX_NODES];
             int8_t parent[MAX_NODES];
@@ -5287,12 +5319,21 @@ void BluetoothDebugWorkflow::updateNavigation()
         const MissionWaypoint& routeWaypoint = missionWaypoints_[missionWaypointIndex_];
         const float routeRangeMm = hypotf(routeWaypoint.xMm - missionPoseXmm_,
                                           routeWaypoint.yMm - missionPoseYmm_);
+        // Map-reroute waypoints on the return leg are transit guides. The
+        // final staging point immediately before the reverse-dock waypoint
+        // is deliberately excluded: the robot must still reach that point
+        // to turn around in the planned clear area.
+        const bool returnHomeTransitWaypoint = missionReturnHome_ &&
+            missionAvoidPhase_ == 0 && !missionWeightVectorActive_ &&
+            (routeWaypoint.flags & (0x01 | 0x04)) == 0 &&
+            missionWaypointIndex_ + 2 < missionWaypointCount_;
         // A transit point is a corridor guide, not a place to double back to
         // after driving past it. The two 27 Sep runs overshot such a point by
         // ~300 mm and then spun in place trying to enter its 120 mm arrival
-        // circle, despite a clear route through the wall gap ahead.
-        if (!missionReturnHome_ && missionAvoidPhase_ == 0 &&
-            !missionWeightVectorActive_ &&
+        // circle, despite a clear route through the wall gap ahead. Apply the
+        // same map-checked pass-through rule on the home transit route.
+        if ((!missionReturnHome_ || returnHomeTransitWaypoint) &&
+            missionAvoidPhase_ == 0 && !missionWeightVectorActive_ &&
             (routeWaypoint.flags & 0x01) == 0 &&
             missionWaypointIndex_ + 1 < missionWaypointCount_ &&
             (missionWaypoints_[missionWaypointIndex_ + 1].flags & 0x01) == 0)
@@ -5307,11 +5348,15 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const float fromY = missionPoseYmm_ - routeWaypoint.yMm;
                 const float alongMm = (fromX * legX + fromY * legY) / legMm;
                 const float lateralMm = fabsf(fromX * legY - fromY * legX) / legMm;
+                const float passToleranceMm = missionReturnHome_
+                    ? max(static_cast<float>(navigationRouteLineToleranceMm_),
+                          0.75f * static_cast<float>(navigationRobotWidthMm_))
+                    : static_cast<float>(navigationRouteLineToleranceMm_);
                 // Never cut across to the next leg when we are visibly off
                 // the intended route.  The tolerance is exposed in the GUI
                 // so line tracking can be tightened without recompiling.
                 if (alongMm > 130.0f &&
-                    lateralMm < static_cast<float>(navigationRouteLineToleranceMm_) &&
+                    lateralMm < passToleranceMm &&
                     pointFreeAt(missionPoseXmm_, missionPoseYmm_, mapClearanceMm) &&
                     segmentFree(missionPoseXmm_, missionPoseYmm_,
                                 next.xMm, next.yMm))
@@ -5374,7 +5419,14 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (!runHeadingTurn()) return;
                 missionDockAligned_ = true;
             }
-            if (routeRangeMm <= 110.0f)
+            // The storage gate is at the rear of the chassis.  Requiring the
+            // robot centre to reach within 110 mm of the home marker is too
+            // strict when odometry has drifted, even after its rear has
+            // physically entered the base.  Open/unload once the chassis
+            // length has crossed into the home area.
+            const float homeGateOpenRangeMm = max(
+                110.0f, static_cast<float>(navigationRobotLengthMm_) + 20.0f);
+            if (routeRangeMm <= homeGateOpenRangeMm)
             {
                 setDrive(0, 0);
                 ++missionWaypointIndex_;
@@ -6123,6 +6175,28 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionBlockedSinceMs_ = 0;
             missionAvoidAttempts_ = 0;
             link_.log("INFO", "Inner-TOF drive-through complete; weight marked collected and moving on");
+            return;
+        }
+        // Odometry/steering can pass close to a visibility-graph corner
+        // without entering the tiny generic 80 mm arrival radius. Advance a
+        // return transit point once a short direct connection to the next
+        // waypoint is proven map-clear; never apply this to the staging or
+        // reverse-dock points.
+        const float returnTransitArrivalMm = max(
+            180.0f, 0.75f * static_cast<float>(navigationRobotWidthMm_));
+        if (returnHomeTransitWaypoint &&
+            routeRangeMm <= returnTransitArrivalMm &&
+            missionWaypointIndex_ + 1 < missionWaypointCount_ &&
+            pointFreeAt(missionPoseXmm_, missionPoseYmm_, mapClearanceMm) &&
+            segmentFree(missionPoseXmm_, missionPoseYmm_,
+                missionWaypoints_[missionWaypointIndex_ + 1].xMm,
+                missionWaypoints_[missionWaypointIndex_ + 1].yMm))
+        {
+            setDrive(0, 0);
+            ++missionWaypointIndex_;
+            missionBlockedSinceMs_ = 0;
+            missionAvoidAttempts_ = 0;
+            link_.log("INFO", "Return-home transit waypoint reached; following next map-clear leg");
             return;
         }
         if (!missionWeightVectorActive_ && distanceToWaypoint <= arrivalMm)
