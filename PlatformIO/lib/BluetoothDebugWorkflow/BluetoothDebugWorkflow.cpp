@@ -5459,18 +5459,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             // Allow a new sensor lock during the search instead of treating
             // this waypoint as permanently collected.
             missionWeightVectorCompletedWaypoint_ = 255;
-            link_.log("INFO", "Entered 500 mm weight-site search region; confidence fades toward its edge");
+            link_.log("INFO", "Reached weight site without a lock; checking this single route pass");
         };
-        // Begin the site sweep as soon as the robot is within 500 mm of the
-        // planned weight, rather than waiting until it reaches the waypoint.
-        // Range-based confidence still controls how strongly a sighting can
-        // influence steering as the robot moves through the search region.
-        if (!searchActive && !missionReturnHome_ &&
-            (waypoint.flags & 0x01) != 0 && routeRangeMm <= 500.0f)
-        {
-            beginSiteSearch();
-            searchActive = true;
-        }
         auto finishSiteSearch = [&](bool incomplete) {
             // The inductor is downstream of the intake. In the last run it
             // confirmed the collected weight six seconds after this search
@@ -5486,8 +5476,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (incomplete && missionSearchSitesIncomplete_ < 255U)
                 ++missionSearchSitesIncomplete_;
             link_.log(incomplete ? "WARNING" : "INFO", incomplete
-                ? "Weight-site search incomplete; pickup not verified"
-                : "Weight site swept; pickup not independently verified");
+                ? "Weight-site pass complete; pickup not verified"
+                : "Weight site checked; pickup not independently verified");
             ++missionWaypointIndex_;
             missionSearchWaypoint_ = 255;
             missionSearchStep_ = 0;
@@ -5692,7 +5682,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             now - weightBearingSeenMs_ <= 800U)
             missionSearchLastEvidenceMs_ = now;
         if (searchActive && !missionWeightVectorActive_ &&
-            now - missionSearchStartedMs_ >= 40000U)
+            now - missionSearchStartedMs_ >= 6000U)
         {
             setDrive(0, 0);
             finishSiteSearch(true);
@@ -5700,64 +5690,13 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
         if (searchActive && missionSearchStep_ >= 3U)
         {
-            if (weightBearingWaypoint_ == missionWaypointIndex_ &&
-                now - weightBearingSeenMs_ <= 800U &&
-                missionWeightVectorCompletedWaypoint_ != missionWaypointIndex_)
-            {
-                // A confirmed hit takes precedence over finishing a blind
-                // sweep, including on the final search pass.
-                missionSearchStep_ = 2;
-                missionSearchDwellStartedMs_ = 0;
-            }
-            else
-            {
-                const bool recentlySeen = missionSearchLastEvidenceMs_ != 0 &&
-                    now - missionSearchLastEvidenceMs_ <= 2500U;
-                const bool needsAnotherLook = recentlySeen || missionSearchSamples_ < 2U ||
-                    missionSearchCoverageSamples_ < 2U;
-                if (needsAnotherLook && missionSearchPasses_ < 1U &&
-                    now - missionSearchStartedMs_ < 35000U)
-                {
-                    missionSearchStep_ = 0;
-                    ++missionSearchPasses_;
-                    missionSearchDwellStartedMs_ = 0;
-                }
-                else
-                {
-                    setDrive(0, 0);
-                    finishSiteSearch(recentlySeen || missionSearchSamples_ < 2U ||
-                                     missionSearchCoverageSamples_ < 2U);
-                    return;
-                }
-            }
+            // A failed/blocked pass is final for this target. Do not turn
+            // back into another scan or re-enter the same site.
+            setDrive(0, 0);
+            finishSiteSearch(true);
+            return;
         }
         float searchX = missionSearchCenterXmm_, searchY = missionSearchCenterYmm_;
-        if (searchActive && missionSearchStep_ < 2U)
-        {
-            const float angle = missionSearchApproachHeadingDeg_ * DEG_TO_RAD;
-            const float searchRadius = missionSearchPasses_ == 0
-                ? static_cast<float>(navigationWeightSearchRadiusMm_)
-                : max(100.0f,
-                    static_cast<float>(navigationWeightSearchRadiusMm_) * 0.70f);
-            const float backward = min(
-                missionSearchPasses_ == 0 ? 180.0f : 130.0f,
-                searchRadius);
-            const float lateral = sqrtf(max(
-                0.0f, searchRadius * searchRadius - backward * backward));
-            const float signedLateral =
-                (missionSearchStep_ == 0 ? -1.0f : 1.0f) * lateral;
-            searchX -= backward * cosf(angle) + signedLateral * sinf(angle);
-            searchY -= backward * sinf(angle) - signedLateral * cosf(angle);
-            if (!pointFreeAt(searchX, searchY, targetClearanceMm) ||
-                !segmentFreeAt(missionPoseXmm_, missionPoseYmm_,
-                               searchX, searchY, targetClearanceMm))
-            {
-                ++missionSearchStep_;
-                missionSearchDwellStartedMs_ = 0;
-                setDrive(0, 0);
-                return;
-            }
-        }
         // Either inward-facing intake sensor can now authorise collection.
         // A sector bit has already required its own fresh bottom/top height
         // geometry, active planned-weight association and mapped-wall
@@ -5858,7 +5797,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                               hitX, hitY, targetClearanceMm))
             {
                 uint16_t overshoot = 0;
-                for (uint16_t candidate : {240U, 200U, 160U, 100U})
+                // Keep the post-contact travel to roughly one third of the
+                // previous 240 mm nominal overshoot.
+                for (uint16_t candidate : {80U, 65U, 50U, 35U})
                 {
                     const float endX = hitX + candidate * ux;
                     const float endY = hitY + candidate * uy;
@@ -5910,14 +5851,15 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionOuterCueActive_ = false;
             missionOuterReverseActive_ = false;
         }
-        // Before the 130 mm lock threshold is reached, one inner return is a
-        // directional hint just like an outer cue. Once it is within that
-        // threshold, the earlier lock block owns the collection pass.
+        // Side sensors may steer the approach; they never start an in-place
+        // scan. A single outer cue may request one short reverse, while the
+        // inner pair goes straight to the independent 130 mm lock check.
         const bool freshDirectionCue = !missionReturnHome_ &&
+            !searchActive &&
             (waypoint.flags & 0x01) != 0 && missionAvoidPhase_ == 0 &&
             missionWeightVectorCompletedWaypoint_ != missionWaypointIndex_ &&
             routeRangeMm <= 500.0f &&
-            weightBearingSector_ < 4U &&
+            (weightBearingSector_ == 0U || weightBearingSector_ == 3U) &&
             weightBearingWaypoint_ == missionWaypointIndex_ &&
             now - weightBearingSeenMs_ <= 350U &&
             (weightSectorMask_ & (1U << weightBearingSector_)) != 0 &&
@@ -5941,8 +5883,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             pointFreeAt(backX, backY, targetClearanceMm) &&
             segmentFreeAt(missionPoseXmm_, missionPoseYmm_, backX,
                           backY, targetClearanceMm);
-        if (!missionOuterCueActive_ && freshDirectionCue &&
-            ((missionOuterCueTriedMask_ & cueBit) == 0U || reverseCandidate))
+        if (!missionOuterCueActive_ && freshDirectionCue && reverseCandidate &&
+            missionOuterReverseTriedMask_ == 0U)
         {
             missionOuterCueActive_ = true;
             missionOuterCueTriedMask_ |= cueBit;
@@ -5962,8 +5904,6 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionOuterReverseEncoder2_ = encoders_.secondCount();
                 link_.log("INFO", "Outer TOF sees weight beside intake; backing up to centre it");
             }
-            else
-                link_.log("INFO", "Bottom TOF suggests weight direction; turning for paired inner confirmation");
         }
         if (missionOuterCueActive_)
         {
@@ -5988,10 +5928,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                     return;
                 }
                 missionOuterReverseActive_ = false;
-                missionOuterCueStartedMs_ = now;
-                missionOuterCueHeadingDeg_ = normaliseHeading(atan2f(
-                    missionOuterCueHitYmm_ - missionPoseYmm_,
-                    missionOuterCueHitXmm_ - missionPoseXmm_) * RAD_TO_DEG);
+                missionOuterCueActive_ = false;
+                missionOuterCueAlignedSinceMs_ = 0;
                 setDrive(0, 0);
                 return;
             }
@@ -6039,9 +5977,9 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionCollectionFollowThroughUntilMs_ = 0;
             missionInnerWeightLocked_ = false;
         }
-        // One bottom TOF, inner or outer, is a directional hint only.
-        // Approach a stand-off where the inner beams can overlap, then
-        // wait for matching raw inner ranges before the straight pickup.
+        // A single bottom TOF is a soft steering hint. It may guide the robot
+        // toward the planned site, but only an inner sensor at its own 130 mm
+        // threshold can start the straight collection vector.
         const bool singleSensorHint = !missionWeightVectorActive_ &&
             !missionOuterCueActive_ && !missionReturnHome_ &&
             missionAvoidPhase_ == 0 && routeRangeMm <= 500.0f &&
@@ -6083,7 +6021,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             const float vx = aimX - missionPoseXmm_;
             const float vy = aimY - missionPoseYmm_;
             const float hitDistance = hypotf(vx, vy);
-            const float standoffMm = outerHint ? 450.0f : 350.0f;
+            const float standoffMm = outerHint ? 200.0f : 110.0f;
             if (searchActive)
             {
                 // Once a sensor has localized a weight, search around that
@@ -6096,13 +6034,6 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (hypotf(bearingX, bearingY) >= 50.0f)
                     missionSearchApproachHeadingDeg_ = normaliseHeading(
                         atan2f(bearingY, bearingX) * RAD_TO_DEG);
-            }
-            if (!outerHint && hitDistance < standoffMm + 40.0f)
-            {
-                setDrive(0, 0);
-                if (!searchActive)
-                    beginSiteSearch();
-                return;
             }
             if (hitDistance >= standoffMm + 40.0f && hitDistance <= 900.0f)
             {
@@ -6149,7 +6080,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 if (missionCollectionFollowThroughUntilMs_ == 0)
                 {
-                    missionCollectionFollowThroughUntilMs_ = now + 2500U;
+                    missionCollectionFollowThroughUntilMs_ = now + 800U;
                     link_.log("INFO", "Centred pickup reached; slow collection follow-through");
                 }
                 const float headingRad = missionWeightVectorHeadingDeg_ * DEG_TO_RAD;
@@ -6223,18 +6154,11 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             if (searchActive)
             {
-                if (missionSearchDwellStartedMs_ == 0)
-                    missionSearchDwellStartedMs_ = now;
-                if (now - missionSearchDwellStartedMs_ >= 800U)
-                {
-                    if (missionSearchSamples_ < 255U)
-                        ++missionSearchSamples_;
-                    if (weightValidMask_ != 0 &&
-                        missionSearchCoverageSamples_ < 255U)
-                        ++missionSearchCoverageSamples_;
-                    ++missionSearchStep_;
-                    missionSearchDwellStartedMs_ = 0;
-                }
+                // The route itself is the one sweep through this weight
+                // site. Sensor hints may guide a single on-route approach,
+                // but reaching the site without an inner lock must not stop
+                // the robot to pivot or restart a search.
+                finishSiteSearch(true);
                 return;
             }
             if ((waypoint.flags & 0x01) != 0 && !missionReturnHome_)
@@ -6490,7 +6414,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 // motor command for the entire site-search timeout.
                 missionSearchStep_ = 3;
                 missionBlockedSinceMs_ = 0;
-                link_.log("WARNING", "Search approach blocked; trying alternate sweep");
+                link_.log("WARNING", "Search approach blocked; moving on after this pass");
             }
             return;
         }
@@ -6613,9 +6537,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             approachingWeightSite = hypotf(site.xMm - missionPoseXmm_,
                                            site.yMm - missionPoseYmm_) <= 800.0f;
         }
-        // Decelerate into the site rather than arriving at the 500 mm search
-        // trigger at full drive speed. Once that trigger actually fires, use
-        // the collection-safe 65% speed for all search/weight manoeuvres.
+            // Slow down on the approach leg. The search state is entered only
+            // at the weight waypoint, not at the outer edge of the site radius.
         const bool slowWeightApproach = !missionReturnHome_ &&
             (approachingWeightSite || searchActive || missionWeightVectorActive_);
         const bool weightSearchSpeed = searchActive || missionWeightVectorActive_;
