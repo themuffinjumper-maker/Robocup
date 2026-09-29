@@ -181,16 +181,25 @@ void BluetoothDebugWorkflow::update()
     if (lastUpdateStartedUs_ != 0)
         maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
     lastUpdateStartedUs_ = updateStartedUs;
-    link_.update();
     const uint32_t now = millis();
-    if (!bluetoothPeerAlive(now) && now - lastLinkProbeMs_ >= 2000U)
-    {
-        lastLinkProbeMs_ = now;
-        JsonDocument probe;
-        probe["type"] = "link_probe";
-        probe["uptime_ms"] = now;
-        link_.send(probe);
-    }
+    auto serviceLink = [this]() {
+        link_.update();
+        const uint32_t linkNow = millis();
+        if (!bluetoothPeerAlive(linkNow) &&
+            linkNow - lastLinkProbeMs_ >= 2000U)
+        {
+            lastLinkProbeMs_ = linkNow;
+            JsonDocument probe;
+            probe["type"] = "link_probe";
+            probe["uptime_ms"] = linkNow;
+            link_.send(probe);
+        }
+    };
+    // In the local competition profile, service the physical start edge
+    // before parsing optional Bluetooth traffic. Keep normal debug-mode order
+    // unchanged so existing manual-control behavior is unaffected.
+    if (!LocalMissionConfig::ENABLED)
+        serviceLink();
     if (!currentSensorSampleValid_ || now - lastCurrentSampleMs_ >= 10U)
     {
         lastCurrentSampleMs_ = now;
@@ -244,6 +253,8 @@ void BluetoothDebugWorkflow::update()
     // mission (or enforce the local round timer). Keep it ahead of navigation
     // so a newly accepted press starts the mission in this same update cycle.
     updateLocalCompetition();
+    if (LocalMissionConfig::ENABLED)
+        serviceLink();
     updateArmSorting(now);
     if (sortingGateTorqueOffAtMs_ != 0 &&
         static_cast<int32_t>(now - sortingGateTorqueOffAtMs_) >= 0)
