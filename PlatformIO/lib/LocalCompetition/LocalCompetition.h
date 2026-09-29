@@ -25,6 +25,7 @@ public:
         returningHome_ = false;
         completed_ = false;
         startedAtMs_ = 0;
+        confirmedWeights_ = 0;
     }
 
     Event update(bool inputAvailable, bool levelHigh, uint32_t now)
@@ -57,7 +58,22 @@ public:
             returningHome_ = true;
             return Event::ReturnHome;
         }
+        if (active_ && !returningHome_ &&
+            confirmedWeights_ >= CONFIRMED_WEIGHT_LIMIT)
+        {
+            returningHome_ = true;
+            return Event::ReturnHome;
+        }
         return Event::None;
+    }
+
+    bool noteConfirmedWeight()
+    {
+        if (!active_ || returningHome_ || completed_ ||
+            confirmedWeights_ >= CONFIRMED_WEIGHT_LIMIT)
+            return false;
+        ++confirmedWeights_;
+        return confirmedWeights_ >= CONFIRMED_WEIGHT_LIMIT;
     }
 
     void markComplete()
@@ -82,6 +98,7 @@ public:
     bool active() const { return active_; }
     bool returningHome() const { return returningHome_; }
     bool completed() const { return completed_; }
+    uint8_t confirmedWeights() const { return confirmedWeights_; }
     uint32_t elapsedMs(uint32_t now) const
     {
         return startedAtMs_ == 0 ? 0 : now - startedAtMs_;
@@ -94,6 +111,7 @@ public:
 
     static constexpr uint32_t ROUND_LIMIT_MS = 90000U;
     static constexpr uint32_t INPUT_DEBOUNCE_MS = 30U;
+    static constexpr uint8_t CONFIRMED_WEIGHT_LIMIT = 5U;
 
 private:
     bool initialized_ = false;
@@ -102,6 +120,7 @@ private:
     bool active_ = false;
     bool returningHome_ = false;
     bool completed_ = false;
+    uint8_t confirmedWeights_ = 0;
     uint32_t candidateSinceMs_ = 0;
     uint32_t startedAtMs_ = 0;
 };

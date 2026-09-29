@@ -1,9 +1,9 @@
 # Local competition run
 
 The local run reuses the existing pre-laid mission navigation and home unload
-sequence. `LocalCompetition` only handles the AIO9 rising edge and 90-second
-clock; `BluetoothDebugWorkflow` remains the controller for navigation,
-encoders/IMU, TOFs, arm sorting, motors, and storage-gate unloading.
+sequence. `LocalCompetition` handles the AIO9 rising edge, 90-second clock, and
+confirmed-weight limit; `BluetoothDebugWorkflow` remains the controller for
+navigation, encoders/IMU, TOFs, arm sorting, motors, and storage-gate unloading.
 
 ## Prepare and export the arena
 
@@ -36,10 +36,12 @@ tuning change. No Bluetooth command is needed to upload the mission.
 - The run arms the existing sorting mechanism, starts motor bank 1 at 100%,
   and starts the exported planned mission. The storage-release gate is handled
   by the existing navigation/home logic.
-- At 90 seconds from the AIO9 edge, the supervisor marks remaining weight
-  targets skipped and hands control to the normal map-aware return-home
-  planner. It performs the existing reverse dock, gate-open and shake sequence.
-  After unloading it closes the storage gate and stops the run.
+- At 90 seconds from the AIO9 edge, or after five inductive weight
+  confirmations during the run, the supervisor marks remaining weight targets
+  skipped and hands control to the normal map-aware return-home planner. It
+  performs the existing reverse dock, gate-open and shake sequence. After
+  unloading it closes the storage gate and stops the run. The live telemetry
+  reports `local_competition.confirmed_weights` and its limit.
 
 ## Bluetooth monitor-only mode
 

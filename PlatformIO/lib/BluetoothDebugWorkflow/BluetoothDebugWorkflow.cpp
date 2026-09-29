@@ -140,6 +140,7 @@ void BluetoothDebugWorkflow::begin()
                  LocalMissionConfig::ENABLED ? "NO_AIO9" : "DISABLED");
         link_.log("WARNING", "AIO SX1509 not detected at 0x3E on I2C0; AIO9 button unavailable");
     }
+    localCompetitionSortingSerial_ = sortingConfirmedSerial_;
     const bool tof8x8Ready = tof8x8_.begin();
     Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
@@ -2100,6 +2101,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         ? localCompetition_.elapsedMs(now) : 0U;
     data["local_competition.remaining_ms"] = localRunActive_
         ? localCompetition_.remainingMs(now) : 0U;
+    data["local_competition.confirmed_weights"] = localCompetition_.confirmedWeights();
+    data["local_competition.weight_limit"] = LocalCompetition::CONFIRMED_WEIGHT_LIMIT;
     data["local_competition.aio9_high"] = aio9ButtonRawHigh_;
     data["local_competition.aio9_available"] = aioExpanderReady_;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
@@ -5424,7 +5427,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 setDrive(0, 0);
                 if (now - missionUnloadPhaseStartedMs_ >= 650U)
                 {
-                    missionUnloadPhase_ = 2;
+                    missionUnloadPhase_ = HomeUnloadConfig::FIRST_SHAKE_PHASE;
                     missionUnloadPhaseStartedMs_ = now;
                     missionUnloadStartEncoder1_ = encoders_.firstCount();
                     missionUnloadStartEncoder2_ = encoders_.secondCount();
@@ -5438,9 +5441,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionUnloadStartEncoder2_) * ENCODER_2_MM_PER_COUNT);
             const float travelledMm = min(leftMm, rightMm);
             const uint32_t elapsedMs = now - missionUnloadPhaseStartedMs_;
-            // Give the motor driver a short neutral interval before each
-            // direction change instead of slamming straight into reverse.
-            if (elapsedMs < 150U)
+            // Briefly neutralise between legs, then use full drive power for
+            // a decisive shake rather than the old soft 75% motion.
+            if (elapsedMs < HomeUnloadConfig::DIRECTION_SETTLE_MS)
             {
                 setDrive(0, 0);
                 return;
@@ -5451,13 +5454,24 @@ void BluetoothDebugWorkflow::updateNavigation()
                 stopNavigation("Home unload aborted: shake travel did not track encoders");
                 return;
             }
-            if (travelledMm >= 90.0f || elapsedMs > 1800U)
+            if (travelledMm >= HomeUnloadConfig::SHAKE_LEG_TRAVEL_MM ||
+                elapsedMs > 1800U)
             {
                 setDrive(0, 0);
-                if (missionUnloadPhase_ == 5)
+                if ((missionUnloadPhase_ - HomeUnloadConfig::FIRST_SHAKE_PHASE + 1U) % 2U == 0U)
+                {
+                    char shakeMessage[48];
+                    const uint8_t completedCycles =
+                        (missionUnloadPhase_ - HomeUnloadConfig::FIRST_SHAKE_PHASE + 1U) / 2U;
+                    snprintf(shakeMessage, sizeof(shakeMessage),
+                        "Home unload shake cycle %u/%u complete",
+                        completedCycles, HomeUnloadConfig::SHAKE_CYCLES);
+                    link_.log("INFO", shakeMessage);
+                }
+                if (missionUnloadPhase_ == HomeUnloadConfig::LAST_SHAKE_PHASE)
                 {
                     missionUnloadPhase_ = 0;
-                    link_.log("INFO", "Home unload shake complete; storage gate open");
+                    link_.log("INFO", "Home unload complete: 3 full-power shake cycles; storage gate open");
                 }
                 else
                 {
@@ -5482,7 +5496,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 stopNavigation("Home unload aborted: shake corridor blocked");
                 return;
             }
-            setDrive(outward ? -75 : 75, outward ? -75 : 75);
+            const int16_t shakePower = HomeUnloadConfig::SHAKE_SPEED_PERCENT;
+            setDrive(outward ? -shakePower : shakePower,
+                     outward ? -shakePower : shakePower);
             return;
         }
 

@@ -250,6 +250,46 @@ class MissionUploadTests(unittest.TestCase):
         self.assertTrue(layout._segment_clear(
             (target["x"], target["y"]), end))
 
+    def test_manual_visit_order_is_persisted_and_planned_in_sequence(self):
+        layout = MissionLayout()
+        first = layout.add_weight(3000, 800)
+        second = layout.add_weight(1800, 1200)
+        layout.order_mode = "manual"
+        layout.set_target_order([second["id"], first["id"]])
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.order_mode, "manual")
+        self.assertEqual(restored.target_order,
+                         [second["id"], first["id"]])
+        self.assertTrue(restored.plan(), restored.route_error)
+        targets = [(point["x"], point["y"]) for point in restored.route
+                   if point.get("target")]
+        self.assertEqual(targets, [(second["x"], second["y"]),
+                                   (first["x"], first["y"])])
+
+    def test_mission_planner_records_and_persists_map_clicked_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            first = view.mission_layout.add_weight(3000, 800)
+            second = view.mission_layout.add_weight(1800, 1200)
+            view._refresh_mission_weight_order()
+            view.mission_set_sequence_button.click()
+            self.assertTrue(view._sequence_pick_active)
+            view.mission_canvas.sequence_weight_clicked.emit(second["id"])
+            view.mission_canvas.sequence_weight_clicked.emit(first["id"])
+            self.assertEqual(view.mission_layout.order_mode, "manual")
+            self.assertEqual(view.mission_layout.target_order,
+                             [second["id"], first["id"]])
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["target_order"],
+                             [second["id"], first["id"]])
+            self.assertFalse(view._sequence_pick_active)
+            self.assertEqual(view.mission_set_sequence_button.text(), "SET SEQUENCE")
+            view.close()
+
     def test_weight_approach_prefers_clear_side_over_short_side(self):
         layout = MissionLayout()
         layout.start.update(x=1700.0, y=1200.0)

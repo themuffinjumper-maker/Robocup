@@ -8,6 +8,23 @@ void BluetoothDebugWorkflow::updateLocalCompetition()
     if (!LocalMissionConfig::ENABLED)
         return;
 
+    // Count each confirmed inductive event independently of the navigation
+    // waypoint attribution. The sorting subsystem already debounces a high
+    // detection before incrementing this serial; consume each event once.
+    if (localRunActive_)
+    {
+        while (localCompetitionSortingSerial_ != sortingConfirmedSerial_)
+        {
+            ++localCompetitionSortingSerial_;
+            if (localCompetition_.noteConfirmedWeight())
+                link_.log("INFO", "Five induction-confirmed weights reached; returning home");
+        }
+    }
+    else
+    {
+        localCompetitionSortingSerial_ = sortingConfirmedSerial_;
+    }
+
     const uint32_t now = millis();
     const LocalCompetition::Event event = localCompetition_.update(
         aioExpanderReady_, aio9ButtonRawHigh_, now);
@@ -199,7 +216,10 @@ void BluetoothDebugWorkflow::requestLocalReturnHome()
     localMissionReturning_ = true;
     localCompetition_.setReturningHome();
     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "RETURNING_HOME");
-    link_.log("WARNING", "90-second local round limit reached; all remaining targets skipped, returning home to unload");
+    if (localCompetition_.confirmedWeights() >= LocalCompetition::CONFIRMED_WEIGHT_LIMIT)
+        link_.log("WARNING", "Five induction-confirmed weights reached; skipping remaining targets and returning home to unload");
+    else
+        link_.log("WARNING", "90-second local round limit reached; all remaining targets skipped, returning home to unload");
 }
 
 void BluetoothDebugWorkflow::finishLocalCompetition()

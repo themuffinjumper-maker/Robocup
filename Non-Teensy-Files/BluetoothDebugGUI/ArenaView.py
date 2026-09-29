@@ -17,8 +17,8 @@ from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QTabWidget,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -1173,6 +1173,8 @@ class MissionLayout:
     def __init__(self):
         self.my_home = "green"
         self.fallback_strategy = 0
+        self.order_mode = "auto"
+        self.target_order = []
         # Physical clearance from the robot's outer edge to a dummy weight.
         self.dummy_clearance_mm = 100.0
         self.start = {"x": 325.0, "y": 325.0, "heading_deg": 0.0}
@@ -1200,6 +1202,8 @@ class MissionLayout:
         item = {"id": self._id(), "x": float(x), "y": float(y),
                 "dummy": bool(dummy)}
         self.weights.append(item)
+        if not item["dummy"]:
+            self.target_order.append(item["id"])
         self.route = []
         return item
 
@@ -1233,6 +1237,8 @@ class MissionLayout:
             for index, item in enumerate(collection):
                 if item["id"] == item_id:
                     del collection[index]
+                    self.target_order = [target_id for target_id in self.target_order
+                                         if str(target_id) != str(item_id)]
                     self.route = []
                     return True
         return False
@@ -1445,6 +1451,30 @@ class MissionLayout:
             path.append((float(goal[0]), float(goal[1])))
         return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
 
+    def ordered_real_weights(self):
+        """Return real targets in saved manual order, appending newly added sites."""
+        by_id = {str(item["id"]): item for item in self.weights
+                 if not item.get("dummy")}
+        ordered_ids = []
+        seen = set()
+        for target_id in self.target_order:
+            key = str(target_id)
+            if key in by_id and key not in seen:
+                ordered_ids.append(by_id[key]["id"])
+                seen.add(key)
+        for item in self.weights:
+            key = str(item["id"])
+            if not item.get("dummy") and key not in seen:
+                ordered_ids.append(item["id"])
+                seen.add(key)
+        self.target_order = ordered_ids
+        return [by_id[str(target_id)] for target_id in ordered_ids]
+
+    def set_target_order(self, target_ids):
+        self.target_order = list(target_ids)
+        self.ordered_real_weights()
+        self.route = []
+
     def docking_path(self, start, home):
         """Route to a clear turning point, then a straight reversing corridor."""
         candidates = []
@@ -1489,11 +1519,16 @@ class MissionLayout:
         if self.blocked(*current):
             self.route_error = "Start position is inside a border/no-go/obstacle clearance."
             return False
-        remaining = list(real_weights)
+        remaining = (self.ordered_real_weights()
+                     if self.order_mode == "manual" else list(real_weights))
         route = []
         while remaining:
             options = []
-            for item in remaining:
+            # Automatic mode chooses the cheapest reachable next site. Manual
+            # mode fixes the next site but still plans its safe staging and
+            # collection approach with the same A* path planner.
+            candidates = remaining[:1] if self.order_mode == "manual" else remaining
+            for item in candidates:
                 weight_options = []
                 weight = (item["x"], item["y"])
                 visit = weight
@@ -1633,6 +1668,8 @@ class MissionLayout:
         return {
             "my_home": self.my_home,
             "fallback_strategy": self.fallback_strategy,
+            "order_mode": self.order_mode,
+            "target_order": list(self.target_order),
             "dummy_clearance_mm": self.dummy_clearance_mm,
             "start": self.start,
             "weights": self.weights,
@@ -1646,6 +1683,9 @@ class MissionLayout:
         if data.get("my_home") in ("green", "blue"):
             self.my_home = data["my_home"]
         self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
+        self.order_mode = "manual" if data.get("order_mode") == "manual" else "auto"
+        stored_order = data.get("target_order", [])
+        self.target_order = list(stored_order) if isinstance(stored_order, list) else []
         # Read the previous field too, so existing layouts retain their
         # selected dummy berth after this update.
         self.dummy_clearance_mm = max(0.0, min(500.0,
@@ -1665,6 +1705,7 @@ class MissionLayout:
                 item["rotation"] = float(item.get("rotation", 0)) % 180.0
         self._next_id = max(int(data.get("next_id", 1)),
                             1 + max([0] + [int(item.get("id", 0)) for item in self.weights + self.obstacles]))
+        self.ordered_real_weights()
         self.route = []
 
 
@@ -1672,6 +1713,7 @@ class MissionLayoutCanvas(QWidget):
     layout_changed = pyqtSignal()
     selection_changed = pyqtSignal(object)
     cursor_moved = pyqtSignal(float, float)
+    sequence_weight_clicked = pyqtSignal(object)
 
     def __init__(self, layout_model, live_model, parent=None):
         super().__init__(parent)
@@ -1680,6 +1722,8 @@ class MissionLayoutCanvas(QWidget):
         self.setMinimumSize(760, 430)
         self.setMouseTracking(True)
         self.add_mode = None
+        self.sequence_pick_active = False
+        self.sequence_preview_order = []
         self.selected_id = "start"
         self._dragging = False
         self._panning = False
@@ -1748,6 +1792,8 @@ class MissionLayoutCanvas(QWidget):
         self.update()
 
     def set_add_mode(self, mode):
+        if self.sequence_pick_active:
+            return
         self.add_mode = mode
         self.update()
 
@@ -1821,6 +1867,12 @@ class MissionLayoutCanvas(QWidget):
             self.update()
             return
         selected = self._nearest_item(event.position())
+        if self.sequence_pick_active:
+            weight = next((item for item in self.layout_model.weights
+                           if item["id"] == selected and not item.get("dummy")), None)
+            if weight is not None:
+                self.sequence_weight_clicked.emit(weight["id"])
+            return
         if selected is not None:
             self.selected_id = selected
             self._dragging = True
@@ -1925,6 +1977,18 @@ class MissionLayoutCanvas(QWidget):
                        f"L{index}  {x:.0f} mm")
             p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
 
+        # Quarter, midpoint, and three-quarter cross-arena references.
+        for index, fraction in enumerate((0.25, 0.5, 0.75), start=1):
+            y = model.HEIGHT_MM * fraction
+            left = self._screen(0.0, y)
+            right = self._screen(model.WIDTH_MM, y)
+            p.drawLine(left, right)
+            p.setPen(QColor("#94a3b8"))
+            p.drawText(QRectF(right.x() - 104, right.y() - 21, 100, 18),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       f"H{index}  {y:.0f} mm")
+            p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
+
         for colour, fill, text in (("green", "#166534", "GREEN HOME"),
                                    ("blue", "#1d4ed8", "BLUE HOME")):
             rect = rect_world(model.home_rect(colour))
@@ -1999,6 +2063,12 @@ class MissionLayoutCanvas(QWidget):
                         f"{item['kind'].upper()}\n{size_text} mm"))
 
         likely_weight = self._likely_visible_planned_weight()
+        displayed_order = (
+            self.sequence_preview_order if self.sequence_pick_active else
+            self.layout_model.target_order
+            if self.layout_model.order_mode == "manual" else [])
+        displayed_rank = {str(target_id): index
+                          for index, target_id in enumerate(displayed_order, 1)}
         for index, item in enumerate(model.weights, 1):
             centre = self._screen(item["x"], item["y"])
             selected = item["id"] == self.selected_id
@@ -2014,7 +2084,10 @@ class MissionLayoutCanvas(QWidget):
             p.setPen(QColor("#111827"))
             p.drawText(QRectF(centre.x() - 16, centre.y() - 9, 32, 18),
                        Qt.AlignmentFlag.AlignCenter,
-                       "D" if item["dummy"] else str(index))
+                       "D" if item["dummy"] else
+                       str(displayed_rank.get(str(item["id"]), "·")
+                           if self.sequence_pick_active else
+                           displayed_rank.get(str(item["id"]), index)))
 
         for route_index, (hit_x, hit_y, committed) in self.detected_weight_hits.items():
             centre = self._screen(hit_x, hit_y)
@@ -2676,6 +2749,8 @@ class ArenaView(QWidget):
     def _build_mission_editor(self):
         self.mission_layout = MissionLayout()
         self._return_home_route_active = False
+        self._sequence_pick_active = False
+        self._sequence_pick_ids = []
         try:
             saved = self.settings.value("navigation/mission_layout", "")
             if saved:
@@ -2729,6 +2804,20 @@ class ArenaView(QWidget):
         self.mission_fallback_combo.currentIndexChanged.connect(self._mission_fallback_changed)
         toolbar.addWidget(QLabel("After weights:"))
         toolbar.addWidget(self.mission_fallback_combo)
+
+        self.mission_order_combo = QComboBox()
+        self.mission_order_combo.addItem("Automatic order", "auto")
+        self.mission_order_combo.addItem("My chosen order", "manual")
+        self.mission_order_combo.setCurrentIndex(
+            1 if self.mission_layout.order_mode == "manual" else 0)
+        self.mission_order_combo.currentIndexChanged.connect(
+            self._mission_order_mode_changed)
+        self.mission_order_combo.setToolTip(
+            "Automatic lets the planner choose the next weight. My chosen order "
+            "visits the targets in the list order, while planning a clear route "
+            "and collection approach for each one.")
+        toolbar.addWidget(QLabel("Visit order:"))
+        toolbar.addWidget(self.mission_order_combo)
         toolbar.addStretch()
         page_layout.addLayout(toolbar)
 
@@ -2768,6 +2857,8 @@ class ArenaView(QWidget):
             self.mission_layout, self.model, self.mission_page)
         self.mission_canvas.layout_changed.connect(self._mission_layout_changed)
         self.mission_canvas.selection_changed.connect(self._mission_selection_changed)
+        self.mission_canvas.sequence_weight_clicked.connect(
+            self._sequence_weight_clicked)
         self.mission_canvas.cursor_moved.connect(self._mission_cursor_moved)
         body.addWidget(self.mission_canvas, 1)
 
@@ -2775,6 +2866,27 @@ class ArenaView(QWidget):
         inspector.setMaximumWidth(310)
         inspector_layout = QVBoxLayout(inspector)
         inspector_layout.setContentsMargins(4, 4, 4, 4)
+
+        order_group = QGroupBox("Weight visit sequence")
+        order_layout = QVBoxLayout(order_group)
+        self.mission_order_list = QListWidget()
+        self.mission_order_list.setMinimumHeight(76)
+        self.mission_order_list.setMaximumHeight(145)
+        self.mission_order_list.setToolTip(
+            "Shows the planned visit order (updated after PLAN ROUTE in automatic mode). "
+            "To choose your own sequence, press SET SEQUENCE and click real weight "
+            "markers on the arena map.")
+        self.mission_order_list.currentItemChanged.connect(
+            self._mission_order_selection_changed)
+        order_layout.addWidget(self.mission_order_list)
+        self.mission_set_sequence_button = QPushButton("SET SEQUENCE")
+        self.mission_set_sequence_button.clicked.connect(
+            self._toggle_mission_sequence_pick)
+        self.mission_set_sequence_button.setToolTip(
+            "Click each real weight on the arena map in the order you want to visit them.")
+        order_layout.addWidget(self.mission_set_sequence_button)
+        inspector_layout.addWidget(order_group)
+        self._refresh_mission_weight_order()
 
         selection_group = QGroupBox("Selected obstacle geometry")
         selection_form = QFormLayout(selection_group)
@@ -2835,7 +2947,10 @@ class ArenaView(QWidget):
         self.mission_cursor_label.setWordWrap(True)
         inspector_layout.addWidget(self.mission_cursor_label)
         guide = QLabel(
-            "Seven dashed vertical placement lines split the 4.9 m arena into eight equal bays. "
+            "Seven dashed vertical placement lines split the arena length into eight bays; "
+            "three horizontal lines mark the quarter, midpoint, and three-quarter positions. "
+            "Choose automatic ordering, or press SET SEQUENCE and click real weight markers "
+            "in the desired order; Plan Route then plans a path through that sequence. "
             "Dummy clearance and wall clearance are both measured from the robot edge. "
             "Walls/tubes use normal robot clearance; ramps and the opposing base are no-go zones. "
             "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
@@ -2880,6 +2995,16 @@ class ArenaView(QWidget):
     def _mission_selection_changed(self, ident):
         if not hasattr(self, "mission_obstacle_width"):
             return
+        if (self.mission_layout.order_mode == "manual" and
+                hasattr(self, "mission_order_list")):
+            for index in range(self.mission_order_list.count()):
+                row = self.mission_order_list.item(index)
+                if str(row.data(Qt.ItemDataRole.UserRole)) == str(ident):
+                    if self.mission_order_list.currentRow() != index:
+                        self.mission_order_list.blockSignals(True)
+                        self.mission_order_list.setCurrentRow(index)
+                        self.mission_order_list.blockSignals(False)
+                    break
         obstacle = next(
             (item for item in self.mission_layout.obstacles
              if item.get("id") == ident), None)
@@ -3029,8 +3154,14 @@ class ArenaView(QWidget):
         )
 
     def _mission_layout_changed(self):
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Sequence selection cancelled because the layout changed; "
+                "the saved visit order is unchanged.")
         self.mission_layout.route = []
         self._return_home_route_active = False
+        if hasattr(self, "mission_order_list"):
+            self._refresh_mission_weight_order()
         self._save_mission_layout()
         self.mission_status.setText("Layout changed — press PLAN ROUTE to recalculate around the new geometry.")
         self.mission_canvas.update()
@@ -3046,6 +3177,147 @@ class ArenaView(QWidget):
     def _mission_fallback_changed(self, index):
         self.mission_layout.fallback_strategy = max(0, min(2, int(index)))
         self._save_mission_layout()
+
+    def _mission_order_mode_changed(self, index):
+        self.mission_layout.order_mode = (
+            "manual" if self.mission_order_combo.itemData(index) == "manual"
+            else "auto")
+        self._mission_layout_changed()
+
+    def _toggle_mission_sequence_pick(self):
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Sequence selection cancelled; the previously saved order is unchanged.")
+            return
+        if not self.mission_layout.ordered_real_weights():
+            self.mission_status.setText(
+                "Add at least one real weight before setting a visit sequence.")
+            return
+        self._sequence_pick_active = True
+        self._sequence_pick_ids = []
+        self.mission_canvas.sequence_pick_active = True
+        self.mission_canvas.sequence_preview_order = []
+        self.mission_canvas.add_mode = None
+        self.mission_order_combo.setEnabled(False)
+        self.mission_set_sequence_button.setText("CANCEL SEQUENCE")
+        self._refresh_mission_weight_order()
+        self.mission_status.setText(
+            "SET SEQUENCE: click each real weight marker on the map in the "
+            f"desired order (0/{len(self.mission_layout.ordered_real_weights())}).")
+        self.mission_canvas.update()
+
+    def _cancel_mission_sequence(self, message):
+        self._sequence_pick_active = False
+        self._sequence_pick_ids = []
+        self.mission_canvas.sequence_pick_active = False
+        self.mission_canvas.sequence_preview_order = []
+        self.mission_order_combo.setEnabled(True)
+        self.mission_set_sequence_button.setText("SET SEQUENCE")
+        self._refresh_mission_weight_order()
+        self.mission_status.setText(message)
+        self.mission_canvas.update()
+
+    def _sequence_weight_clicked(self, target_id):
+        if not self._sequence_pick_active:
+            return
+        weight = next((item for item in self.mission_layout.weights
+                       if str(item["id"]) == str(target_id) and
+                       not item.get("dummy")), None)
+        if weight is None:
+            return
+        if any(str(existing) == str(weight["id"])
+               for existing in self._sequence_pick_ids):
+            self.mission_status.setText(
+                "That weight is already in the sequence; click a different real weight.")
+            return
+        self._sequence_pick_ids.append(weight["id"])
+        self.mission_canvas.sequence_preview_order = list(self._sequence_pick_ids)
+        self.mission_canvas.selected_id = weight["id"]
+        self._refresh_mission_weight_order()
+        for index in range(self.mission_order_list.count()):
+            row = self.mission_order_list.item(index)
+            if str(row.data(Qt.ItemDataRole.UserRole)) == str(weight["id"]):
+                self.mission_order_list.setCurrentRow(index)
+                break
+        self._mission_selection_changed(weight["id"])
+        self.mission_canvas.update()
+
+        count = len(self.mission_layout.ordered_real_weights())
+        picked = len(self._sequence_pick_ids)
+        if picked == count:
+            self.mission_layout.set_target_order(self._sequence_pick_ids)
+            self.mission_layout.order_mode = "manual"
+            self._sequence_pick_active = False
+            self._sequence_pick_ids = []
+            self.mission_canvas.sequence_pick_active = False
+            self.mission_canvas.sequence_preview_order = []
+            self.mission_order_combo.blockSignals(True)
+            self.mission_order_combo.setCurrentIndex(1)
+            self.mission_order_combo.blockSignals(False)
+            self.mission_order_combo.setEnabled(True)
+            self.mission_set_sequence_button.setText("SET SEQUENCE")
+            self._mission_layout_changed()
+            self.mission_status.setText(
+                f"Manual visit sequence saved for {count} weights. Click PLAN ROUTE "
+                "to calculate a safe path in that order.")
+            self.mission_canvas.update()
+            return
+        self.mission_status.setText(
+            f"Visit sequence: {picked}/{count}. Click the next weight in your order.")
+
+    def _refresh_mission_weight_order(self):
+        if not hasattr(self, "mission_order_list"):
+            return
+        selected_id = None
+        current = self.mission_order_list.currentItem()
+        if current is not None:
+            selected_id = current.data(Qt.ItemDataRole.UserRole)
+        weights = self.mission_layout.ordered_real_weights()
+        if self._sequence_pick_active:
+            weights_by_id = {str(weight["id"]): weight for weight in weights}
+            weights = [weights_by_id[str(target_id)]
+                       for target_id in self._sequence_pick_ids
+                       if str(target_id) in weights_by_id]
+        elif self.mission_layout.order_mode == "auto" and self.mission_layout.route:
+            remaining = {str(weight["id"]): weight for weight in weights}
+            planned = []
+            for point in self.mission_layout.route:
+                if not point.get("target") or not remaining:
+                    continue
+                nearest = min(
+                    remaining.values(),
+                    key=lambda weight: math.hypot(
+                        weight["x"] - point["x"], weight["y"] - point["y"]),
+                )
+                planned.append(nearest)
+                remaining.pop(str(nearest["id"]), None)
+            weights = planned + list(remaining.values())
+        self.mission_order_list.blockSignals(True)
+        self.mission_order_list.clear()
+        for index, weight in enumerate(weights, start=1):
+            row = QListWidgetItem(
+                f"{index}. Weight #{weight['id']}  "
+                f"({weight['x']:.0f}, {weight['y']:.0f} mm)")
+            row.setData(Qt.ItemDataRole.UserRole, weight["id"])
+            self.mission_order_list.addItem(row)
+            if str(weight["id"]) == str(selected_id):
+                self.mission_order_list.setCurrentItem(row)
+        if self.mission_order_list.currentRow() < 0 and weights:
+            self.mission_order_list.setCurrentRow(0)
+        self.mission_order_list.blockSignals(False)
+        manual = self.mission_layout.order_mode == "manual"
+        self.mission_order_list.setEnabled(
+            (manual or self._sequence_pick_active) and bool(weights))
+        self.mission_set_sequence_button.setEnabled(
+            bool(self.mission_layout.ordered_real_weights()))
+
+    def _mission_order_selection_changed(self, current, _previous):
+        if current is None or not hasattr(self, "mission_canvas"):
+            return
+        ident = current.data(Qt.ItemDataRole.UserRole)
+        self.mission_canvas.selected_id = ident
+        self._mission_selection_changed(ident)
+        self.mission_canvas.update()
 
     def _mission_dummy_extra_changed(self, value):
         self.mission_layout.dummy_clearance_mm = float(value)
@@ -3065,13 +3337,15 @@ class ArenaView(QWidget):
         self.mission_layout.SAFETY_MARGIN_MM = self.navigation_tuning_controls[
             "wall_clearance_mm"].value()
         if self.mission_layout.plan():
+            self._refresh_mission_weight_order()
             target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
             length = MissionLayout._path_length(
                 [(self.mission_layout.start["x"], self.mission_layout.start["y"])] +
                 [(point["x"], point["y"]) for point in self.mission_layout.route]
             )
             self.mission_status.setText(
-                f"Route ready: {target_count} real weights, {len(self.mission_layout.route)} waypoints, "
+                f"Route ready ({'manual' if self.mission_layout.order_mode == 'manual' else 'automatic'} order): "
+                f"{target_count} real weights, {len(self.mission_layout.route)} waypoints, "
                 f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
             )
         else:

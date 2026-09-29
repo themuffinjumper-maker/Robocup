@@ -238,6 +238,23 @@ namespace Tof8x8Config {
 
 } // namespace Tof8x8Config
 
+// ============================================================
+// HOME UNLOAD SHAKE CONFIG
+// ============================================================
+// Three complete forward/back cycles (six encoder-measured legs) are used
+// to shake collected weights out after the storage gate opens.
+namespace HomeUnloadConfig {
+
+    constexpr uint8_t SHAKE_CYCLES = 3;
+    constexpr uint8_t FIRST_SHAKE_PHASE = 2;
+    constexpr uint8_t SHAKE_LEG_COUNT = SHAKE_CYCLES * 2;
+    constexpr uint8_t LAST_SHAKE_PHASE = FIRST_SHAKE_PHASE + SHAKE_LEG_COUNT - 1;
+    constexpr int16_t SHAKE_SPEED_PERCENT = 100;
+    constexpr float SHAKE_LEG_TRAVEL_MM = 90.0f;
+    constexpr uint16_t DIRECTION_SETTLE_MS = 100;
+
+} // namespace HomeUnloadConfig
+
 
 // ============================================================
 // IR SENSOR CONFIG

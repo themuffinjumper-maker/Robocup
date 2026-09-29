@@ -50,6 +50,7 @@ private:
     LocalCompetition localCompetition_;
     bool localRunActive_ = false;
     bool localMissionReturning_ = false;
+    uint16_t localCompetitionSortingSerial_ = 0;
     char localCompetitionStatus_[24] = "DISABLED";
 
     bool debugMode_ = false;
@@ -456,7 +457,7 @@ private:
     uint32_t missionDockPhaseStartedMs_ = 0;
     uint32_t missionDockNearWallSinceMs_ = 0;
     bool missionDockAligned_ = false;
-    uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, 2..5 shake legs
+    uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, then configured shake legs
     uint32_t missionUnloadPhaseStartedMs_ = 0;
     int32_t missionUnloadStartEncoder1_ = 0;
     int32_t missionUnloadStartEncoder2_ = 0;
