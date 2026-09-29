@@ -182,6 +182,7 @@ private:
     bool aioExpanderReady_ = false;
     bool aio9ButtonRawHigh_ = false;
     uint32_t lastAio9ButtonSampleMs_ = 0;
+    uint32_t lastAio9ExpanderRetryMs_ = 0;
     uint8_t ultrasoundSensorCount_ = 0;
     char ultrasoundSensorNames_[MAX_ULTRASOUND_SENSORS][25] = {};
     UltrasoundSensor ultrasoundSensors_[MAX_ULTRASOUND_SENSORS];
@@ -218,6 +219,7 @@ private:
     uint32_t lastMotionSampleMs_ = 0;
     bool lastImuSampleValid_ = false;
     uint16_t navigationFrontMm_ = 0;
+    uint16_t navigationHomeFrontTofMm_ = 0;
     uint16_t navigationLeftMm_ = 0;
     uint16_t navigationRightMm_ = 0;
     uint32_t navigationMotionStartedMs_ = 0;
@@ -312,7 +314,7 @@ private:
     struct MissionWaypoint {
         int16_t xMm = 0;
         int16_t yMm = 0;
-        uint8_t flags = 0;  // bit 0 = target, bit 2 = reverse-dock finish
+        uint8_t flags = 0;  // bit 0 = target, bit 2 = reverse dock, bit 3 = gap-centre transit
     };
     MissionWaypoint missionWaypoints_[MAX_MISSION_WAYPOINTS] = {};
     uint8_t missionWaypointCount_ = 0;
@@ -449,7 +451,10 @@ private:
     bool missionUltrasoundGeometryValid_ = false;
     bool missionReturnHome_ = false;
     bool missionAutoReturnHome_ = false;
+    uint8_t missionDockPhase_ = 0; // 0 approach wall, 1 turn, 2 retreat clear of wall
     uint32_t missionDockTurnStartedMs_ = 0;
+    uint32_t missionDockPhaseStartedMs_ = 0;
+    uint32_t missionDockNearWallSinceMs_ = 0;
     bool missionDockAligned_ = false;
     uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, 2..5 shake legs
     uint32_t missionUnloadPhaseStartedMs_ = 0;
