@@ -208,6 +208,29 @@ void BluetoothDebugWorkflow::update()
     updateDrumJamRecovery(now);
     for (uint8_t i = 0; i < digitalInputCount_; ++i)
         digitalInputs_[i].update(now);
+    // The button must remain usable even if the AIO expander was not ready
+    // on the first I2C probe.  Retry only while it is unavailable; once found,
+    // keep the established active-HIGH/rising-edge trigger and pulldown.
+    if (LocalMissionConfig::ENABLED && !aioExpanderReady_ &&
+        now - lastAio9ExpanderRetryMs_ >= AioConfig::EXPANDER_RETRY_INTERVAL_MS)
+    {
+        lastAio9ExpanderRetryMs_ = now;
+        if (aioExpander_.begin(AioConfig::EXPANDER_I2C_ADDRESS, Wire))
+        {
+            aioExpander_.pinMode(AioConfig::TEST_BUTTON_PIN, INPUT);
+            aioExpander_.digitalWrite(AioConfig::TEST_BUTTON_PIN, LOW);
+            // Treat the recovered level as the idle baseline. A fresh LOW to
+            // HIGH transition is still required, so reconnecting a held
+            // button can never unexpectedly launch the robot.
+            aio9ButtonRawHigh_ =
+                aioExpander_.digitalRead(AioConfig::TEST_BUTTON_PIN) == HIGH;
+            localCompetition_.begin(aio9ButtonRawHigh_, now);
+            aioExpanderReady_ = true;
+            lastAio9ButtonSampleMs_ = now;
+            snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "ARMED");
+            link_.log("INFO", "AIO9 button expander recovered on SX1509 I2C0");
+        }
+    }
     if (aioExpanderReady_ &&
         now - lastAio9ButtonSampleMs_ >= AioConfig::TEST_BUTTON_SAMPLE_INTERVAL_MS)
     {
@@ -215,6 +238,11 @@ void BluetoothDebugWorkflow::update()
         aio9ButtonRawHigh_ =
             aioExpander_.digitalRead(AioConfig::TEST_BUTTON_PIN) == HIGH;
     }
+    // The AIO9 supervisor was being sampled above but never advanced here;
+    // without this call its debounced rising edge could not load/start a local
+    // mission (or enforce the local round timer). Keep it ahead of navigation
+    // so a newly accepted press starts the mission in this same update cycle.
+    updateLocalCompetition();
     updateArmSorting(now);
     if (sortingGateTorqueOffAtMs_ != 0 &&
         static_cast<int32_t>(now - sortingGateTorqueOffAtMs_) >= 0)
@@ -407,7 +435,10 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionUltrasoundGeometryValid_ = false;
         missionReturnHome_ = false;
         missionAutoReturnHome_ = false;
+        missionDockPhase_ = 0;
         missionDockTurnStartedMs_ = 0;
+        missionDockPhaseStartedMs_ = 0;
+        missionDockNearWallSinceMs_ = 0;
         missionDockAligned_ = false;
         missionUnloadPhase_ = 0;
         missionHomeValid_ = false;
@@ -696,6 +727,11 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         }
         missionAutoReturnHome_ = false;
         missionUnloadPhase_ = 0;
+        missionDockPhase_ = 0;
+        missionDockTurnStartedMs_ = 0;
+        missionDockPhaseStartedMs_ = 0;
+        missionDockNearWallSinceMs_ = 0;
+        missionDockAligned_ = false;
         missionTurnDirection_ = 0;
         missionPointTurnActive_ = false;
         missionTurnFinishing_ = false;
@@ -1135,6 +1171,11 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         // B is the storage-release gate: keep it shut throughout travel.
         hx12kB_.setAngle(50.0f);
         missionUnloadPhase_ = 0;
+        missionDockPhase_ = 0;
+        missionDockTurnStartedMs_ = 0;
+        missionDockPhaseStartedMs_ = 0;
+        missionDockNearWallSinceMs_ = 0;
+        missionDockAligned_ = false;
         navigationState_ = navigationStrategy_ == 3 ? NAV_MISSION_TRACK : NAV_SEEK_WALL;
         navigationMotionStartedMs_ = millis();
         navigationHeadingReferenceDeg_ = imu_.headingDeg();
@@ -1197,7 +1238,10 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionLandmarkRecoveryMatches_ = 0;
         missionLandmarkRecoveryLastMs_ = 0;
         missionPoseRecoveryHoldUntilMs_ = 0;
+        missionDockPhase_ = 0;
         missionDockTurnStartedMs_ = 0;
+        missionDockPhaseStartedMs_ = 0;
+        missionDockNearWallSinceMs_ = 0;
         missionDockAligned_ = false;
         missionUnloadPhase_ = 0;
         missionPendingPickupWaypoint_ = 255;
@@ -1865,6 +1909,10 @@ void BluetoothDebugWorkflow::updateDrumJamRecovery(uint32_t now)
             return;
         if (filteredAdc >= drumJamBaselineAdc_ - rearmDropCounts)
         {
+            // A recovered reading is still required for RECOVERY_CLEAR_MS
+            // before the detector rearms for a new jam episode. Do not let a
+            // partial retry-confirmation interval carry across this recovery.
+            drumJamLowSinceMs_ = 0;
             if (drumJamClearSinceMs_ == 0)
                 drumJamClearSinceMs_ = now;
             if (now - drumJamClearSinceMs_ >= RECOVERY_CLEAR_MS)
@@ -1878,7 +1926,37 @@ void BluetoothDebugWorkflow::updateDrumJamRecovery(uint32_t now)
             }
         }
         else
+        {
             drumJamClearSinceMs_ = 0;
+
+            // The original kick can clear the obstruction only briefly, or
+            // the drum can remain stalled against the same load. After the
+            // normal post-kick cooldown, require a fresh full jam-confirm
+            // interval before issuing another identical reverse kick.
+            // Hysteresis-band readings reset this timer; they cannot trigger
+            // retries and must reach the rearm threshold to clear the latch.
+            if (filteredAdc <= drumJamBaselineAdc_ - jamDropCounts)
+            {
+                if (drumJamLowSinceMs_ == 0)
+                    drumJamLowSinceMs_ = now;
+                if (now - drumJamLowSinceMs_ >= drumJamConfirmTimeMs_)
+                {
+                    drumJamBackoffActive_ = true;
+                    drumJamBackoffUntilMs_ = now + drumJamBackoffTimeMs_;
+                    drumJamCooldownUntilMs_ = now + COOLDOWN_MS;
+                    drumJamLowSinceMs_ = 0;
+                    if (drumJamAttemptsInEpisode_ < 255U)
+                        ++drumJamAttemptsInEpisode_;
+                    ++drumJamRecoveryCount_;
+                    setDcMotor203Speed(drumJamBackoffPercent_,
+                                       drumJamBackoffPercent_);
+                    link_.log("WARNING",
+                              "Drum jam persisted after recovery; applying another configured reverse kick");
+                }
+            }
+            else
+                drumJamLowSinceMs_ = 0;
+        }
         return;
     }
 
@@ -2076,6 +2154,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.active"] = navigationActive_;
     data["navigation.state"] = navigationState_;
     data["navigation.front_mm"] = navigationFrontMm_;
+    data["navigation.home_front_tof_mm"] = navigationHomeFrontTofMm_;
     data["navigation.matrix_wall_mm"] = navigationMatrixWallMm_;
     data["navigation.left_mm"] = navigationLeftMm_;
     data["navigation.right_mm"] = navigationRightMm_;
@@ -2165,7 +2244,9 @@ void BluetoothDebugWorkflow::sendTelemetry()
         missionWallReverseActive_ ? "reversing_from_wall" :
         missionReturnHome_ && missionWaypointIndex_ < missionWaypointCount_ &&
             (missionWaypoints_[missionWaypointIndex_].flags & 0x04) != 0
-            ? "backing_into_home" :
+            ? (missionDockPhase_ == 0 ? "entering_home_front_first" :
+               missionDockPhase_ == 1 ? "turning_around_at_home" :
+                                        "retreating_from_home_wall") :
         missionReturnHome_ ? "returning_home" :
         missionOuterReverseActive_ ? "reversing_to_center_weight" :
         missionOuterCueActive_ ? "checking_outer_weight_cue" :
@@ -2193,6 +2274,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.targets_visited"] = missionTargetsVisited_;
     data["mission.returning_home"] = missionReturnHome_ && navigationActive_;
     data["mission.unload_phase"] = missionUnloadPhase_;
+    data["mission.dock_phase"] = missionDockPhase_;
     data["mission.target_count"] = missionTargetCount_;
     data["mission.pose_x_mm"] = missionPoseXmm_;
     data["mission.pose_y_mm"] = missionPoseYmm_;
@@ -3227,6 +3309,11 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionTofRecoveryHold_ = false;
     missionWeightVectorActive_ = false;
     missionUnloadPhase_ = 0;
+    missionDockPhase_ = 0;
+    missionDockTurnStartedMs_ = 0;
+    missionDockPhaseStartedMs_ = 0;
+    missionDockNearWallSinceMs_ = 0;
+    missionDockAligned_ = false;
     missionCollectionFollowThroughUntilMs_ = 0;
     missionVerifyPhase_ = 0;
     missionInnerWeightLocked_ = false;
@@ -3514,6 +3601,8 @@ void BluetoothDebugWorkflow::updateNavigation()
     static uint32_t recoverySideLastGoodMs[2] = {};
 
     uint16_t front = 0xFFFF, left = 0xFFFF, right = 0xFFFF;
+    uint16_t homeFrontTof = 0xFFFF;
+    uint8_t homeFrontTofCount = 0;
     auto includeMinimum = [](uint16_t& target, int value, int maximum = 3500) {
         if (value >= 30 && value <= maximum)
             target = min(target, static_cast<uint16_t>(value));
@@ -3542,6 +3631,13 @@ void BluetoothDebugWorkflow::updateNavigation()
             frontCandidates[frontCandidateCount++] = static_cast<uint16_t>(value);
         else
             outerTopFallback = min(outerTopFallback, static_cast<uint16_t>(value));
+        if ((strcmp(tofSensorNames_[i], "top_mid_left") == 0 ||
+             strcmp(tofSensorNames_[i], "top_mid_right") == 0) &&
+            tofLastSampleMs_[i] != 0 && now - tofLastSampleMs_[i] <= 400U)
+        {
+            homeFrontTof = min(homeFrontTof, static_cast<uint16_t>(value));
+            ++homeFrontTofCount;
+        }
     }
     if (frontCandidateCount == 0 && outerTopFallback != 0xFFFF)
         frontCandidates[frontCandidateCount++] = outerTopFallback;
@@ -3898,6 +3994,8 @@ void BluetoothDebugWorkflow::updateNavigation()
     }
 
     navigationFrontMm_ = front == 0xFFFF ? 0 : front;
+    navigationHomeFrontTofMm_ = homeFrontTofCount == 0 || homeFrontTof == 0xFFFF
+        ? 0 : homeFrontTof;
     navigationLeftMm_ = left == 0xFFFF ? 0 : left;
     navigationRightMm_ = right == 0xFFFF ? 0 : right;
     const bool rawFrontBlocked = front != 0xFFFF && front < FRONT_AVOID_MM;
@@ -4595,12 +4693,14 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             return true;
         };
-        // Match the desktop planner: wall clearance is measured from the
-        // robot edge and is never silently enlarged by gap-margin settings.
-        const float mapClearanceMm = missionReturnHome_
-            ? 0.5f * static_cast<float>(navigationRobotWidthMm_) + 10.0f
-            : 0.5f * static_cast<float>(navigationRobotWidthMm_) +
-              static_cast<float>(navigationWallClearanceMm_);
+        // Keep transit clearance at the chassis half-width plus the selected
+        // wall margin so a measured passage remains usable. A turnaround
+        // waypoint gets the larger rotating-footprint check separately; using
+        // that turn radius for every segment made the mapped gap look too
+        // narrow and sent the return route on a wide, off-centre detour.
+        const float mapClearanceMm =
+            0.5f * static_cast<float>(navigationRobotWidthMm_) +
+            static_cast<float>(navigationWallClearanceMm_);
         auto pointFree = [&](float x, float y) -> bool {
             return pointFreeAt(x, y, mapClearanceMm);
         };
@@ -4620,6 +4720,228 @@ void BluetoothDebugWorkflow::updateNavigation()
         auto segmentFree = [&](float x0, float y0, float x1, float y1) -> bool {
             return segmentFreeAt(x0, y0, x1, y1, mapClearanceMm);
         };
+
+        // Find the centre of a usable opening between two mapped walls when
+        // that opening lies on the route segment.  This keeps both the first
+        // departure leg and the return leg aimed through the actual passage,
+        // instead of merely routing around the inflated wall corners.
+        auto findMapGapCenterNearSegment = [&](float fromX, float fromY,
+                                                float toX, float toY,
+                                                float& gapX,
+                                                float& gapY,
+                                                float& axisX,
+                                                float& axisY) -> bool {
+            const float legX = toX - fromX;
+            const float legY = toY - fromY;
+            const float legLength = hypotf(legX, legY);
+            if (legLength < 1.0f) return false;
+
+            float bestScore = 1.0e9f;
+            bool found = false;
+            for (uint8_t i = 0; i < missionFeatureCount_; ++i)
+            {
+                const MissionFeature& first = missionFeatures_[i];
+                if (first.kind != 1) continue;
+                float firstMinX = first.x0, firstMaxX = first.x1;
+                float firstMinY = first.y0, firstMaxY = first.y1;
+                if (first.rotatedWall)
+                {
+                    firstMinX = firstMinY = 1.0e9f;
+                    firstMaxX = firstMaxY = -1.0e9f;
+                    const float angle = first.rotationDeg * DEG_TO_RAD;
+                    for (const int8_t sx : {-1, 1})
+                        for (const int8_t sy : {-1, 1})
+                        {
+                            const float x = first.wallX + sx * 300.0f * cosf(angle) -
+                                sy * 65.0f * sinf(angle);
+                            const float y = first.wallY + sx * 300.0f * sinf(angle) +
+                                sy * 65.0f * cosf(angle);
+                            firstMinX = min(firstMinX, x);
+                            firstMaxX = max(firstMaxX, x);
+                            firstMinY = min(firstMinY, y);
+                            firstMaxY = max(firstMaxY, y);
+                        }
+                }
+
+                for (uint8_t j = i + 1; j < missionFeatureCount_; ++j)
+                {
+                    const MissionFeature& second = missionFeatures_[j];
+                    if (second.kind != 1) continue;
+                    float secondMinX = second.x0, secondMaxX = second.x1;
+                    float secondMinY = second.y0, secondMaxY = second.y1;
+                    if (second.rotatedWall)
+                    {
+                        secondMinX = secondMinY = 1.0e9f;
+                        secondMaxX = secondMaxY = -1.0e9f;
+                        const float angle = second.rotationDeg * DEG_TO_RAD;
+                        for (const int8_t sx : {-1, 1})
+                            for (const int8_t sy : {-1, 1})
+                            {
+                                const float x = second.wallX + sx * 300.0f * cosf(angle) -
+                                    sy * 65.0f * sinf(angle);
+                                const float y = second.wallY + sx * 300.0f * sinf(angle) +
+                                    sy * 65.0f * cosf(angle);
+                                secondMinX = min(secondMinX, x);
+                                secondMaxX = max(secondMaxX, x);
+                                secondMinY = min(secondMinY, y);
+                                secondMaxY = max(secondMaxY, y);
+                            }
+                    }
+
+                    float nearFirstX, nearSecondX;
+                    float gapXSeparation = 0.0f;
+                    if (firstMaxX < secondMinX)
+                    {
+                        nearFirstX = firstMaxX;
+                        nearSecondX = secondMinX;
+                        gapXSeparation = secondMinX - firstMaxX;
+                    }
+                    else if (secondMaxX < firstMinX)
+                    {
+                        nearFirstX = firstMinX;
+                        nearSecondX = secondMaxX;
+                        gapXSeparation = firstMinX - secondMaxX;
+                    }
+                    else
+                    {
+                        nearFirstX = nearSecondX = 0.5f *
+                            (max(firstMinX, secondMinX) + min(firstMaxX, secondMaxX));
+                    }
+
+                    float nearFirstY, nearSecondY;
+                    float gapYSeparation = 0.0f;
+                    if (firstMaxY < secondMinY)
+                    {
+                        nearFirstY = firstMaxY;
+                        nearSecondY = secondMinY;
+                        gapYSeparation = secondMinY - firstMaxY;
+                    }
+                    else if (secondMaxY < firstMinY)
+                    {
+                        nearFirstY = firstMinY;
+                        nearSecondY = secondMaxY;
+                        gapYSeparation = firstMinY - secondMaxY;
+                    }
+                    else
+                    {
+                        nearFirstY = nearSecondY = 0.5f *
+                            (max(firstMinY, secondMinY) + min(firstMaxY, secondMaxY));
+                    }
+
+                    const float separation = hypotf(gapXSeparation, gapYSeparation);
+                    if (separation < 1.0f || separation > 1400.0f) continue;
+                    const float candidateX = 0.5f * (nearFirstX + nearSecondX);
+                    const float candidateY = 0.5f * (nearFirstY + nearSecondY);
+                    if (!pointFreeAt(candidateX, candidateY, mapClearanceMm))
+                        continue;
+
+                    const float relX = candidateX - fromX;
+                    const float relY = candidateY - fromY;
+                    const float along = (relX * legX + relY * legY) / legLength;
+                    if (along < 100.0f || along > legLength - 100.0f)
+                        continue;
+                    const float lateral = fabsf(relX * legY - relY * legX) /
+                        legLength;
+                    if (lateral > max(250.0f, min(500.0f, separation * 0.7f)))
+                        continue;
+
+                    const float score = lateral * 3.0f +
+                        separation * 0.1f +
+                        fabsf(along / legLength - 0.5f) * 120.0f;
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        gapX = candidateX;
+                        gapY = candidateY;
+                        axisX = -gapYSeparation / separation;
+                        axisY = gapXSeparation / separation;
+                        if (axisX * legX + axisY * legY < 0.0f)
+                        {
+                            axisX = -axisX;
+                            axisY = -axisY;
+                        }
+                        found = true;
+                    }
+                }
+            }
+            return found;
+        };
+
+        auto chooseHomeGapPassage = [&](float& entryX, float& entryY,
+                                         float& gapX, float& gapY,
+                                         float& exitX, float& exitY) -> bool {
+            if (!missionHomeValid_ || !missionPoseInitialised_)
+                return false;
+            float passageAxisX = 0.0f, passageAxisY = 0.0f;
+            if (!findMapGapCenterNearSegment(missionHomeXmm_, missionHomeYmm_,
+                    missionPoseXmm_, missionPoseYmm_, gapX, gapY,
+                    passageAxisX, passageAxisY))
+                return false;
+
+            // The robot must approach from the arena side, align to the
+            // opening normal, cross its centre, and continue clear on the
+            // home side before it turns toward the base.
+            const float homeDot = (missionHomeXmm_ - gapX) * passageAxisX +
+                                  (missionHomeYmm_ - gapY) * passageAxisY;
+            const float homeDirection = homeDot >= 0.0f ? 1.0f : -1.0f;
+            const float homeUx = homeDirection * passageAxisX;
+            const float homeUy = homeDirection * passageAxisY;
+            entryX = gapX - homeUx * 550.0f;
+            entryY = gapY - homeUy * 550.0f;
+            exitX = gapX + homeUx * 450.0f;
+            exitY = gapY + homeUy * 450.0f;
+            return pointFreeAt(entryX, entryY, mapClearanceMm) &&
+                   pointFreeAt(gapX, gapY, mapClearanceMm) &&
+                   pointFreeAt(exitX, exitY, mapClearanceMm) &&
+                   segmentFreeAt(entryX, entryY, gapX, gapY, mapClearanceMm) &&
+                   segmentFreeAt(gapX, gapY, exitX, exitY, mapClearanceMm) &&
+                   segmentFreeAt(exitX, exitY, missionHomeXmm_, missionHomeYmm_,
+                                 mapClearanceMm);
+        };
+
+        // Replace the first loose departure guide with a map-derived,
+        // perpendicular passage: line up on the home side, cross the gap
+        // centre, and continue straight through before following the mission.
+        if (!missionReturnHome_ && missionWaypointIndex_ == 0 &&
+            missionWaypointCount_ >= 2 &&
+            (missionWaypoints_[0].flags & (0x01 | 0x08)) == 0 &&
+            (missionWaypoints_[1].flags & (0x01 | 0x08)) == 0 &&
+            missionWaypointCount_ + 2U <= MAX_MISSION_WAYPOINTS)
+        {
+            float gapX = 0.0f, gapY = 0.0f;
+            float axisX = 0.0f, axisY = 0.0f;
+            const MissionWaypoint& first = missionWaypoints_[0];
+            const MissionWaypoint& second = missionWaypoints_[1];
+            if (findMapGapCenterNearSegment(first.xMm, first.yMm,
+                    second.xMm, second.yMm, gapX, gapY, axisX, axisY) &&
+                hypotf(gapX - first.xMm, gapY - first.yMm) > 140.0f &&
+                hypotf(gapX - second.xMm, gapY - second.yMm) > 140.0f)
+            {
+                const float entryX = gapX - axisX * 450.0f;
+                const float entryY = gapY - axisY * 450.0f;
+                const float exitX = gapX + axisX * 450.0f;
+                const float exitY = gapY + axisY * 450.0f;
+                if (pointFreeAt(entryX, entryY, mapClearanceMm) &&
+                    pointFreeAt(exitX, exitY, mapClearanceMm) &&
+                    segmentFreeAt(entryX, entryY, gapX, gapY, mapClearanceMm) &&
+                    segmentFreeAt(gapX, gapY, exitX, exitY, mapClearanceMm))
+                {
+                    for (int i = missionWaypointCount_ + 1; i >= 3; --i)
+                        missionWaypoints_[i] = missionWaypoints_[i - 2];
+                    missionWaypoints_[0].xMm = static_cast<int16_t>(roundf(entryX));
+                    missionWaypoints_[0].yMm = static_cast<int16_t>(roundf(entryY));
+                    missionWaypoints_[0].flags = 0;
+                    missionWaypoints_[1].xMm = static_cast<int16_t>(roundf(gapX));
+                    missionWaypoints_[1].yMm = static_cast<int16_t>(roundf(gapY));
+                    missionWaypoints_[1].flags = 0x08;
+                    missionWaypoints_[2].xMm = static_cast<int16_t>(roundf(exitX));
+                    missionWaypoints_[2].yMm = static_cast<int16_t>(roundf(exitY));
+                    missionWaypoints_[2].flags = 0;
+                    missionWaypointCount_ += 2;
+                    link_.log("INFO", "Initial route aligned to the mapped gap axis and crosses its centre");
+                }
+            }
+        }
 
         if (missionLaunchPhase_ != 0)
         {
@@ -5087,8 +5409,8 @@ void BluetoothDebugWorkflow::updateNavigation()
 
         if (missionUnloadPhase_ != 0)
         {
-            // The chassis is facing out of home. Shake only along the same
-            // mapped-clear line used for reverse docking; never turn here.
+            // The chassis now faces out of home. Shake along that same
+            // mapped-clear line; never turn while releasing the load.
             if (!lastImuSampleValid_ || fabsf(headingDelta(
                     imu_.headingDeg(), missionUnloadImuHeadingDeg_)) > 12.0f ||
                 hypotf(missionPoseXmm_ - missionUnloadHomeXmm_,
@@ -5164,109 +5486,111 @@ void BluetoothDebugWorkflow::updateNavigation()
             return;
         }
 
+        auto chooseHomeTurnaroundNearDock = [&](float& resultX,
+                                                 float& resultY) -> bool {
+            if (!missionHomeValid_) return false;
+            const float turnClearanceMm = hypotf(
+                0.5f * static_cast<float>(navigationRobotLengthMm_),
+                0.5f * static_cast<float>(navigationRobotWidthMm_)) + 10.0f;
+            const float dockClearanceMm =
+                0.5f * static_cast<float>(navigationRobotWidthMm_) + 10.0f;
+            const float inward = missionHomeXmm_ < 2450.0f ? 1.0f : -1.0f;
+            float bestScore = 1.0e9f;
+            bool found = false;
+            for (const int distance : {450, 550, 650, 750, 850, 950,
+                                       1150, 1350, 1550, 1750})
+                for (const int offset : {0, 100, -100, 200, -200, 300, -300})
+                {
+                    const float x = missionHomeXmm_ + inward * distance;
+                    const float y = missionHomeYmm_ + offset;
+                    if (!pointFreeAt(x, y, turnClearanceMm) ||
+                        !segmentFreeAt(x, y, missionHomeXmm_, missionHomeYmm_,
+                                       dockClearanceMm))
+                        continue;
+                    const float routeCost = hypotf(x - missionPoseXmm_,
+                                                   y - missionPoseYmm_);
+                    const float score = routeCost + 0.5f * fabsf(offset) +
+                        0.1f * fabsf(distance - 650.0f);
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        resultX = x;
+                        resultY = y;
+                        found = true;
+                    }
+                }
+            return found;
+        };
+
         if (!missionReturnHome_ && missionTargetsVisited_ >= missionTargetCount_ &&
             missionHomeValid_)
         {
-            if (missionWaypointIndex_ + 1 >= MAX_MISSION_WAYPOINTS)
+            if (missionWaypointIndex_ + 3U >= MAX_MISSION_WAYPOINTS)
             {
                 // Past waypoints are irrelevant once all sites are checked.
                 // Compact the route so a long detour history cannot remove
-                // the two slots needed for home staging and reverse docking.
+                // the aligned gap entry, centre, exit and dock slots.
                 missionWaypointIndex_ = 0;
                 missionWaypointCount_ = 0;
             }
-            // A staging point gives the robot room to turn before backing
-            // into home.  It needs normal chassis clearance, not an extra
-            // 70 mm margin that can reject every valid corridor in a narrow
-            // home area.
-            bool stageFound = false;
-            const float dockClearanceMm = 0.5f * navigationRobotWidthMm_ + 10.0f;
-            const float inward = missionHomeXmm_ < 2450 ? 1.0f : -1.0f;
-            for (const int distance : {750, 950, 1150, 1350, 1550, 1750})
+            uint8_t dockIndex = missionWaypointIndex_;
+            float gapX = 0.0f, gapY = 0.0f;
+            float entryX = 0.0f, entryY = 0.0f;
+            float exitX = 0.0f, exitY = 0.0f;
+            if (chooseHomeGapPassage(entryX, entryY, gapX, gapY,
+                                     exitX, exitY))
             {
-                if (stageFound) break;
-                for (const int offset : {0, 100, -100, 200, -200})
-                {
-                    const float stageX = missionHomeXmm_ + inward * distance;
-                    const float stageY = missionHomeYmm_ + offset;
-                    if (!pointFreeAt(stageX, stageY, mapClearanceMm) ||
-                        !segmentFreeAt(stageX, stageY, missionHomeXmm_,
-                                       missionHomeYmm_, dockClearanceMm))
-                        continue;
-                    missionWaypoints_[missionWaypointIndex_].xMm =
-                        static_cast<int16_t>(stageX);
-                    missionWaypoints_[missionWaypointIndex_].yMm =
-                        static_cast<int16_t>(stageY);
-                    missionWaypoints_[missionWaypointIndex_].flags = 0;
-                    stageFound = true;
-                    break;
-                }
+                missionWaypoints_[missionWaypointIndex_].xMm =
+                    static_cast<int16_t>(roundf(entryX));
+                missionWaypoints_[missionWaypointIndex_].yMm =
+                    static_cast<int16_t>(roundf(entryY));
+                missionWaypoints_[missionWaypointIndex_].flags = 0;
+                missionWaypoints_[missionWaypointIndex_ + 1].xMm =
+                    static_cast<int16_t>(roundf(gapX));
+                missionWaypoints_[missionWaypointIndex_ + 1].yMm =
+                    static_cast<int16_t>(roundf(gapY));
+                missionWaypoints_[missionWaypointIndex_ + 1].flags = 0x08;
+                missionWaypoints_[missionWaypointIndex_ + 2].xMm =
+                    static_cast<int16_t>(roundf(exitX));
+                missionWaypoints_[missionWaypointIndex_ + 2].yMm =
+                    static_cast<int16_t>(roundf(exitY));
+                missionWaypoints_[missionWaypointIndex_ + 2].flags = 0;
+                dockIndex += 3;
+                link_.log("INFO", "Home route aligned north of the gap and will cross straight through its centre");
             }
-            if (!stageFound)
+            else
             {
-                for (const int distance : {750, 950, 1150, 1350, 1550, 1750})
+                float stageX = 0.0f, stageY = 0.0f;
+                if (chooseHomeTurnaroundNearDock(stageX, stageY))
                 {
-                    if (stageFound) break;
-                    for (const int angleDeg : {20, -20, 35, -35, 50, -50,
-                                               65, -65, 80, -80})
+                    missionWaypoints_[missionWaypointIndex_].xMm =
+                        static_cast<int16_t>(roundf(stageX));
+                    missionWaypoints_[missionWaypointIndex_].yMm =
+                        static_cast<int16_t>(roundf(stageY));
+                    missionWaypoints_[missionWaypointIndex_].flags = 0;
+                    ++dockIndex;
+                    link_.log("WARNING", "Mapped gap unavailable; routing to a clear fallback approach before home");
+                }
+                else
+                {
+                    setDrive(0, 0);
+                    if (missionBlockedSinceMs_ == 0)
                     {
-                        const float angle = angleDeg * DEG_TO_RAD;
-                        const float stageX = missionHomeXmm_ +
-                            inward * distance * cosf(angle);
-                        const float stageY = missionHomeYmm_ +
-                            distance * sinf(angle);
-                        if (!pointFreeAt(stageX, stageY, mapClearanceMm) ||
-                            !segmentFreeAt(stageX, stageY, missionHomeXmm_,
-                                           missionHomeYmm_, dockClearanceMm))
-                            continue;
-                        missionWaypoints_[missionWaypointIndex_].xMm =
-                            static_cast<int16_t>(roundf(stageX));
-                        missionWaypoints_[missionWaypointIndex_].yMm =
-                            static_cast<int16_t>(roundf(stageY));
-                        missionWaypoints_[missionWaypointIndex_].flags = 0;
-                        stageFound = true;
-                        break;
+                        missionBlockedSinceMs_ = now;
+                        link_.log("WARNING", "No clear home approach point yet; holding and retrying");
                     }
+                    return;
                 }
-            }
-            if (!stageFound)
-            {
-                // The map can be incomplete even though the live route to a
-                // clear staging point is usable.  Do not strand the robot at
-                // the last weight simply because the final reverse corridor
-                // has not been drawn yet; use a map-clear staging fallback
-                // and let normal live rerouting bring it there.
-                for (const int distance : {750, 950, 1150, 1350, 1550, 1750})
-                {
-                    const float stageX = missionHomeXmm_ + inward * distance;
-                    const float stageY = missionHomeYmm_;
-                    if (!pointFreeAt(stageX, stageY, mapClearanceMm))
-                        continue;
-                    missionWaypoints_[missionWaypointIndex_].xMm =
-                        static_cast<int16_t>(stageX);
-                    missionWaypoints_[missionWaypointIndex_].yMm =
-                        static_cast<int16_t>(stageY);
-                    missionWaypoints_[missionWaypointIndex_].flags = 0;
-                    stageFound = true;
-                    link_.log("WARNING", "Home dock corridor unverified; routing to map-clear staging fallback");
-                    break;
-                }
-            }
-            if (!stageFound)
-            {
-                setDrive(0, 0);
-                if (missionBlockedSinceMs_ == 0)
-                {
-                    missionBlockedSinceMs_ = now;
-                    link_.log("WARNING", "No map-clear home staging point yet; navigation remains active and will retry");
-                }
-                return;
             }
             missionBlockedSinceMs_ = 0;
-            missionWaypoints_[missionWaypointIndex_ + 1].xMm = missionHomeXmm_;
-            missionWaypoints_[missionWaypointIndex_ + 1].yMm = missionHomeYmm_;
-            missionWaypoints_[missionWaypointIndex_ + 1].flags = 4;
-            missionWaypointCount_ = missionWaypointIndex_ + 2;
+            missionWaypoints_[dockIndex].xMm = missionHomeXmm_;
+            missionWaypoints_[dockIndex].yMm = missionHomeYmm_;
+            missionWaypoints_[dockIndex].flags = 4;
+            missionWaypointCount_ = dockIndex + 1;
+            missionDockPhase_ = 0;
+            missionDockNearWallSinceMs_ = 0;
+            missionDockTurnStartedMs_ = 0;
+            missionDockAligned_ = false;
             missionReturnHome_ = true;
             missionAutoReturnHome_ = true;
             missionSearchWaypoint_ = 255;
@@ -5346,9 +5670,84 @@ void BluetoothDebugWorkflow::updateNavigation()
                 return;
             }
             if (missionReturnHome_ &&
+                (missionWaypoints_[missionWaypointIndex_].flags & 0x08) != 0)
+            {
+                float entryX = 0.0f, entryY = 0.0f;
+                float gapX = 0.0f, gapY = 0.0f;
+                float exitX = 0.0f, exitY = 0.0f;
+                if (missionWaypointIndex_ > 0 &&
+                    missionWaypointIndex_ + 2 < MAX_MISSION_WAYPOINTS &&
+                    chooseHomeGapPassage(entryX, entryY, gapX, gapY,
+                                         exitX, exitY))
+                {
+                    missionWaypoints_[missionWaypointIndex_ - 1].xMm =
+                        static_cast<int16_t>(roundf(entryX));
+                    missionWaypoints_[missionWaypointIndex_ - 1].yMm =
+                        static_cast<int16_t>(roundf(entryY));
+                    missionWaypoints_[missionWaypointIndex_].xMm =
+                        static_cast<int16_t>(roundf(gapX));
+                    missionWaypoints_[missionWaypointIndex_].yMm =
+                        static_cast<int16_t>(roundf(gapY));
+                    missionWaypoints_[missionWaypointIndex_ + 1].xMm =
+                        static_cast<int16_t>(roundf(exitX));
+                    missionWaypoints_[missionWaypointIndex_ + 1].yMm =
+                        static_cast<int16_t>(roundf(exitY));
+                    missionWaypoints_[missionWaypointIndex_ + 1].flags = 0;
+                    missionWaypoints_[missionWaypointIndex_ + 2].xMm =
+                        missionHomeXmm_;
+                    missionWaypoints_[missionWaypointIndex_ + 2].yMm =
+                        missionHomeYmm_;
+                    missionWaypoints_[missionWaypointIndex_ + 2].flags = 4;
+                    missionWaypointCount_ = missionWaypointIndex_ + 3;
+                    missionDockTurnStartedMs_ = 0;
+                    missionDockAligned_ = false;
+                    missionDockPhase_ = 0;
+                    missionDockNearWallSinceMs_ = 0;
+                    missionReroutePoseValid_ = false;
+                    missionLastRerouteMs_ = 0;
+                    missionAvoidPhase_ = 0;
+                    missionBlockedSinceMs_ = 0;
+                    link_.log("WARNING", "Return gap changed; realigned approach, centre crossing and home approach");
+                }
+                else if (missionBlockedSinceMs_ == 0)
+                {
+                    missionBlockedSinceMs_ = now;
+                    link_.log("WARNING", "Return gap is temporarily map-blocked; holding and retrying");
+                }
+                setDrive(0, 0);
+                return;
+            }
+            if (missionReturnHome_ &&
                 (missionWaypoints_[missionWaypointIndex_ + 1].flags & 0x04) != 0)
             {
-                stopNavigation("Home turnaround point is no longer map-clear");
+                // If a newly mapped obstacle blocks the selected turn point,
+                // choose another clear point beside the home corridor rather
+                // than turning beside a wall or cancelling the return.
+                float fartherStageX = 0.0f;
+                float fartherStageY = 0.0f;
+                const bool foundFurtherStage = chooseHomeTurnaroundNearDock(
+                    fartherStageX, fartherStageY);
+                if (foundFurtherStage)
+                {
+                    missionWaypoints_[missionWaypointIndex_].xMm =
+                        static_cast<int16_t>(roundf(fartherStageX));
+                    missionWaypoints_[missionWaypointIndex_].yMm =
+                        static_cast<int16_t>(roundf(fartherStageY));
+                    missionWaypoints_[missionWaypointIndex_].flags = 0;
+                    missionDockTurnStartedMs_ = 0;
+                    missionDockAligned_ = false;
+                    missionReroutePoseValid_ = false;
+                    missionLastRerouteMs_ = 0;
+                    missionAvoidPhase_ = 0;
+                    missionBlockedSinceMs_ = 0;
+                    link_.log("WARNING", "Home turn point blocked; selecting another map-clear turn area");
+                }
+                else if (missionBlockedSinceMs_ == 0)
+                {
+                    missionBlockedSinceMs_ = now;
+                    link_.log("WARNING", "Home turn point untrusted; holding and retrying a farther gap-centred approach");
+                }
+                setDrive(0, 0);
                 return;
             }
             ++missionWaypointIndex_;
@@ -5362,9 +5761,8 @@ void BluetoothDebugWorkflow::updateNavigation()
         const float routeRangeMm = hypotf(routeWaypoint.xMm - missionPoseXmm_,
                                           routeWaypoint.yMm - missionPoseYmm_);
         // Map-reroute waypoints on the return leg are transit guides. The
-        // final staging point immediately before the reverse-dock waypoint
-        // is deliberately excluded: the robot must still reach that point
-        // to turn around in the planned clear area.
+        // final gap-exit point before the front-first dock waypoint is
+        // deliberately excluded so the robot finishes the straight crossing.
         const bool returnHomeTransitWaypoint = missionReturnHome_ &&
             missionAvoidPhase_ == 0 && !missionWeightVectorActive_ &&
             (routeWaypoint.flags & (0x01 | 0x04)) == 0 &&
@@ -5415,64 +5813,124 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
         if (missionReturnHome_ && (routeWaypoint.flags & 0x04) != 0)
         {
-            // The robot has no rear range sensor. Reverse only on the
-            // pre-verified straight corridor, with valid IMU/odometry and a
-            // bounded turn at the staging point. Do not let ordinary live
-            // front-obstacle avoidance point the chassis back into a wall.
-            if (missionWaypointIndex_ == 0 || !lastImuSampleValid_ ||
-                !segmentFreeAt(missionPoseXmm_, missionPoseYmm_,
-                               routeWaypoint.xMm, routeWaypoint.yMm,
-                               0.5f * navigationRobotWidthMm_ + 10.0f))
+            // Home docking is deliberately front-first: use the two forward
+            // point TOFs to stop close to the home wall, turn around in place,
+            // then roll 100 mm out so the rear storage gate has room to unload.
+            if (missionWaypointIndex_ == 0 || !lastImuSampleValid_)
             {
-                stopNavigation("Reverse home corridor or IMU no longer valid");
+                setDrive(0, 0);
+                if (missionBlockedSinceMs_ == 0)
+                {
+                    missionBlockedSinceMs_ = now;
+                    link_.log("WARNING", "Home dock waiting for a valid route predecessor and IMU heading");
+                }
                 return;
             }
-            const MissionWaypoint& stage = missionWaypoints_[missionWaypointIndex_ - 1];
-            if (missionDockTurnStartedMs_ == 0 &&
-                hypotf(stage.xMm - missionPoseXmm_,
-                       stage.yMm - missionPoseYmm_) > 200.0f)
-            {
-                stopNavigation("Robot is not at the clear home turnaround point");
-                return;
-            }
-            const float outwardArena = normaliseHeading(atan2f(
-                stage.yMm - routeWaypoint.yMm,
-                stage.xMm - routeWaypoint.xMm) * RAD_TO_DEG);
+            const MissionWaypoint& approachStart =
+                missionWaypoints_[missionWaypointIndex_ - 1];
+            const float inwardArena = normaliseHeading(atan2f(
+                routeWaypoint.yMm - approachStart.yMm,
+                routeWaypoint.xMm - approachStart.xMm) * RAD_TO_DEG);
+            const float outwardArena = normaliseHeading(inwardArena + 180.0f);
+            const float inwardImu = normaliseHeading(missionStartImuHeadingDeg_ +
+                headingDelta(missionStartArenaHeadingDeg_, inwardArena));
             const float outwardImu = normaliseHeading(missionStartImuHeadingDeg_ +
                 headingDelta(missionStartArenaHeadingDeg_, outwardArena));
             if (missionDockTurnStartedMs_ == 0)
             {
                 missionDockTurnStartedMs_ = now;
-                navigationTargetHeadingDeg_ = outwardImu;
+                missionDockPhase_ = 0;
+                missionDockNearWallSinceMs_ = 0;
+                missionDockAligned_ = false;
+                navigationTargetHeadingDeg_ = inwardImu;
                 navigationTurnSettledSinceMs_ = 0;
                 navigationTurnDirection_ = 0;
                 navigationTurnCoastUntilMs_ = now;
                 navigationTurnPulseStartedMs_ = now;
-                missionDockAligned_ = false;
-                link_.log("INFO", "Turning in clear staging area to reverse into home");
+                link_.log("INFO", "Home approach: aligning to the straight entry line");
             }
-            if (now - missionDockTurnStartedMs_ > 18000U)
+            if (now - missionDockTurnStartedMs_ > 45000U)
             {
-                stopNavigation("Reverse home docking timed out");
+                stopNavigation("Home docking sequence timed out");
                 return;
             }
-            if (!missionDockAligned_)
+
+            if (missionDockPhase_ == 0)
             {
-                if (!runHeadingTurn()) return;
-                missionDockAligned_ = true;
+                if (!missionDockAligned_)
+                {
+                    if (!runHeadingTurn()) return;
+                    missionDockAligned_ = true;
+                }
+                if (homeFrontTofCount == 0 || homeFrontTof == 0xFFFF)
+                {
+                    // Do not substitute a drifting pose estimate for the
+                    // requested physical wall stop. Wait for either fresh
+                    // forward TOF to recover before entering the base.
+                    setDrive(0, 0);
+                    missionDockNearWallSinceMs_ = 0;
+                    return;
+                }
+                constexpr uint16_t HOME_WALL_STOP_MM = 85;
+                if (homeFrontTof <= HOME_WALL_STOP_MM)
+                {
+                    setDrive(0, 0);
+                    if (missionDockNearWallSinceMs_ == 0)
+                        missionDockNearWallSinceMs_ = now;
+                    if (now - missionDockNearWallSinceMs_ >= 200U)
+                    {
+                        missionDockPhase_ = 1;
+                        missionDockTurnStartedMs_ = now;
+                        missionDockAligned_ = false;
+                        navigationTargetHeadingDeg_ = outwardImu;
+                        navigationTurnSettledSinceMs_ = 0;
+                        navigationTurnDirection_ = 0;
+                        navigationTurnCoastUntilMs_ = now;
+                        navigationTurnPulseStartedMs_ = now;
+                        link_.log("INFO", "Home wall confirmed by forward TOF; turning 180 degrees");
+                    }
+                    return;
+                }
+                missionDockNearWallSinceMs_ = 0;
+                driveOnHeading(inwardImu, 75);
+                return;
             }
-            // The storage gate is at the rear of the chassis.  Requiring the
-            // robot centre to reach within 110 mm of the home marker is too
-            // strict when odometry has drifted, even after its rear has
-            // physically entered the base.  Open/unload once the chassis
-            // length has crossed into the home area.
-            const float homeGateOpenRangeMm = max(
-                110.0f, static_cast<float>(navigationRobotLengthMm_) + 20.0f);
-            if (routeRangeMm <= homeGateOpenRangeMm)
+
+            if (missionDockPhase_ == 1)
+            {
+                if (!missionDockAligned_)
+                {
+                    if (!runHeadingTurn()) return;
+                    missionDockAligned_ = true;
+                    missionDockPhase_ = 2;
+                    missionDockPhaseStartedMs_ = now;
+                    missionUnloadStartEncoder1_ = encoders_.firstCount();
+                    missionUnloadStartEncoder2_ = encoders_.secondCount();
+                    link_.log("INFO", "Home turn complete; moving 100 mm away from the wall");
+                }
+                return;
+            }
+
+            const float retreatLeftMm = fabsf((encoders_.firstCount() -
+                missionUnloadStartEncoder1_) * ENCODER_1_MM_PER_COUNT);
+            const float retreatRightMm = fabsf((encoders_.secondCount() -
+                missionUnloadStartEncoder2_) * ENCODER_2_MM_PER_COUNT);
+            const float retreatMm = 0.5f * (retreatLeftMm + retreatRightMm);
+            const uint32_t retreatElapsedMs = now - missionDockPhaseStartedMs_;
+            if (retreatLeftMm > 160.0f || retreatRightMm > 160.0f ||
+                (retreatElapsedMs > 3500U && retreatMm < 55.0f))
+            {
+                stopNavigation("Home retreat did not track the encoders");
+                return;
+            }
+            if (retreatMm >= 100.0f)
             {
                 setDrive(0, 0);
                 ++missionWaypointIndex_;
+                missionDockPhase_ = 0;
                 missionDockTurnStartedMs_ = 0;
+                missionDockPhaseStartedMs_ = 0;
+                missionDockNearWallSinceMs_ = 0;
                 missionDockAligned_ = false;
                 missionUnloadHomeXmm_ = routeWaypoint.xMm;
                 missionUnloadHomeYmm_ = routeWaypoint.yMm;
@@ -5481,18 +5939,15 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionUnloadPhase_ = 1;
                 missionUnloadPhaseStartedMs_ = now;
                 hx12kB_.setAngle(10.0f);
-                link_.log("INFO", "Home reached; storage gate opening for two shake cycles");
+                link_.log("INFO", "Home docked; gate opening after 100 mm clearance retreat");
                 return;
             }
-            const float error = headingDelta(imu_.headingDeg(), outwardImu);
-            if (fabsf(error) > 12.0f)
+            if (homeFrontTofCount != 0 && homeFrontTof < 110U)
             {
-                stopNavigation("Reverse docking heading drifted outside tolerance");
+                setDrive(0, 0);
                 return;
             }
-            const int16_t correction = static_cast<int16_t>(constrain(
-                error * 0.4f, -5.0f, 5.0f));
-            setDrive(75 - correction, 75 + correction);
+            driveOnHeading(outwardImu, 65);
             return;
         }
         // The final approach can fit closer to a wall than the general
@@ -6222,8 +6677,8 @@ void BluetoothDebugWorkflow::updateNavigation()
         // Odometry/steering can pass close to a visibility-graph corner
         // without entering the tiny generic 80 mm arrival radius. Advance a
         // return transit point once a short direct connection to the next
-        // waypoint is proven map-clear; never apply this to the staging or
-        // reverse-dock points.
+        // waypoint is proven map-clear; never apply this to the final gap-exit
+        // or front-first dock points.
         const float returnTransitArrivalMm = max(
             180.0f, 0.75f * static_cast<float>(navigationRobotWidthMm_));
         if (returnHomeTransitWaypoint &&

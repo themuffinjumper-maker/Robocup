@@ -227,6 +227,7 @@ namespace AioConfig {
     constexpr uint8_t EXPANDER_I2C_ADDRESS = 0x3E;
     constexpr uint8_t TEST_BUTTON_PIN = 9;
     constexpr uint16_t TEST_BUTTON_SAMPLE_INTERVAL_MS = 50;
+    constexpr uint16_t EXPANDER_RETRY_INTERVAL_MS = 1000;
 
 } // namespace AioConfig
 
