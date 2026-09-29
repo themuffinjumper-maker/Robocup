@@ -17,7 +17,8 @@ from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -2753,6 +2754,13 @@ class ArenaView(QWidget):
             "QPushButton { background:#0369a1; color:white; font-weight:bold; padding:6px 12px; }")
         plan.clicked.connect(self._plan_mission_route)
         tools.addWidget(plan)
+        self.export_local_mission_button = QPushButton("EXPORT LOCAL FIRMWARE CONFIG")
+        self.export_local_mission_button.setToolTip(
+            "Save this arena, rotated obstacles, route, sensor poses, and navigation tuning "
+            "to PlatformIO/local_mission.json for the next Teensy build."
+        )
+        self.export_local_mission_button.clicked.connect(self._export_local_mission)
+        tools.addWidget(self.export_local_mission_button)
         page_layout.addLayout(tools)
 
         body = QHBoxLayout()
@@ -3252,6 +3260,95 @@ class ArenaView(QWidget):
                 int(round(ultrasound[name][field]))
                 for name in ("a", "b") for field in ("x", "y")]
         return payload
+
+    def _export_local_mission(self):
+        """Export exactly the planned mission data consumed by local firmware."""
+        if not self.navigation_tuning_controls:
+            QMessageBox.warning(self, "Local mission export",
+                                "Navigation tuning controls are not ready yet.")
+            return
+        if not self.mission_layout.route and not self._plan_mission_route():
+            return
+
+        mission = self.mission_layout.command_payload()
+        map_payload = self._mission_map_payload()
+        real_targets = sum(1 for item in self.mission_layout.weights
+                           if not item.get("dummy", False))
+        if real_targets == 0 or not mission["points"]:
+            QMessageBox.warning(
+                self, "Local mission export",
+                "Add at least one real weight and plan a route before exporting."
+            )
+            return
+        if len(mission["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS or \
+                len(map_payload["features"]) // 5 > 24:
+            QMessageBox.warning(
+                self, "Local mission export",
+                "This mission exceeds the Teensy's route/map capacity. Simplify the route or arena."
+            )
+            return
+
+        parameters = [{"name": "navigation.strategy", "value": 3}]
+        for name, control in self.navigation_tuning_controls.items():
+            # The drum recovery controls are deliberately excluded: that
+            # proven subsystem is protected from unrelated configuration edits.
+            if name.startswith("jam_"):
+                continue
+            parameters.append({
+                "name": "navigation." + name,
+                "value": int(control.value()),
+            })
+
+        export = {
+            "schema_version": 1,
+            "enabled": True,
+            "arena": {
+                "width_mm": int(MissionLayout.WIDTH_MM),
+                "height_mm": int(MissionLayout.HEIGHT_MM),
+            },
+            "map": map_payload,
+            "mission": mission,
+            "parameters": parameters,
+            "sensor_layout": {
+                "point_tofs": self.model.sensor_specs,
+                "ultrasounds": self.model.ultrasound_specs,
+                "matrix_tof": self.model.matrix_spec,
+            },
+        }
+        project_root = Path(__file__).resolve().parents[2]
+        output_path = project_root / "PlatformIO" / "local_mission.json"
+        try:
+            output_path.write_text(
+                json.dumps(export, indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Local mission export",
+                f"Could not write the firmware mission file:\n{exc}"
+            )
+            return
+
+        self.mission_status.setText(
+            f"Local mission exported to {output_path}. Build/upload the teensy40 "
+            "environment to embed it; firmware will remain idle until AIO9 rises HIGH."
+        )
+
+    def set_read_only_mode(self, enabled):
+        """Hide/disable arena-page controls that can send robot commands."""
+        enabled = bool(enabled)
+        for name in (
+            "start_run_button", "stop_run_button", "run_navigation_button",
+            "stop_navigation_button", "return_home_button", "run_motors_button",
+            "stop_motors_button", "open_gate_button", "close_gate_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not enabled)
+                button.setVisible(not enabled)
+        tuning = getattr(self, "navigation_tuning_tabs", None)
+        if tuning is not None:
+            tuning.setVisible(not enabled)
 
     def _return_home(self):
         latest = self.model.latest
@@ -3857,6 +3954,43 @@ class ArenaView(QWidget):
             ("ENCODER/IMU DISAGREEMENT: map translation held. "
              if m.encoder_imu_disagreement else "")
         )
+        firmware_localization = ""
+        firmware_confidence = _number(
+            m.latest.get("mission.localization_confidence"))
+        if firmware_confidence is not None and m.latest.get("mission.pose_live") is True:
+            confidence_pct = int(round(100.0 * max(0.0, min(1.0,
+                                                          firmware_confidence))))
+            encoder_yaw_valid = m.latest.get("mission.encoder_yaw_valid") is True
+            heading_ok = m.latest.get("mission.heading_agreement") is True
+            wheel_ok = m.latest.get("mission.wheel_travel_agreement") is True
+            distance_ok = m.latest.get("mission.distance_imu_confirmed") is True
+            encoder_motion = m.latest.get("mission.encoder_motion_detected") is True
+            single_wheel_fallback = (
+                m.latest.get("mission.single_wheel_distance_fallback") is True)
+            track_mm = _number(m.latest.get("mission.encoder_track_estimate_mm")) or 0.0
+            wheel_imbalance = _number(
+                m.latest.get("mission.encoder_wheel_imbalance"))
+            encoder_yaw_valid = track_mm >= 100.0
+            turn_status = ("encoder + IMU agree" if heading_ok else
+                           "encoder/IMU turn mismatch" if encoder_yaw_valid else
+                           "learning turn geometry")
+            distance_status = (
+                "encoder mismatch; using corroborated single-wheel distance"
+                if single_wheel_fallback else
+                "wheel-distance mismatch" if not wheel_ok else
+                f"wheel distances agree ({wheel_imbalance * 100:.0f}% imbalance)"
+                if wheel_imbalance is not None else "wheel distances agree")
+            motion_status = (
+                "IMU confirms travel" if distance_ok and encoder_motion else
+                "stationary" if distance_ok else
+                "waiting for IMU motion confirmation")
+            track_status = (f"; learned track {track_mm:.0f} mm"
+                            if encoder_yaw_valid else "")
+            firmware_localization = (
+                f"Robot localization: {confidence_pct}% confidence; "
+                f"{turn_status}; {distance_status}; {motion_status}"
+                f"{track_status}. "
+            )
         self._refresh_mission_weight_visibility()
         phase_names = {
             "idle": "IDLE / STOPPED",
@@ -3926,7 +4060,7 @@ class ArenaView(QWidget):
             f"{m.last_imu_system_status if m.last_imu_system_status is not None else '?'}/"
             f"{m.last_imu_system_error if m.last_imu_system_error_active is True else 'inactive'}; "
             f"self-test {'pass' if m.last_imu_self_test_passed is True else 'not confirmed'}. "
-            f"{m.last_source}. "
+            f"{m.last_source}. {firmware_localization}"
             f"Point TOF online: {online}/{len(m.sensor_specs)}; "
             f"ultrasound valid: {ultrasound_valid}/{len(m.ultrasound_specs)}; "
             f"8x8: {'ready' if m.last_matrix_available and m.last_matrix_valid else 'waiting/invalid'}. "

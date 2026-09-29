@@ -8,7 +8,9 @@
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
+#include <LocalCompetition.h>
 #include <RobotDebug.h>
+#include <SparkFunSX1509.h>
 #include <Tof.h>
 #include <Tof8x8.h>
 #include <UltrasoundSensor.h>
@@ -19,6 +21,9 @@ public:
 
     void begin();
     void update();
+    // Optional local-autonomy hook, deliberately called as one line from
+    // main.cpp so the whole competition supervisor can be unplugged easily.
+    void updateLocalCompetition();
 
 private:
     static constexpr uint8_t MAX_TOF_SENSORS = 8;
@@ -40,7 +45,12 @@ private:
     Hx12kServo hx12kD_;
     RobotDebug link_;
     Tof8x8 tof8x8_;
+    SX1509 aioExpander_;
     JsonDocument config_;
+    LocalCompetition localCompetition_;
+    bool localRunActive_ = false;
+    bool localMissionReturning_ = false;
+    char localCompetitionStatus_[24] = "DISABLED";
 
     bool debugMode_ = false;
     bool stopped_ = true;
@@ -169,6 +179,9 @@ private:
     uint8_t digitalInputCount_ = 0;
     char digitalInputNames_[MAX_DIGITAL_INPUTS][25] = {};
     DigitalInputSensor digitalInputs_[MAX_DIGITAL_INPUTS];
+    bool aioExpanderReady_ = false;
+    bool aio9ButtonRawHigh_ = false;
+    uint32_t lastAio9ButtonSampleMs_ = 0;
     uint8_t ultrasoundSensorCount_ = 0;
     char ultrasoundSensorNames_[MAX_ULTRASOUND_SENSORS][25] = {};
     UltrasoundSensor ultrasoundSensors_[MAX_ULTRASOUND_SENSORS];
@@ -317,6 +330,7 @@ private:
     uint32_t missionLaunchStartedMs_ = 0;
     int32_t missionLaunchEncoder1_ = 0;
     int32_t missionLaunchEncoder2_ = 0;
+    uint8_t missionLaunchRealignAttempts_ = 0;
     bool missionLaunchBlocked_ = false;
     float missionPoseXmm_ = 0.0f;
     float missionPoseYmm_ = 0.0f;
@@ -456,8 +470,6 @@ private:
     bool missionWallReverseNoProgress_ = false;
     bool missionWallRecoveryDetourRequested_ = false;
     int8_t missionWallRecoveryPreferredSide_ = 0;
-    uint16_t navigationClosePointTofMm_ = 0;
-    int8_t navigationClosePointTofSide_ = 0;
     uint32_t missionWallReverseStartedMs_ = 0;
     uint8_t missionWallReverseWaypoint_ = 255;
     uint8_t missionWallReverseRepeatCount_ = 0;
@@ -518,6 +530,9 @@ private:
     void handleMessage(JsonDocument& message);
     void handleCommand(JsonDocument& message);
     void handleParameter(JsonDocument& message);
+    bool loadLocalMission();
+    void requestLocalReturnHome();
+    void finishLocalCompetition();
     void sendDefinitions();
     void updateDefinitionBroadcast(uint32_t now);
     bool bluetoothPeerAlive(uint32_t now) const;
