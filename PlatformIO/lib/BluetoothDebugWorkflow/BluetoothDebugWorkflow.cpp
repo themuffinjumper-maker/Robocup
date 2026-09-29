@@ -447,6 +447,10 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionUltrasoundGeometryValid_ = false;
         missionReturnHome_ = false;
         missionAutoReturnHome_ = false;
+        localBlockTargetValid_ = false;
+        localBlockTargetEnroute_ = false;
+        localPostUnloadPhase_ = 0;
+        localPostUnloadStartedMs_ = 0;
         missionDockPhase_ = 0;
         missionDockTurnStartedMs_ = 0;
         missionDockPhaseStartedMs_ = 0;
@@ -668,6 +672,28 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         const int fallback = message["fallback_strategy"] | 0;
         const int homeX = message["home_x_mm"] | -1;
         const int homeY = message["home_y_mm"] | -1;
+        bool blockTargetValid = false;
+        int blockTargetX = 0;
+        int blockTargetY = 0;
+        if (!message["block_target"].isNull())
+        {
+            const JsonObjectConst blockTarget =
+                message["block_target"].as<JsonObjectConst>();
+            if (blockTarget.isNull())
+            {
+                link_.error("Block destination must contain x_mm and y_mm");
+                return;
+            }
+            blockTargetX = blockTarget["x_mm"] | -1;
+            blockTargetY = blockTarget["y_mm"] | -1;
+            if (blockTargetX < 0 || blockTargetX > 4900 ||
+                blockTargetY < 0 || blockTargetY > 2400)
+            {
+                link_.error("Block destination is outside the 4900 x 2400 mm arena");
+                return;
+            }
+            blockTargetValid = true;
+        }
         if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
             fallback < 0 || fallback > 2)
         {
@@ -702,6 +728,12 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         while (missionStartArenaHeadingDeg_ >= 360.0f) missionStartArenaHeadingDeg_ -= 360.0f;
         while (missionStartArenaHeadingDeg_ < 0.0f) missionStartArenaHeadingDeg_ += 360.0f;
         missionFallbackStrategy_ = static_cast<uint8_t>(fallback);
+        localBlockTargetValid_ = blockTargetValid;
+        localBlockTargetXmm_ = static_cast<int16_t>(blockTargetX);
+        localBlockTargetYmm_ = static_cast<int16_t>(blockTargetY);
+        localBlockTargetEnroute_ = false;
+        localPostUnloadPhase_ = 0;
+        localPostUnloadStartedMs_ = 0;
         missionWaypointCount_ = count;
         missionWaypointIndex_ = 0;
         missionTargetCount_ = targets;
@@ -2991,7 +3023,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
         const float ray = (missionArenaHeadingDeg_ + sensor.angleDeg) * DEG_TO_RAD;
         const float ux = cosf(ray), uy = sinf(ray);
         float nearest = 5000.0f;
-        // Slab intersection with physical walls; no-go home zones are not
+        // Slab intersection with physical walls; map exclusions are not
         // physical surfaces. Include the four real arena boundaries.
         auto intersect = [&](float x0, float y0, float x1, float y1) {
             float enter = -5000.0f, leave = 5000.0f;
@@ -5549,7 +5581,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             return found;
         };
 
-        if (!missionReturnHome_ && missionTargetsVisited_ >= missionTargetCount_ &&
+        if (!localBlockTargetEnroute_ && !missionReturnHome_ &&
+            missionTargetsVisited_ >= missionTargetCount_ &&
             missionHomeValid_)
         {
             if (missionWaypointIndex_ + 3U >= MAX_MISSION_WAYPOINTS)
@@ -5628,7 +5661,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             return;
         }
         if (missionWaypointIndex_ >= missionWaypointCount_ ||
-            (!missionReturnHome_ && missionTargetsVisited_ >= missionTargetCount_))
+            (!localBlockTargetEnroute_ && !missionReturnHome_ &&
+             missionTargetsVisited_ >= missionTargetCount_))
         {
             setDrive(0, 0);
             if (missionReturnHome_)
@@ -5637,6 +5671,54 @@ void BluetoothDebugWorkflow::updateNavigation()
                 {
                     if (localRunActive_)
                     {
+                        if (localBlockTargetValid_)
+                        {
+                            if (localPostUnloadPhase_ == 0)
+                            {
+                                localPostUnloadPhase_ = 1;
+                                localPostUnloadStartedMs_ = now;
+                                setDrive(0, 0);
+                                link_.log("INFO", "Home unload complete; holding 5 seconds before closing gate and heading to block destination");
+                                return;
+                            }
+                            if (localPostUnloadPhase_ == 1 &&
+                                now - localPostUnloadStartedMs_ < LOCAL_POST_UNLOAD_WAIT_MS)
+                            {
+                                setDrive(0, 0);
+                                return;
+                            }
+
+                            if (!pointFree(localBlockTargetXmm_, localBlockTargetYmm_))
+                            {
+                                link_.log("ERROR", "Block destination is inside a mapped obstacle/no-go clearance; local run stopping at home");
+                                finishLocalCompetition();
+                                return;
+                            }
+
+                            // Reuse the mission waypoint follower and its live
+                            // map rerouting for the post-unload destination.
+                            // It is not a weight target and must not trigger
+                            // another home-return transition.
+                            JsonDocument stopDrum;
+                            stopDrum["command"] = "dc_motor_203_stop";
+                            handleCommand(stopDrum);
+                            hx12kB_.setAngle(50.0f);
+                            missionReturnHome_ = false;
+                            missionAutoReturnHome_ = false;
+                            missionWaypointIndex_ = 0;
+                            missionWaypointCount_ = 1;
+                            missionWaypoints_[0].xMm = localBlockTargetXmm_;
+                            missionWaypoints_[0].yMm = localBlockTargetYmm_;
+                            missionWaypoints_[0].flags = 0;
+                            missionDockPhase_ = 0;
+                            missionUnloadPhase_ = 0;
+                            missionReroutePoseValid_ = false;
+                            missionLastRerouteMs_ = 0;
+                            localPostUnloadPhase_ = 2;
+                            localBlockTargetEnroute_ = true;
+                            link_.log("INFO", "Gate closed; following mapped route to the post-unload block destination");
+                            return;
+                        }
                         finishLocalCompetition();
                         return;
                     }
@@ -5666,6 +5748,12 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
                 stopNavigation("Return-home route complete; motors stopped");
                 missionReturnHome_ = false;
+                return;
+            }
+            if (localRunActive_ && localBlockTargetEnroute_)
+            {
+                link_.log("INFO", "Post-unload block destination reached");
+                finishLocalCompetition();
                 return;
             }
             navigationStrategy_ = missionFallbackStrategy_;

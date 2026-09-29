@@ -1180,6 +1180,7 @@ class MissionLayout:
         self.start = {"x": 325.0, "y": 325.0, "heading_deg": 0.0}
         self.weights = []
         self.obstacles = []
+        self.block_target = None
         self.route = []
         self.route_error = ""
         self._next_id = 1
@@ -1194,9 +1195,6 @@ class MissionLayout:
             return (0.0, 0.0, self.HOME_WIDTH_MM, self.HOME_HEIGHT_MM)
         return (0.0, self.HEIGHT_MM - self.HOME_HEIGHT_MM,
                 self.HOME_WIDTH_MM, self.HEIGHT_MM)
-
-    def no_go_home(self):
-        return self.home_rect("blue" if self.my_home == "green" else "green")
 
     def add_weight(self, x, y, dummy=False):
         item = {"id": self._id(), "x": float(x), "y": float(y),
@@ -1217,10 +1215,26 @@ class MissionLayout:
         self.route = []
         return item
 
+    def set_block_target(self, x, y):
+        """Set the one optional destination visited after home unloading."""
+        if self.block_target is None:
+            self.block_target = {"id": "block_target"}
+        self.block_target.update({
+            "x": max(0.0, min(self.WIDTH_MM, float(x))),
+            "y": max(0.0, min(self.HEIGHT_MM, float(y))),
+        })
+        self.route = []
+        return self.block_target
+
     def move_item(self, item_id, x, y):
         if item_id == "start":
             self.start["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
             self.start["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
+            self.route = []
+            return True
+        if item_id == "block_target" and self.block_target is not None:
+            self.block_target["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
+            self.block_target["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
             self.route = []
             return True
         for collection in (self.weights, self.obstacles):
@@ -1233,6 +1247,10 @@ class MissionLayout:
         return False
 
     def delete_item(self, item_id):
+        if item_id == "block_target" and self.block_target is not None:
+            self.block_target = None
+            self.route = []
+            return True
         for collection in (self.weights, self.obstacles):
             for index, item in enumerate(collection):
                 if item["id"] == item_id:
@@ -1302,8 +1320,6 @@ class MissionLayout:
         if (x < clearance or y < clearance or
                 x > self.WIDTH_MM - clearance or
                 y > self.HEIGHT_MM - clearance):
-            return True
-        if self._inside_rect(x, y, self._inflate_rect(self.no_go_home(), clearance)):
             return True
         for item in self.obstacles:
             if item["kind"] == "tube":
@@ -1636,15 +1652,19 @@ class MissionLayout:
             "home_x_mm": int(round((home[0] + home[2]) * 0.5)),
             "home_y_mm": int(round((home[1] + home[3]) * 0.5)),
             "fallback_strategy": int(self.fallback_strategy),
+            "block_target": (None if self.block_target is None else {
+                "x_mm": int(round(self.block_target["x"])),
+                "y_mm": int(round(self.block_target["y"])),
+            }),
             "points": points,
         }
 
     def map_payload(self):
         # Rectangles are deliberately compact: the Teensy command receive
-        # buffer is 768 bytes. Kind 0 features are forbidden zones (the other
-        # team's home and ramps); kind 1 features are physical landmarks.
+        # buffer is 768 bytes. Kind 0 features are forbidden zones (ramps);
+        # kind 1 features are physical landmarks.
         features = []
-        rectangles = [(self.no_go_home(), 0)]
+        rectangles = []
         rotated_walls = []
         for item in self.obstacles:
             if item["kind"] == "wall":
@@ -1674,6 +1694,7 @@ class MissionLayout:
             "start": self.start,
             "weights": self.weights,
             "obstacles": self.obstacles,
+            "block_target": self.block_target,
             "next_id": self._next_id,
         }
 
@@ -1699,6 +1720,15 @@ class MissionLayout:
         }
         self.weights = [dict(item) for item in data.get("weights", []) if isinstance(item, dict)]
         self.obstacles = [dict(item) for item in data.get("obstacles", []) if isinstance(item, dict)]
+        target = data.get("block_target")
+        if isinstance(target, dict) and "x" in target and "y" in target:
+            self.block_target = {
+                "id": "block_target",
+                "x": max(0.0, min(self.WIDTH_MM, float(target["x"]))),
+                "y": max(0.0, min(self.HEIGHT_MM, float(target["y"]))),
+            }
+        else:
+            self.block_target = None
         for item in self.obstacles:
             if item.get("kind") == "wall":
                 item["w"], item["h"] = self.DEFAULT_SIZES["wall"]
@@ -1833,6 +1863,9 @@ class MissionLayoutCanvas(QWidget):
                        for item in self.layout_model.weights]
         candidates += [(item["id"], item["x"], item["y"])
                        for item in self.layout_model.obstacles]
+        if self.layout_model.block_target is not None:
+            target = self.layout_model.block_target
+            candidates.append(("block_target", target["x"], target["y"]))
         if not candidates:
             return None
         ident, x, y = min(
@@ -1859,6 +1892,8 @@ class MissionLayoutCanvas(QWidget):
                 self.selected_id = self.layout_model.add_weight(x, y, False)["id"]
             elif self.add_mode == "dummy":
                 self.selected_id = self.layout_model.add_weight(x, y, True)["id"]
+            elif self.add_mode == "block_target":
+                self.selected_id = self.layout_model.set_block_target(x, y)["id"]
             else:
                 self.selected_id = self.layout_model.add_obstacle(self.add_mode, x, y)["id"]
             self.add_mode = None
@@ -1997,12 +2032,6 @@ class MissionLayoutCanvas(QWidget):
             p.drawRect(rect)
             p.setPen(QColor("#f8fafc"))
             p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-            if colour != model.my_home:
-                p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
-                p.setBrush(QColor(127, 29, 29, 90))
-                p.drawRect(rect)
-                p.drawText(rect.adjusted(0, 22, 0, 0),
-                           Qt.AlignmentFlag.AlignCenter, "NO-GO ZONE")
 
         if model.route:
             points = ([self._screen(model.start["x"], model.start["y"])] +
@@ -2061,6 +2090,23 @@ class MissionLayoutCanvas(QWidget):
                        (f"RAMP — NO-GO ZONE\n{size_text} mm"
                         if item["kind"] == "ramp" else
                         f"{item['kind'].upper()}\n{size_text} mm"))
+
+        if model.block_target is not None:
+            target = model.block_target
+            centre = self._screen(target["x"], target["y"])
+            selected = target["id"] == self.selected_id
+            p.setPen(QPen(QColor("#ffffff" if selected else "#fb7185"),
+                          3 if selected else 2))
+            p.setBrush(QColor("#be123c"))
+            p.drawPolygon(QPolygonF([
+                QPointF(centre.x(), centre.y() - 17),
+                QPointF(centre.x() + 17, centre.y()),
+                QPointF(centre.x(), centre.y() + 17),
+                QPointF(centre.x() - 17, centre.y()),
+            ]))
+            p.setPen(QColor("#fff1f2"))
+            p.drawText(QRectF(centre.x() + 20, centre.y() - 12, 185, 24),
+                       Qt.AlignmentFlag.AlignLeft, "POST-UNLOAD BLOCK")
 
         likely_weight = self._likely_visible_planned_weight()
         displayed_order = (
@@ -2824,8 +2870,14 @@ class ArenaView(QWidget):
         tools = QHBoxLayout()
         for label, mode in (("Set start", "start"), ("+ Weight", "weight"),
                             ("+ Dummy weight", "dummy"), ("+ Wall", "wall"),
-                            ("+ Ramp", "ramp"), ("+ Tube", "tube")):
+                            ("+ Ramp", "ramp"), ("+ Tube", "tube"),
+                            ("+ Block destination", "block_target")):
             button = QPushButton(label)
+            if mode == "block_target":
+                button.setToolTip(
+                    "Place or move the single optional post-unload destination. "
+                    "It runs after home unload/shaking and a 5-second pause. "
+                    "Choose a reachable point clear of walls and ramp obstacles.")
             button.clicked.connect(
                 lambda _checked=False, m=mode: self.mission_canvas.set_add_mode(m))
             tools.addWidget(button)
@@ -2951,8 +3003,12 @@ class ArenaView(QWidget):
             "three horizontal lines mark the quarter, midpoint, and three-quarter positions. "
             "Choose automatic ordering, or press SET SEQUENCE and click real weight markers "
             "in the desired order; Plan Route then plans a path through that sequence. "
+            "The optional POST-UNLOAD BLOCK marker is a single destination: after home "
+            "unloading/shaking, the robot waits 5 seconds with the gate open, closes it, "
+            "then navigates there. Place it at a reachable point clear of walls and ramps. "
             "Dummy clearance and wall clearance are both measured from the robot edge. "
-            "Walls/tubes use normal robot clearance; ramps and the opposing base are no-go zones. "
+            "Homes are shown for reference and are not no-go zones; ramps remain forbidden. "
+            "Walls/tubes use normal robot clearance. "
             "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
         guide.setWordWrap(True)
         inspector_layout.addWidget(guide)
@@ -2962,7 +3018,8 @@ class ArenaView(QWidget):
 
         self.mission_status = QLabel(
             "Pre-lay the arena: fixed border; green home top-left; blue home bottom-left. "
-            "The other home is NO-GO. Add real/dummy weights and obstacles, set START, then Plan Route.")
+            "Both homes are shown for reference. Add real/dummy weights and obstacles, set START, then Plan Route. "
+            "Use + Block destination for one optional post-unload destination.")
         self.mission_status.setWordWrap(True)
         page_layout.addWidget(self.mission_status)
         self._mission_selection_changed("start")
@@ -3015,6 +3072,8 @@ class ArenaView(QWidget):
             if obstacle is None:
                 if ident == "start":
                     label = "START"
+                elif ident == "block_target" and self.mission_layout.block_target is not None:
+                    label = "POST-UNLOAD BLOCK DESTINATION"
                 else:
                     weight = next(
                         (item for item in self.mission_layout.weights
@@ -3546,6 +3605,15 @@ class ArenaView(QWidget):
 
         mission = self.mission_layout.command_payload()
         map_payload = self._mission_map_payload()
+        block_target = self.mission_layout.block_target
+        if block_target is not None and self.mission_layout.blocked(
+                block_target["x"], block_target["y"]):
+            QMessageBox.warning(
+                self, "Local mission export",
+                "The post-unload block destination is inside a wall, ramp, obstacle, "
+                "or arena-edge clearance. Move it to a reachable point before exporting."
+            )
+            return
         real_targets = sum(1 for item in self.mission_layout.weights
                            if not item.get("dummy", False))
         if real_targets == 0 or not mission["points"]:

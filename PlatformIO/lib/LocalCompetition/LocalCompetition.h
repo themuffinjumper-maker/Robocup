@@ -111,7 +111,7 @@ public:
 
     static constexpr uint32_t ROUND_LIMIT_MS = 90000U;
     static constexpr uint32_t INPUT_DEBOUNCE_MS = 30U;
-    static constexpr uint8_t CONFIRMED_WEIGHT_LIMIT = 5U;
+    static constexpr uint8_t CONFIRMED_WEIGHT_LIMIT = 3U;
 
 private:
     bool initialized_ = false;

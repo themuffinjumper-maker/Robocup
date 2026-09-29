@@ -17,7 +17,7 @@ void BluetoothDebugWorkflow::updateLocalCompetition()
         {
             ++localCompetitionSortingSerial_;
             if (localCompetition_.noteConfirmedWeight())
-                link_.log("INFO", "Five induction-confirmed weights reached; returning home");
+                link_.log("INFO", "Three induction-confirmed weights reached; returning home");
         }
     }
     else
@@ -217,7 +217,7 @@ void BluetoothDebugWorkflow::requestLocalReturnHome()
     localCompetition_.setReturningHome();
     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "RETURNING_HOME");
     if (localCompetition_.confirmedWeights() >= LocalCompetition::CONFIRMED_WEIGHT_LIMIT)
-        link_.log("WARNING", "Five induction-confirmed weights reached; skipping remaining targets and returning home to unload");
+        link_.log("WARNING", "Three induction-confirmed weights reached; skipping remaining targets and returning home to unload");
     else
         link_.log("WARNING", "90-second local round limit reached; all remaining targets skipped, returning home to unload");
 }
@@ -237,7 +237,10 @@ void BluetoothDebugWorkflow::finishLocalCompetition()
     missionAutoReturnHome_ = false;
     localRunActive_ = false;
     localMissionReturning_ = false;
+    localBlockTargetEnroute_ = false;
+    localPostUnloadPhase_ = 0;
+    localPostUnloadStartedMs_ = 0;
     localCompetition_.markComplete();
     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "COMPLETE");
-    link_.log("INFO", "Local round complete; home unload finished and motors stopped");
+    link_.log("INFO", "Local competition run complete; motors stopped");
 }

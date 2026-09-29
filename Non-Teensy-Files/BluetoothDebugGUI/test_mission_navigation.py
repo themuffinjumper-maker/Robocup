@@ -210,15 +210,15 @@ class MissionUploadTests(unittest.TestCase):
             self.assertIn(2, canvas.detected_weight_hits)
             view.close()
 
-    def test_map_contains_forbidden_home_and_physical_landmarks(self):
+    def test_opposing_home_is_navigable_and_map_contains_landmarks(self):
         layout = MissionLayout()
         layout.add_obstacle("wall", 1800, 1000)
         layout.add_weight(2600, 1200, dummy=True)
         features = layout.map_payload()["features"]
-        self.assertEqual(len(features), 15)
-        self.assertEqual(features[:5], [0, 1750, 650, 2400, 0])
-        self.assertEqual(features[9], 1)
-        self.assertEqual(features[14], 2)
+        self.assertEqual(len(features), 10)
+        self.assertEqual(features[:5], [1500, 935, 2100, 1065, 1])
+        self.assertEqual(features[9], 2)
+        self.assertFalse(layout.blocked(325, 2075))
         self.assertEqual(layout.map_payload()["dummy_clearance_mm"], 100)
         self.assertTrue(layout.blocked(3150, 1200))
         self.assertFalse(layout.blocked(3300, 1200))
@@ -232,7 +232,7 @@ class MissionUploadTests(unittest.TestCase):
         layout = MissionLayout()
         ramp = layout.add_obstacle("ramp", 1800, 1000)
         self.assertTrue(layout.blocked(ramp["x"], ramp["y"]))
-        ramp_feature = layout.map_payload()["features"][5:10]
+        ramp_feature = layout.map_payload()["features"][:5]
         self.assertEqual(ramp_feature[4], 0)
 
     def test_weight_route_has_straight_staging_and_run_through(self):
@@ -267,6 +267,25 @@ class MissionUploadTests(unittest.TestCase):
                    if point.get("target")]
         self.assertEqual(targets, [(second["x"], second["y"]),
                                    (first["x"], first["y"])])
+
+    def test_block_destination_is_single_persistent_and_exported(self):
+        layout = MissionLayout()
+        first = layout.set_block_target(3100, 1200)
+        second = layout.set_block_target(3200, 1250)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(layout.block_target["x"], 3200)
+        self.assertEqual(layout.command_payload()["block_target"],
+                         {"x_mm": 3200, "y_mm": 1250})
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.block_target,
+                         {"id": "block_target", "x": 3200, "y": 1250})
+        self.assertTrue(restored.move_item("block_target", 3300, 1300))
+        self.assertEqual(restored.command_payload()["block_target"],
+                         {"x_mm": 3300, "y_mm": 1300})
+        self.assertTrue(restored.delete_item("block_target"))
+        self.assertIsNone(restored.command_payload()["block_target"])
 
     def test_mission_planner_records_and_persists_map_clicked_sequence(self):
         with tempfile.TemporaryDirectory() as directory:
