@@ -1364,6 +1364,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionWallReverseFailed_ = false;
         missionWallReverseNoProgress_ = false;
         missionWallRecoveryDetourRequested_ = false;
+        missionWallRecoveryMapTried_ = false;
         missionWallRecoveryPreferredSide_ = 0;
         missionWallReverseWaypoint_ = 255;
         missionWallReverseRepeatCount_ = 0;
@@ -1374,7 +1375,11 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionOuterReverseActive_ = false;
         missionOuterCueAlignedSinceMs_ = 0;
         missionForwardProgressStartedMs_ = 0;
+        missionForwardProgressFrontMm_ = 0xFFFF;
+        missionForwardProgressImuEventCount_ = imuMotionEventCount;
+        missionForwardProgressHeadingDeg_ = 0.0f;
         missionForwardStalled_ = false;
+        missionEncoderImuSkid_ = false;
         missionTurnProgressStartedMs_ = 0;
         missionLandmarkCorrections_ = 0;
         missionLastLandmarkId_ = -1;
@@ -2441,6 +2446,10 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.wall_reverse_active"] = missionWallReverseActive_;
     data["mission.wall_reverse_failed"] = missionWallReverseFailed_;
     data["mission.forward_stalled"] = missionForwardStalled_;
+    data["mission.encoder_imu_skid"] = missionEncoderImuSkid_;
+    data["mission.wall_recovery_detour_requested"] =
+        missionWallRecoveryDetourRequested_;
+    data["mission.wall_recovery_map_tried"] = missionWallRecoveryMapTried_;
     data["mission.avoid_phase"] = missionAvoidPhase_;
     data["mission.reroute_count"] = missionRerouteCount_;
     data["mission.skipped_route_points"] = missionSkippedWaypoints_;
@@ -3439,6 +3448,7 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionWallReverseFailed_ = false;
     missionWallReverseNoProgress_ = false;
     missionWallRecoveryDetourRequested_ = false;
+    missionWallRecoveryMapTried_ = false;
     missionWallRecoveryPreferredSide_ = 0;
     missionWallReverseWaypoint_ = 255;
     missionWallReverseRepeatCount_ = 0;
@@ -3450,7 +3460,11 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionOuterReverseActive_ = false;
     missionOuterCueAlignedSinceMs_ = 0;
     missionForwardProgressStartedMs_ = 0;
+    missionForwardProgressFrontMm_ = 0xFFFF;
+    missionForwardProgressImuEventCount_ = imuMotionEventCount;
+    missionForwardProgressHeadingDeg_ = 0.0f;
     missionForwardStalled_ = false;
+    missionEncoderImuSkid_ = false;
     missionTurnProgressStartedMs_ = 0;
     missionBlockedSinceMs_ = 0;
     dcMotor203Second_.stop();
@@ -5191,19 +5205,33 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWallReverseNoProgress_ = reversedMm < 80.0f;
             missionWallReverseFailed_ = missionWallReverseNoProgress_ ||
                 front == 0xFFFF || front < 220U;
+            // A single bounded retreat is the only push/back-up retry at a
+            // blocked waypoint. From here, switch to map/live-space planning;
+            // never repeat the same reverse-and-drive-into-it cycle.
+            missionWallRecoveryDetourRequested_ = true;
+            missionWallRecoveryPreferredSide_ =
+                right != 0xFFFF && (left == 0xFFFF || right >= left)
+                    ? 1 : left != 0xFFFF ? -1 : 0;
             missionAvoidPhase_ = 0;
             missionBlockedSinceMs_ = 0;
             link_.log(missionWallReverseFailed_ ? "WARNING" : "INFO",
                 missionWallReverseNoProgress_
-                    ? "Reverse produced no encoder progress; motors held stopped"
+                    ? "Reverse produced no encoder progress; switching to map/open-space detour"
                     : missionWallReverseFailed_
-                    ? "Wall still too close after bounded reverse; holding motors stopped"
-                    : "Backed away from frontal wall; replanning before turning");
+                    ? "Wall still close after one bounded retreat; switching to detour"
+                    : "Backed away once; selecting a map-checked open-space detour");
             return;
         }
         if (missionWallReverseFailed_)
         {
-            if (missionWallReverseNoProgress_ || front == 0xFFFF || front < 220U)
+            if (missionWallRecoveryDetourRequested_)
+            {
+                // The detour planner below owns the next action, even when
+                // encoder/ultrasound evidence says the retreat did not work.
+                missionWallReverseFailed_ = false;
+                missionWallReverseNoProgress_ = false;
+            }
+            else if (missionWallReverseNoProgress_ || front == 0xFFFF || front < 220U)
             {
                 setDrive(0, 0);
                 return;
@@ -5219,6 +5247,10 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionForwardProgressStartedMs_ = now;
                 missionForwardProgressEncoder1_ = encoders_.firstCount();
                 missionForwardProgressEncoder2_ = encoders_.secondCount();
+                missionForwardProgressFrontMm_ = front;
+                missionForwardProgressImuEventCount_ = imuMotionEventCount;
+                missionForwardProgressHeadingDeg_ = lastImuSampleValid_
+                    ? imu_.headingDeg() : 0.0f;
             }
             else if (now - missionForwardProgressStartedMs_ >= 1000U)
             {
@@ -5228,16 +5260,54 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const float rightTravel = fabsf(
                     (encoders_.secondCount() - missionForwardProgressEncoder2_) *
                     0.08461399f);
-                missionForwardStalled_ = leftTravel < 35.0f && rightTravel < 35.0f;
+                const float encoderTravelMm = 0.5f * (leftTravel + rightTravel);
+                const bool encoderStopped = leftTravel < 35.0f && rightTravel < 35.0f;
+                const uint16_t skidFrontRangeMm = min(
+                    static_cast<uint16_t>(FRONT_AVOID_MM + 150U),
+                    static_cast<uint16_t>(600U));
+                const bool closeForwardSurface =
+                    front != 0xFFFF && front <= skidFrontRangeMm &&
+                    missionForwardProgressFrontMm_ != 0xFFFF &&
+                    missionForwardProgressFrontMm_ <= skidFrontRangeMm + 250U;
+                const float measuredClosingMm = closeForwardSurface
+                    ? static_cast<float>(missionForwardProgressFrontMm_) - front
+                    : 0.0f;
+                const bool rangeConfirmsTranslation = closeForwardSurface &&
+                    measuredClosingMm >= max(25.0f, encoderTravelMm * 0.30f);
+                const bool imuReportsNoChassisMotion = lastImuSampleValid_ &&
+                    !imuMotionActive &&
+                    imuMotionEventCount == missionForwardProgressImuEventCount_ &&
+                    fabsf(headingDelta(missionForwardProgressHeadingDeg_,
+                                       imu_.headingDeg())) < 2.0f;
+                const bool driveIsStraight = abs(commandedA - commandedB) <= 20 &&
+                    lastImuSampleValid_ &&
+                    fabsf(headingDelta(missionArenaHeadingDeg_,
+                                       navigationTargetHeadingDeg_)) <= 12.0f;
+                // Encoders alone report wheel rotation even when the tyres
+                // spin against a wall. Near a forward return, call that a
+                // skid only when the front range did not close and the IMU
+                // also saw neither a motion event nor a heading change.
+                missionEncoderImuSkid_ = encoderTravelMm >= 100.0f &&
+                    min(leftTravel, rightTravel) >= 40.0f &&
+                    closeForwardSurface && !rangeConfirmsTranslation &&
+                    imuReportsNoChassisMotion && driveIsStraight;
+                missionForwardStalled_ = encoderStopped ||
+                    missionEncoderImuSkid_;
                 missionForwardProgressStartedMs_ = now;
                 missionForwardProgressEncoder1_ = encoders_.firstCount();
                 missionForwardProgressEncoder2_ = encoders_.secondCount();
+                missionForwardProgressFrontMm_ = front;
+                missionForwardProgressImuEventCount_ = imuMotionEventCount;
+                missionForwardProgressHeadingDeg_ = lastImuSampleValid_
+                    ? imu_.headingDeg() : 0.0f;
             }
         }
         else
         {
             missionForwardProgressStartedMs_ = 0;
             missionForwardStalled_ = false;
+            missionEncoderImuSkid_ = false;
+            missionForwardProgressFrontMm_ = 0xFFFF;
         }
         auto beginMissionWallReverse = [&](const char* reason) {
             if (missionWallReverseWaypoint_ == missionWaypointIndex_ &&
@@ -5251,10 +5321,14 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWallReverseLastStartMs_ = now;
             missionWallReverseActive_ = true;
             missionWallReverseStartedMs_ = now;
+            missionWallRecoveryDetourRequested_ = false;
+            missionWallRecoveryMapTried_ = false;
             missionWallReverseEncoder1_ = encoders_.firstCount();
             missionWallReverseEncoder2_ = encoders_.secondCount();
             missionForwardStalled_ = false;
+            missionEncoderImuSkid_ = false;
             missionForwardProgressStartedMs_ = 0;
+            missionForwardProgressFrontMm_ = 0xFFFF;
             missionTurnProgressStartedMs_ = 0;
             missionWeightVectorActive_ = false;
             missionInnerWeightLocked_ = false;
@@ -7152,29 +7226,132 @@ void BluetoothDebugWorkflow::updateNavigation()
         // every ordinary obstacle still retains the hard physical stop.
         const bool hardFrontWall = front != 0xFFFF && front < hardWallMm &&
             !missionInnerWeightLocked_;
-        // A 240-260 mm return is not grounds for reversing a pivot away
-        // from a wall; that threshold created the repeated reverse/advance
-        // loop at the first weight site. A genuinely close wall still backs out.
-        if (hardFrontWall || missionForwardStalled_)
-        {
-            if (missionWallReverseWaypoint_ == missionWaypointIndex_ &&
-                missionWallReverseRepeatCount_ >= 3U &&
-                now - missionWallReverseLastStartMs_ <= 30000U)
+        auto planMissionOpenSpaceDetour = [&]() -> bool {
+            const float headingRad = missionArenaHeadingDeg_ * DEG_TO_RAD;
+            const float forwardX = cosf(headingRad), forwardY = sinf(headingRad);
+            int8_t selectedSide = 0;
+            float bestScore = -1000000.0f;
+            for (int8_t side = -1; side <= 1; side += 2)
             {
-                setDrive(0, 0);
-                if (searchActive && (waypoint.flags & 0x01) != 0)
+                const uint16_t sideRange = side < 0 ? left : right;
+                const bool sideMeasured = sideRange != 0xFFFF;
+                const uint8_t openColumns = side < 0
+                    ? matrixLeftOpenColumns : matrixRightOpenColumns;
+                const uint16_t mappedDepth = side < 0
+                    ? matrixLeftGapMm : matrixRightGapMm;
+                if (!sideMeasured && (!matrixFresh || openColumns < 2U ||
+                    mappedDepth < OBSTACLE_FORWARD_GAP_MM))
+                    continue;
+
+                for (const float lateralMm : {250.0f, 350.0f, 500.0f})
                 {
-                    finishSiteSearch(true);
-                    link_.log("WARNING", "Repeated wall retreat ended weight-site search");
+                    if (sideMeasured && sideRange < lateralMm +
+                        0.5f * navigationRobotWidthMm_ + 50.0f)
+                        continue;
+                    const float x = missionPoseXmm_ - forwardY * side * lateralMm;
+                    const float y = missionPoseYmm_ + forwardX * side * lateralMm;
+                    if (!segmentFree(missionPoseXmm_, missionPoseYmm_, x, y))
+                        continue;
+                    for (const float forwardMm : {250.0f, 400.0f, 650.0f})
+                    {
+                        const float passX = x + forwardX * forwardMm;
+                        const float passY = y + forwardY * forwardMm;
+                        if (!segmentFree(x, y, passX, passY))
+                            continue;
+                        const bool mapClearToGoal = segmentFree(
+                            passX, passY, waypoint.xMm, waypoint.yMm);
+                        const float measuredSpace = sideMeasured
+                            ? static_cast<float>(sideRange)
+                            : static_cast<float>(mappedDepth);
+                        const float preferredSideBonus =
+                            side == missionWallRecoveryPreferredSide_ ? 80.0f : 0.0f;
+                        const float previousSidePenalty =
+                            side == missionAvoidSide_ ? 130.0f : 0.0f;
+                        const float score = measuredSpace + preferredSideBonus -
+                            0.2f * hypotf(waypoint.xMm - passX,
+                                         waypoint.yMm - passY) -
+                            0.05f * (lateralMm + forwardMm) -
+                            (sideMeasured ? 0.0f : 160.0f) -
+                            previousSidePenalty +
+                            (mapClearToGoal ? 120.0f : -180.0f);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            selectedSide = side;
+                            missionAvoidXmm_ = x;
+                            missionAvoidYmm_ = y;
+                            missionAvoidForwardXmm_ = passX;
+                            missionAvoidForwardYmm_ = passY;
+                        }
+                    }
                 }
-                else if (!rerouteAroundMap())
-                    beginMissionWallReverse(
-                        "Repeated wall retreat; backing out again for a new mapped approach");
+            }
+            if (selectedSide == 0)
+                return false;
+            missionAvoidSide_ = selectedSide;
+            missionAvoidPhase_ = 1;
+            if (missionAvoidAttempts_ < 255U)
+                ++missionAvoidAttempts_;
+            return true;
+        };
+
+        const bool sameRecoveryWaypoint =
+            missionWallReverseWaypoint_ == missionWaypointIndex_ &&
+            missionWallReverseRepeatCount_ >= 1U;
+        const bool recoveryDetourPending =
+            missionWallRecoveryDetourRequested_ || sameRecoveryWaypoint;
+        const bool alreadyTurningOut = recoveryDetourPending &&
+            (missionAvoidPhase_ != 0 || missionWallRecoveryMapTried_) &&
+            !missionForwardStalled_ &&
+            fabsf(headingDelta(missionArenaHeadingDeg_,
+                               desiredArenaHeadingDeg)) > 18.0f;
+
+        if ((hardFrontWall || missionForwardStalled_) &&
+            recoveryDetourPending && !alreadyTurningOut)
+        {
+            setDrive(0, 0);
+            missionAvoidPhase_ = 0;
+            if (!missionWallRecoveryMapTried_)
+            {
+                missionWallRecoveryMapTried_ = true;
+                if (rerouteAroundMap())
+                {
+                    missionWallRecoveryDetourRequested_ = false;
+                    missionWallReverseFailed_ = false;
+                    missionWallReverseNoProgress_ = false;
+                    missionBlockedSinceMs_ = 0;
+                    link_.log("WARNING", "After one retreat, routed around the blockage using the arena map");
+                    return;
+                }
+            }
+            if (planMissionOpenSpaceDetour())
+            {
+                missionWallRecoveryDetourRequested_ = false;
+                missionWallReverseFailed_ = false;
+                missionWallReverseNoProgress_ = false;
+                missionBlockedSinceMs_ = 0;
+                link_.log("WARNING", "After one retreat, detouring through sensor- and map-verified open space");
                 return;
             }
-            beginMissionWallReverse(missionForwardStalled_
-                ? "Forward drive stalled; reversing before replanning"
-                : "Frontal wall too close to turn; reversing before replanning");
+            missionWallRecoveryDetourRequested_ = true;
+            if (missionBlockedSinceMs_ == 0)
+            {
+                missionBlockedSinceMs_ = now;
+                link_.log("WARNING", "No map-clear side route yet; holding and checking for open space");
+            }
+            return;
+        }
+
+        // A single bounded retreat is permitted at each blocked route point.
+        // Further recovery is handled by the map/open-space detour above.
+        if ((hardFrontWall || missionForwardStalled_) &&
+            !recoveryDetourPending)
+        {
+            beginMissionWallReverse(missionEncoderImuSkid_
+                ? "Wheel encoders moved but range and IMU did not: one retreat before detouring"
+                : missionForwardStalled_
+                    ? "Forward drive stalled: one retreat before detouring"
+                    : "Frontal wall too close: one retreat before detouring");
             return;
         }
         const bool blockedOnLeg = (front != 0xFFFF || missionFrontBlockedLatched_) &&
@@ -7234,57 +7411,30 @@ void BluetoothDebugWorkflow::updateNavigation()
             setDrive(0, 0);
             return;
         }
+        if (blockedOnLeg && missionAvoidPhase_ != 0 &&
+            sameRecoveryWaypoint)
+        {
+            // The first escape vector met another close return. Try a
+            // different verified flank, never another straight push/reverse.
+            setDrive(0, 0);
+            missionAvoidPhase_ = 0;
+            missionWallRecoveryDetourRequested_ = true;
+            if (planMissionOpenSpaceDetour())
+            {
+                missionWallRecoveryDetourRequested_ = false;
+                missionBlockedSinceMs_ = 0;
+                link_.log("WARNING", "First detour blocked; switching to the other map-clear side");
+                return;
+            }
+            if (missionBlockedSinceMs_ == 0)
+                missionBlockedSinceMs_ = now;
+            return;
+        }
         if (blockedOnLeg && missionAvoidPhase_ == 0 &&
             missionAvoidAttempts_ < (missionReturnHome_ ? 6U : 3U))
         {
-            const float headingRad = missionArenaHeadingDeg_ * DEG_TO_RAD;
-            const float forwardX = cosf(headingRad), forwardY = sinf(headingRad);
-            int8_t selectedSide = 0;
-            float bestScore = -1000000.0f;
-            for (int8_t side = -1; side <= 1; side += 2)
+            if (planMissionOpenSpaceDetour())
             {
-                const uint16_t sideRange = side < 0 ? left : right;
-                const bool sideMeasured = sideRange != 0xFFFF;
-                // A fixed 500 mm sidestep plus 650 mm forward leg was
-                // impossible near the arena edge in the return-home run,
-                // even though a shorter route was map-clear.  Prefer a live
-                // side measurement, but permit a map-verified side when its
-                // ultrasound is temporarily unavailable.
-                for (const float lateralMm : {250.0f, 350.0f, 500.0f})
-                {
-                    if (sideMeasured && sideRange < lateralMm +
-                        0.5f * navigationRobotWidthMm_ + 50.0f) continue;
-                    const float x = missionPoseXmm_ - forwardY * side * lateralMm;
-                    const float y = missionPoseYmm_ + forwardX * side * lateralMm;
-                    if (!segmentFree(missionPoseXmm_, missionPoseYmm_, x, y)) continue;
-                    for (const float forwardMm : {250.0f, 400.0f, 650.0f})
-                    {
-                        const float passX = x + forwardX * forwardMm;
-                        const float passY = y + forwardY * forwardMm;
-                        if (!segmentFree(x, y, passX, passY)) continue;
-                        const float score = (sideMeasured ? static_cast<float>(sideRange) : 450.0f) -
-                            0.2f * hypotf(waypoint.xMm - passX,
-                                         waypoint.yMm - passY) -
-                            0.05f * (lateralMm + forwardMm) -
-                            (sideMeasured ? 0.0f : 160.0f) -
-                            (side == missionAvoidSide_ ? 100.0f : 0.0f);
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            selectedSide = side;
-                            missionAvoidXmm_ = x;
-                            missionAvoidYmm_ = y;
-                            missionAvoidForwardXmm_ = passX;
-                            missionAvoidForwardYmm_ = passY;
-                        }
-                    }
-                }
-            }
-            if (selectedSide != 0)
-            {
-                missionAvoidSide_ = selectedSide;
-                missionAvoidPhase_ = 1;
-                ++missionAvoidAttempts_;
                 missionBlockedSinceMs_ = 0;
                 link_.log("INFO", "Mission route blocked; taking map-checked live detour");
                 setDrive(0, 0);

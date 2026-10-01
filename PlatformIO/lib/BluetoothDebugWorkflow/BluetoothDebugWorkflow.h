@@ -484,6 +484,7 @@ private:
     bool missionWallReverseFailed_ = false;
     bool missionWallReverseNoProgress_ = false;
     bool missionWallRecoveryDetourRequested_ = false;
+    bool missionWallRecoveryMapTried_ = false;
     int8_t missionWallRecoveryPreferredSide_ = 0;
     uint32_t missionWallReverseStartedMs_ = 0;
     uint8_t missionWallReverseWaypoint_ = 255;
@@ -494,7 +495,11 @@ private:
     uint32_t missionForwardProgressStartedMs_ = 0;
     int32_t missionForwardProgressEncoder1_ = 0;
     int32_t missionForwardProgressEncoder2_ = 0;
+    uint16_t missionForwardProgressFrontMm_ = 0xFFFF;
+    uint32_t missionForwardProgressImuEventCount_ = 0;
+    float missionForwardProgressHeadingDeg_ = 0.0f;
     bool missionForwardStalled_ = false;
+    bool missionEncoderImuSkid_ = false;
     uint32_t missionTurnProgressStartedMs_ = 0;
     float missionTurnProgressHeadingDeg_ = 0.0f;
     float missionAvoidXmm_ = 0.0f;
