@@ -1380,7 +1380,18 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionForwardProgressHeadingDeg_ = 0.0f;
         missionForwardStalled_ = false;
         missionEncoderImuSkid_ = false;
+        missionRampTiltDeg_ = 0.0f;
+        missionRampTiltDetected_ = false;
+        missionRampRecoveryLatched_ = false;
+        missionOnMappedGoRamp_ = false;
+        missionRampTiltSinceMs_ = 0;
+        missionRampTiltClearSinceMs_ = 0;
+        missionRampAvoidanceNext_ = 0;
+        for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            missionRampAvoidances_[i].active = false;
         missionTurnProgressStartedMs_ = 0;
+        missionTurnProgressEncoder1_ = 0;
+        missionTurnProgressEncoder2_ = 0;
         missionLandmarkCorrections_ = 0;
         missionLastLandmarkId_ = -1;
         for (uint8_t i = 0; i < 2; ++i)
@@ -2352,6 +2363,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         missionVerifyPhase_ == 5 ? "reversing_for_weight_retry" :
         missionVerifyPhase_ != 0 ? "checking_pickup" :
         missionTofRecoveryHold_ ? "waiting_for_point_tofs" :
+        missionRampRecoveryLatched_ && missionWallReverseActive_
+            ? "reversing_from_unexpected_ramp" :
         missionWallReverseActive_ ? "reversing_from_wall" :
         missionReturnHome_ && missionWaypointIndex_ < missionWaypointCount_ &&
             (missionWaypoints_[missionWaypointIndex_].flags & 0x04) != 0
@@ -2447,6 +2460,14 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.wall_reverse_failed"] = missionWallReverseFailed_;
     data["mission.forward_stalled"] = missionForwardStalled_;
     data["mission.encoder_imu_skid"] = missionEncoderImuSkid_;
+    data["mission.ramp_tilt_deg"] = missionRampTiltDeg_;
+    data["mission.ramp_tilt_detected"] = missionRampTiltDetected_;
+    data["mission.ramp_recovery_latched"] = missionRampRecoveryLatched_;
+    data["mission.on_mapped_go_ramp"] = missionOnMappedGoRamp_;
+    uint8_t rampAvoidanceCount = 0;
+    for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+        if (missionRampAvoidances_[i].active) ++rampAvoidanceCount;
+    data["mission.ramp_avoidance_count"] = rampAvoidanceCount;
     data["mission.wall_recovery_detour_requested"] =
         missionWallRecoveryDetourRequested_;
     data["mission.wall_recovery_map_tried"] = missionWallRecoveryMapTried_;
@@ -3465,7 +3486,18 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionForwardProgressHeadingDeg_ = 0.0f;
     missionForwardStalled_ = false;
     missionEncoderImuSkid_ = false;
+    missionRampTiltDeg_ = 0.0f;
+    missionRampTiltDetected_ = false;
+    missionRampRecoveryLatched_ = false;
+    missionOnMappedGoRamp_ = false;
+    missionRampTiltSinceMs_ = 0;
+    missionRampTiltClearSinceMs_ = 0;
+    missionRampAvoidanceNext_ = 0;
+    for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+        missionRampAvoidances_[i].active = false;
     missionTurnProgressStartedMs_ = 0;
+    missionTurnProgressEncoder1_ = 0;
+    missionTurnProgressEncoder2_ = 0;
     missionBlockedSinceMs_ = 0;
     dcMotor203Second_.stop();
     dcMotor203SecondActive_ = false;
@@ -4519,6 +4551,61 @@ void BluetoothDebugWorkflow::updateNavigation()
         link_.log("WARNING", "U-shaped enclosure detected; reversing to find turning clearance");
     }
 
+    // Reactive navigation has no uploaded waypoint corridor to route around an
+    // unexpected incline, so use its existing single-reverse/90-degree escape.
+    // Planned missions handle this below, where the incline is also recorded
+    // as a temporary no-go area for map-based rerouting.
+    if (navigationStrategy_ != 3)
+    {
+        missionRampTiltDeg_ = lastImuSampleValid_
+            ? max(fabsf(imu_.pitchDeg()), fabsf(imu_.rollDeg())) : 0.0f;
+        missionRampTiltDetected_ = lastImuSampleValid_ &&
+            missionRampTiltDeg_ > 5.0f;
+        missionOnMappedGoRamp_ = false;
+        if (missionRampRecoveryLatched_)
+        {
+            if (lastImuSampleValid_ && missionRampTiltDeg_ < 3.0f)
+            {
+                if (missionRampTiltClearSinceMs_ == 0)
+                    missionRampTiltClearSinceMs_ = now;
+                else if (now - missionRampTiltClearSinceMs_ >= 500U)
+                {
+                    missionRampRecoveryLatched_ = false;
+                    missionRampTiltClearSinceMs_ = 0;
+                }
+            }
+            else
+                missionRampTiltClearSinceMs_ = 0;
+        }
+        const int16_t rampDriveA = dcMotor203Second_.channelAPercent();
+        const int16_t rampDriveB = dcMotor203Second_.channelBPercent();
+        const bool rampForwardCommand = rampDriveA <= -35 && rampDriveB <= -35;
+        if (rampForwardCommand && missionRampTiltDetected_ &&
+            !missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltSinceMs_ == 0)
+                missionRampTiltSinceMs_ = now;
+            if (now - missionRampTiltSinceMs_ >= 200U)
+            {
+                missionRampRecoveryLatched_ = true;
+                missionRampTiltClearSinceMs_ = 0;
+                navigationState_ = NAV_ESCAPE_REVERSE;
+                navigationEscapeStartEncoder1_ = encoders_.firstCount();
+                navigationEscapeStartEncoder2_ = encoders_.secondCount();
+                navigationEscapeTurnRight_ = recoveryRight != 0xFFFF &&
+                    (recoveryLeft == 0xFFFF || recoveryRight >= recoveryLeft);
+                navigationMotionStartedMs_ = now;
+                navigationMotionConsistent_ = true;
+                setDrive(100, 100);
+                link_.log("WARNING",
+                    "Unexpected incline over 5 degrees; reversing once and turning toward open space");
+                return;
+            }
+        }
+        else
+            missionRampTiltSinceMs_ = 0;
+    }
+
     if (navigationState_ == NAV_MISSION_TRACK && navigationStrategy_ == 3)
     {
         if (!lastImuSampleValid_)
@@ -4526,6 +4613,56 @@ void BluetoothDebugWorkflow::updateNavigation()
             setDrive(0, 0);
             return;
         }
+        missionRampTiltDeg_ = max(fabsf(imu_.pitchDeg()), fabsf(imu_.rollDeg()));
+        missionRampTiltDetected_ = missionRampTiltDeg_ > 5.0f;
+        missionOnMappedGoRamp_ = false;
+        const float goRampPoseMarginMm =
+            0.5f * static_cast<float>(navigationRobotLengthMm_) + 60.0f;
+        for (uint8_t i = 0; i < missionFeatureCount_; ++i)
+        {
+            const MissionFeature& feature = missionFeatures_[i];
+            if (feature.kind == 3 &&
+                missionPoseXmm_ >= feature.x0 - goRampPoseMarginMm &&
+                missionPoseXmm_ <= feature.x1 + goRampPoseMarginMm &&
+                missionPoseYmm_ >= feature.y0 - goRampPoseMarginMm &&
+                missionPoseYmm_ <= feature.y1 + goRampPoseMarginMm)
+            {
+                // Go ramps are an explicit, planned route feature. Keep the
+                // incline recovery for unexpected ramps, not this deliberate
+                // centreline crossing.
+                missionOnMappedGoRamp_ = true;
+                break;
+            }
+        }
+        const int16_t rampDriveA = dcMotor203Second_.channelAPercent();
+        const int16_t rampDriveB = dcMotor203Second_.channelBPercent();
+        const bool drivingForwardForRamp = rampDriveA <= -35 && rampDriveB <= -35;
+        bool missionRampEscapeReady = false;
+        if (missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltDeg_ < 3.0f)
+            {
+                if (missionRampTiltClearSinceMs_ == 0)
+                    missionRampTiltClearSinceMs_ = now;
+                else if (now - missionRampTiltClearSinceMs_ >= 500U)
+                {
+                    missionRampRecoveryLatched_ = false;
+                    missionRampTiltClearSinceMs_ = 0;
+                }
+            }
+            else
+                missionRampTiltClearSinceMs_ = 0;
+        }
+        if (drivingForwardForRamp && !missionOnMappedGoRamp_ &&
+            missionRampTiltDetected_ && !missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltSinceMs_ == 0)
+                missionRampTiltSinceMs_ = now;
+            missionRampEscapeReady = now - missionRampTiltSinceMs_ >= 200U;
+        }
+        else
+            missionRampTiltSinceMs_ = 0;
+
         // Associate a NEW side-ultrasound echo with the nearest uploaded
         // physical rectangle or arena boundary. Three independent echoes must
         // match the same surface before a small position correction is made.
@@ -4785,6 +4922,22 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (x < clearance || y < clearance ||
                 x > 4900.0f - clearance || y > 2400.0f - clearance)
                 return false;
+            for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            {
+                const MissionRampAvoidance& avoid = missionRampAvoidances_[i];
+                if (!avoid.active) continue;
+                const float angle = avoid.headingDeg * DEG_TO_RAD;
+                const float dx = x - avoid.centerXmm;
+                const float dy = y - avoid.centerYmm;
+                const float localX = dx * cosf(angle) + dy * sinf(angle);
+                const float localY = -dx * sinf(angle) + dy * cosf(angle);
+                // A detected unexpected incline becomes a no-go footprint for
+                // the rest of this run, so map rerouting cannot send the robot
+                // straight back onto the same ramp.
+                if (fabsf(localX) <= 600.0f + clearance &&
+                    fabsf(localY) <= 200.0f + clearance)
+                    return false;
+            }
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
@@ -5240,7 +5393,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
         const int16_t commandedA = dcMotor203Second_.channelAPercent();
         const int16_t commandedB = dcMotor203Second_.channelBPercent();
-        if (commandedA <= -75 && commandedB <= -75)
+        if (commandedA <= -35 && commandedB <= -35)
         {
             if (missionForwardProgressStartedMs_ == 0)
             {
@@ -5273,7 +5426,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                     ? static_cast<float>(missionForwardProgressFrontMm_) - front
                     : 0.0f;
                 const bool rangeConfirmsTranslation = closeForwardSurface &&
-                    measuredClosingMm >= max(25.0f, encoderTravelMm * 0.30f);
+                    fabsf(measuredClosingMm) >=
+                        max(25.0f, encoderTravelMm * 0.30f);
                 const bool imuReportsNoChassisMotion = lastImuSampleValid_ &&
                     !imuMotionActive &&
                     imuMotionEventCount == missionForwardProgressImuEventCount_ &&
@@ -5283,14 +5437,46 @@ void BluetoothDebugWorkflow::updateNavigation()
                     lastImuSampleValid_ &&
                     fabsf(headingDelta(missionArenaHeadingDeg_,
                                        navigationTargetHeadingDeg_)) <= 12.0f;
-                // Encoders alone report wheel rotation even when the tyres
-                // spin against a wall. Near a forward return, call that a
-                // skid only when the front range did not close and the IMU
-                // also saw neither a motion event nor a heading change.
-                missionEncoderImuSkid_ = encoderTravelMm >= 100.0f &&
-                    min(leftTravel, rightTravel) >= 40.0f &&
+                // The BNO055 has no trustworthy absolute translation speed;
+                // use a close, stable front surface as the independent proof
+                // that commanded straight-line wheel travel did not move the
+                // chassis. Compare range change in either direction so an
+                // oblique wall edge that is opening up still counts as motion.
+                const bool straightWheelSlip = encoderTravelMm >= 90.0f &&
+                    min(leftTravel, rightTravel) >= 35.0f &&
                     closeForwardSurface && !rangeConfirmsTranslation &&
                     imuReportsNoChassisMotion && driveIsStraight;
+                // On a differential turn the signed wheel-distance difference
+                // predicts yaw. If the encoders imply a substantial turn but
+                // the IMU reports almost none while an obstacle is close, the
+                // wheels are scrubbing at the wall edge rather than turning
+                // the robot. Treat this as blocked, not as a slow correction.
+                const float leftSignedTravel =
+                    (missionForwardProgressEncoder1_ - encoders_.firstCount()) *
+                    0.08437374f;
+                const float rightSignedTravel =
+                    (encoders_.secondCount() - missionForwardProgressEncoder2_) *
+                    0.08461399f;
+                const float encoderDifferentialMm =
+                    fabsf(leftSignedTravel - rightSignedTravel);
+                const float expectedEncoderTurnDeg = encoderDifferentialMm *
+                    RAD_TO_DEG / max(180.0f,
+                        static_cast<float>(navigationRobotWidthMm_));
+                const float imuHeadingChangeDeg = lastImuSampleValid_
+                    ? fabsf(headingDelta(missionForwardProgressHeadingDeg_,
+                                         imu_.headingDeg()))
+                    : 180.0f;
+                const bool nearbySurface =
+                    (front != 0xFFFF && front <= 700U) ||
+                    (left != 0xFFFF && left <= 500U) ||
+                    (right != 0xFFFF && right <= 500U);
+                const bool turnWheelSlip = abs(commandedA - commandedB) >= 25 &&
+                    encoderDifferentialMm >= 70.0f &&
+                    expectedEncoderTurnDeg >= 12.0f &&
+                    imuHeadingChangeDeg <= max(3.0f,
+                                                expectedEncoderTurnDeg * 0.20f) &&
+                    nearbySurface;
+                missionEncoderImuSkid_ = straightWheelSlip || turnWheelSlip;
                 missionForwardStalled_ = encoderStopped ||
                     missionEncoderImuSkid_;
                 missionForwardProgressStartedMs_ = now;
@@ -5335,6 +5521,26 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionAvoidPhase_ = 0;
             setDrive(75, 75);
             link_.log("WARNING", reason);
+        };
+        auto rememberUnexpectedRamp = [&]() {
+            const float heading = missionArenaHeadingDeg_ * DEG_TO_RAD;
+            const float centerX = missionPoseXmm_ + 700.0f * cosf(heading);
+            const float centerY = missionPoseYmm_ + 700.0f * sinf(heading);
+            for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            {
+                const MissionRampAvoidance& existing = missionRampAvoidances_[i];
+                if (existing.active && hypotf(existing.centerXmm - centerX,
+                                              existing.centerYmm - centerY) < 500.0f)
+                    return;
+            }
+            MissionRampAvoidance& avoid =
+                missionRampAvoidances_[missionRampAvoidanceNext_];
+            avoid.active = true;
+            avoid.centerXmm = centerX;
+            avoid.centerYmm = centerY;
+            avoid.headingDeg = missionArenaHeadingDeg_;
+            missionRampAvoidanceNext_ = static_cast<uint8_t>(
+                (missionRampAvoidanceNext_ + 1U) % MAX_MISSION_RAMP_AVOIDS);
         };
 
         // Large odometry errors cannot be repaired by the ordinary 3 mm
@@ -7342,6 +7548,16 @@ void BluetoothDebugWorkflow::updateNavigation()
             return;
         }
 
+        if (missionRampEscapeReady && !recoveryDetourPending)
+        {
+            missionRampRecoveryLatched_ = true;
+            missionRampTiltClearSinceMs_ = 0;
+            rememberUnexpectedRamp();
+            beginMissionWallReverse(
+                "Unexpected incline over 5 degrees; reversing once and routing around it");
+            return;
+        }
+
         // A single bounded retreat is permitted at each blocked route point.
         // Further recovery is handled by the map/open-space detour above.
         if ((hardFrontWall || missionForwardStalled_) &&
@@ -7500,18 +7716,56 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 missionTurnProgressStartedMs_ = now;
                 missionTurnProgressHeadingDeg_ = imu_.headingDeg();
+                missionTurnProgressEncoder1_ = encoders_.firstCount();
+                missionTurnProgressEncoder2_ = encoders_.secondCount();
             }
-            else if (now - missionTurnProgressStartedMs_ >= 3000U)
+            else
             {
                 const float turnedDeg = fabsf(headingDelta(
                     missionTurnProgressHeadingDeg_, imu_.headingDeg()));
-                missionTurnProgressStartedMs_ = now;
-                missionTurnProgressHeadingDeg_ = imu_.headingDeg();
-                if (turnedDeg < 5.0f)
+                const float leftSignedTravel =
+                    (missionTurnProgressEncoder1_ - encoders_.firstCount()) *
+                    0.08437374f;
+                const float rightSignedTravel =
+                    (encoders_.secondCount() - missionTurnProgressEncoder2_) *
+                    0.08461399f;
+                const float encoderDifferentialMm =
+                    fabsf(leftSignedTravel - rightSignedTravel);
+                const float expectedEncoderTurnDeg = encoderDifferentialMm *
+                    RAD_TO_DEG / max(180.0f,
+                        static_cast<float>(navigationRobotWidthMm_));
+                const uint32_t turnProgressElapsedMs =
+                    now - missionTurnProgressStartedMs_;
+                const bool nearbyTurnObstacle =
+                    (front != 0xFFFF && front <= 700U) ||
+                    (left != 0xFFFF && left <= 500U) ||
+                    (right != 0xFFFF && right <= 500U);
+                const bool encoderImuTurnMismatch =
+                    turnProgressElapsedMs >= 1000U &&
+                    encoderDifferentialMm >= 70.0f &&
+                    expectedEncoderTurnDeg >= 12.0f &&
+                    turnedDeg <= max(3.0f, expectedEncoderTurnDeg * 0.20f) &&
+                    nearbyTurnObstacle;
+                if (encoderImuTurnMismatch)
                 {
+                    missionEncoderImuSkid_ = true;
+                    missionForwardStalled_ = true;
                     beginMissionWallReverse(
-                        "Point turn made no IMU progress; reversing before another turn");
+                        "Encoders predicted a turn but the IMU saw almost none at a nearby obstacle; backing out to detour");
                     return;
+                }
+                if (turnProgressElapsedMs >= 3000U)
+                {
+                    missionTurnProgressStartedMs_ = now;
+                    missionTurnProgressHeadingDeg_ = imu_.headingDeg();
+                    missionTurnProgressEncoder1_ = encoders_.firstCount();
+                    missionTurnProgressEncoder2_ = encoders_.secondCount();
+                    if (turnedDeg < 5.0f)
+                    {
+                        beginMissionWallReverse(
+                            "Point turn made no IMU progress; reversing before another turn");
+                        return;
+                    }
                 }
             }
         }

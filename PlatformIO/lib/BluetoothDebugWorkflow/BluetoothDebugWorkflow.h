@@ -500,8 +500,23 @@ private:
     float missionForwardProgressHeadingDeg_ = 0.0f;
     bool missionForwardStalled_ = false;
     bool missionEncoderImuSkid_ = false;
+    float missionRampTiltDeg_ = 0.0f;
+    bool missionRampTiltDetected_ = false;
+    bool missionRampRecoveryLatched_ = false;
+    bool missionOnMappedGoRamp_ = false;
+    uint32_t missionRampTiltSinceMs_ = 0;
+    uint32_t missionRampTiltClearSinceMs_ = 0;
+    static constexpr uint8_t MAX_MISSION_RAMP_AVOIDS = 4;
+    struct MissionRampAvoidance {
+        bool active = false;
+        float centerXmm = 0.0f, centerYmm = 0.0f, headingDeg = 0.0f;
+    };
+    MissionRampAvoidance missionRampAvoidances_[MAX_MISSION_RAMP_AVOIDS] = {};
+    uint8_t missionRampAvoidanceNext_ = 0;
     uint32_t missionTurnProgressStartedMs_ = 0;
     float missionTurnProgressHeadingDeg_ = 0.0f;
+    int32_t missionTurnProgressEncoder1_ = 0;
+    int32_t missionTurnProgressEncoder2_ = 0;
     float missionAvoidXmm_ = 0.0f;
     float missionAvoidYmm_ = 0.0f;
     float missionAvoidForwardXmm_ = 0.0f;
