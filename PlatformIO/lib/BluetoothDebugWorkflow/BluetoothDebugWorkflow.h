@@ -54,7 +54,7 @@ private:
     bool localBlockTargetEnroute_ = false;
     int16_t localBlockTargetXmm_ = 0;
     int16_t localBlockTargetYmm_ = 0;
-    uint8_t localPostUnloadPhase_ = 0; // 0 idle, 1 open-gate dwell, 2 travelling
+    uint8_t localPostUnloadPhase_ = 0; // 0 idle, 1 open-gate dwell, 2 travelling, 3 blocking spin
     uint32_t localPostUnloadStartedMs_ = 0;
     static constexpr uint32_t LOCAL_POST_UNLOAD_WAIT_MS = 5000U;
     uint16_t localCompetitionSortingSerial_ = 0;

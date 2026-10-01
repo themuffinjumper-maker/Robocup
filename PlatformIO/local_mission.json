@@ -107,7 +107,7 @@
     "home_x_mm": 325,
     "home_y_mm": 2075,
     "fallback_strategy": 0,
-    "confirmed_weight_limit": 2,
+    "confirmed_weight_limit": 1,
     "block_target": {
       "x_mm": 1841,
       "y_mm": 578

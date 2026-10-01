@@ -5712,6 +5712,23 @@ void BluetoothDebugWorkflow::updateNavigation()
             link_.log("INFO", "All weight sites checked; returning home before exploring");
             return;
         }
+        // The post-unload destination is the final blocking position, not a
+        // normal mission stop. Keep the drive bank rotating in place until a
+        // deliberate stop command arrives; do not fall through to the generic
+        // end-of-route neutral/finish handling below.
+        if (localRunActive_ && localBlockTargetEnroute_ &&
+            missionWaypointIndex_ >= missionWaypointCount_)
+        {
+            if (localPostUnloadPhase_ != 3)
+            {
+                localPostUnloadPhase_ = 3;
+                snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
+                link_.log("INFO", "Post-unload block destination reached; spinning in place until stopped");
+            }
+            setDrive(-80, 80);
+            return;
+        }
+
         if (missionWaypointIndex_ >= missionWaypointCount_ ||
             (!localBlockTargetEnroute_ && !missionReturnHome_ &&
              missionTargetsVisited_ >= missionTargetCount_))
@@ -5821,8 +5838,15 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             if (localRunActive_ && localBlockTargetEnroute_)
             {
-                link_.log("INFO", "Post-unload block destination reached");
-                finishLocalCompetition();
+                // The route index normally catches this at the top of the
+                // end-of-route handling. Keep a defensive fallback here too.
+                if (localPostUnloadPhase_ != 3)
+                {
+                    localPostUnloadPhase_ = 3;
+                    snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
+                    link_.log("INFO", "Post-unload block destination reached; spinning in place until stopped");
+                }
+                setDrive(-80, 80);
                 return;
             }
             navigationStrategy_ = missionFallbackStrategy_;
