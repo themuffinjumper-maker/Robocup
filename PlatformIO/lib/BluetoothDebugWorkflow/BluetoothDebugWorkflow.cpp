@@ -5566,12 +5566,6 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (missionUnloadPhase_ == HomeUnloadConfig::LAST_SHAKE_PHASE)
                 {
                     missionUnloadPhase_ = 0;
-                    // The drum is only needed while the robot is carrying
-                    // weights and unloading. Stop it as soon as the final
-                    // shake finishes, before the dwell or any next route leg.
-                    JsonDocument stopDrum;
-                    stopDrum["command"] = "dc_motor_203_stop";
-                    handleCommand(stopDrum);
                     link_.log("INFO", "Home unload complete: 3 full-power shake cycles; storage gate open");
                 }
                 else
@@ -5758,6 +5752,15 @@ void BluetoothDebugWorkflow::updateNavigation()
                             // It is not a weight target and must not trigger
                             // another home-return transition.
                             hx12kB_.setAngle(50.0f);
+                            // Match the GUI's first-203 0% command without
+                            // routing a manual command through the handler,
+                            // which would stop the active navigation route.
+                            cancelDrumJamRecovery();
+                            setDcMotor203Speed(0, 0);
+                            drumJamMonitorStartedMs_ = 0;
+                            drumJamBaselineInitialized_ = false;
+                            drumJamLowSinceMs_ = 0;
+                            link_.log("INFO", "First 203 DC motors set to 0% after storage gate close");
                             missionReturnHome_ = false;
                             missionAutoReturnHome_ = false;
                             missionWaypointIndex_ = 0;
@@ -6113,10 +6116,17 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionDockPhaseStartedMs_ = 0;
                 missionDockNearWallSinceMs_ = 0;
                 missionDockAligned_ = false;
-                missionUnloadHomeXmm_ = routeWaypoint.xMm;
-                missionUnloadHomeYmm_ = routeWaypoint.yMm;
+                // Anchor the unload guard and the return leg to the actual
+                // docked pose. The physical wall approach/turn/retreat can
+                // leave the estimated pose offset from the planned waypoint;
+                // comparing against that waypoint can abort the shimmy before
+                // it starts even though the robot is correctly docked.
+                missionUnloadHomeXmm_ = missionPoseXmm_;
+                missionUnloadHomeYmm_ = missionPoseYmm_;
                 missionUnloadArenaHeadingDeg_ = outwardArena;
-                missionUnloadImuHeadingDeg_ = outwardImu;
+                // Use the measured heading after the turn and retreat as the
+                // reference, rather than the ideal route heading.
+                missionUnloadImuHeadingDeg_ = imu_.headingDeg();
                 missionUnloadPhase_ = 1;
                 missionUnloadPhaseStartedMs_ = now;
                 hx12kB_.setAngle(10.0f);
