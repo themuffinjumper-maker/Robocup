@@ -18,7 +18,7 @@ from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -1173,6 +1173,7 @@ class MissionLayout:
     def __init__(self):
         self.my_home = "green"
         self.fallback_strategy = 0
+        self.confirmed_weight_limit = 3
         self.order_mode = "auto"
         self.target_order = []
         # Physical clearance from the robot's outer edge to a dummy weight.
@@ -1183,6 +1184,8 @@ class MissionLayout:
         self.block_target = None
         self.route = []
         self.route_error = ""
+        self._after_unload_route_cache_key = None
+        self._after_unload_route_cache = None
         self._next_id = 1
 
     def _id(self):
@@ -1260,6 +1263,18 @@ class MissionLayout:
                     self.route = []
                     return True
         return False
+
+    def clear_arena_items(self):
+        """Remove placed map objects and plans while keeping the start/home setup."""
+        self.weights.clear()
+        self.obstacles.clear()
+        self.block_target = None
+        self.route = []
+        self.route_error = ""
+        self.order_mode = "auto"
+        self.target_order = []
+        self._after_unload_route_cache_key = None
+        self._after_unload_route_cache = None
 
     def rotate_item(self, item_id):
         for item in self.obstacles:
@@ -1467,6 +1482,45 @@ class MissionLayout:
             path.append((float(goal[0]), float(goal[1])))
         return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
 
+    def after_unload_route(self):
+        """Map-clear route from the home dock to the optional final destination."""
+        target = self.block_target
+        if target is None:
+            return None
+
+        obstacle_signature = tuple(
+            (item["kind"], float(item["x"]), float(item["y"]),
+             float(item["w"]), float(item["h"]),
+             float(item.get("rotation", 0.0)))
+            for item in self.obstacles)
+        dummy_signature = tuple(
+            (float(item["x"]), float(item["y"]))
+            for item in self.weights if item.get("dummy"))
+        cache_key = (
+            self.my_home, float(target["x"]), float(target["y"]),
+            obstacle_signature, dummy_signature,
+            float(self.dummy_clearance_mm), float(self.ROBOT_RADIUS_MM),
+            float(self.SAFETY_MARGIN_MM), float(self.GRID_MM),
+        )
+        if cache_key != self._after_unload_route_cache_key:
+            home = self.home_rect(self.my_home)
+            # home_rect() returns (left, top, right, bottom), not
+            # (x, y, width, height). Averaging the bounds matters especially
+            # for the blue home at the bottom of the arena; treating bottom as
+            # a height placed the route start outside the arena.
+            start = ((home[0] + home[2]) * 0.5,
+                     (home[1] + home[3]) * 0.5)
+            goal = (float(target["x"]), float(target["y"]))
+            path = None if self.blocked(*start) or self.blocked(*goal) else \
+                self._travel_path(start, goal)
+            if path and len(path) == 1:
+                path = [start, goal]
+            self._after_unload_route_cache = (
+                path if path and len(path) <= self.MAX_ROUTE_POINTS else None)
+            self._after_unload_route_cache_key = cache_key
+        route = self._after_unload_route_cache
+        return None if route is None else list(route)
+
     def ordered_real_weights(self):
         """Return real targets in saved manual order, appending newly added sites."""
         by_id = {str(item["id"]): item for item in self.weights
@@ -1644,6 +1698,10 @@ class MissionLayout:
         for point in self.route:
             points.extend([int(round(point["x"])), int(round(point["y"])),
                            1 if point.get("target") else 0])
+        after_unload_route = self.after_unload_route()
+        block_route = ([] if after_unload_route is None else
+                       [int(round(value)) for point in after_unload_route
+                        for value in point])
         home = self.home_rect(self.my_home)
         return {
             "start_x_mm": int(round(self.start["x"])),
@@ -1652,10 +1710,12 @@ class MissionLayout:
             "home_x_mm": int(round((home[0] + home[2]) * 0.5)),
             "home_y_mm": int(round((home[1] + home[3]) * 0.5)),
             "fallback_strategy": int(self.fallback_strategy),
+            "confirmed_weight_limit": int(self.confirmed_weight_limit),
             "block_target": (None if self.block_target is None else {
                 "x_mm": int(round(self.block_target["x"])),
                 "y_mm": int(round(self.block_target["y"])),
             }),
+            "block_route": block_route,
             "points": points,
         }
 
@@ -1688,6 +1748,7 @@ class MissionLayout:
         return {
             "my_home": self.my_home,
             "fallback_strategy": self.fallback_strategy,
+            "confirmed_weight_limit": self.confirmed_weight_limit,
             "order_mode": self.order_mode,
             "target_order": list(self.target_order),
             "dummy_clearance_mm": self.dummy_clearance_mm,
@@ -1704,6 +1765,11 @@ class MissionLayout:
         if data.get("my_home") in ("green", "blue"):
             self.my_home = data["my_home"]
         self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
+        try:
+            self.confirmed_weight_limit = max(1, min(20,
+                int(data.get("confirmed_weight_limit", 3))))
+        except (TypeError, ValueError):
+            self.confirmed_weight_limit = 3
         self.order_mode = "manual" if data.get("order_mode") == "manual" else "auto"
         stored_order = data.get("target_order", [])
         self.target_order = list(stored_order) if isinstance(stored_order, list) else []
@@ -1754,6 +1820,9 @@ class MissionLayoutCanvas(QWidget):
         self.add_mode = None
         self.sequence_pick_active = False
         self.sequence_preview_order = []
+        # The home-to-after-unload route is a planner preview, not a permanent
+        # decoration. It becomes visible when PLAN ROUTE succeeds.
+        self.after_unload_route_visible = False
         self.selected_id = "start"
         self._dragging = False
         self._panning = False
@@ -2052,6 +2121,25 @@ class MissionLayoutCanvas(QWidget):
                 p.drawText(QRectF(centre.x() - 12, centre.y() - 25, 24, 18),
                            Qt.AlignmentFlag.AlignCenter, str(visit_number))
 
+        if model.block_target is not None and self.after_unload_route_visible:
+            after_unload_route = model.after_unload_route()
+            if after_unload_route and len(after_unload_route) >= 2:
+                route_points = QPolygonF([
+                    self._screen(x, y) for x, y in after_unload_route])
+                # A light casing keeps the requested red route legible over
+                # the arena, home zone, and the cyan collection route.
+                p.setPen(QPen(QColor("#fff1f2"), 8, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline(route_points)
+                p.setPen(QPen(QColor("#ef4444"), 4, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline(route_points)
+            else:
+                p.setPen(QColor("#fca5a5"))
+                p.drawText(QRectF(ox + 14, oy + 24, 350, 24),
+                           Qt.AlignmentFlag.AlignLeft,
+                           "NO CLEAR AFTER-UNLOAD ROUTE FROM HOME")
+
         if len(self.replay_path) >= 2:
             p.setPen(QPen(QColor("#fb923c"), 3, Qt.PenStyle.SolidLine,
                           Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -2106,7 +2194,7 @@ class MissionLayoutCanvas(QWidget):
             ]))
             p.setPen(QColor("#fff1f2"))
             p.drawText(QRectF(centre.x() + 20, centre.y() - 12, 185, 24),
-                       Qt.AlignmentFlag.AlignLeft, "POST-UNLOAD BLOCK")
+                       Qt.AlignmentFlag.AlignLeft, "AFTER-UNLOAD DESTINATION")
 
         likely_weight = self._likely_visible_planned_weight()
         displayed_order = (
@@ -2867,11 +2955,26 @@ class ArenaView(QWidget):
         toolbar.addStretch()
         page_layout.addLayout(toolbar)
 
+        return_limit_bar = QHBoxLayout()
+        return_limit_bar.addWidget(QLabel("Return home after:"))
+        self.mission_weight_limit = QSpinBox()
+        self.mission_weight_limit.setRange(1, 20)
+        self.mission_weight_limit.setValue(self.mission_layout.confirmed_weight_limit)
+        self.mission_weight_limit.setSuffix(" confirmed weights")
+        self.mission_weight_limit.setToolTip(
+            "Automatically return home after this many induction-confirmed pickups. "
+            "The 90-second round timer remains an independent backup limit.")
+        self.mission_weight_limit.valueChanged.connect(
+            self._mission_weight_limit_changed)
+        return_limit_bar.addWidget(self.mission_weight_limit)
+        return_limit_bar.addStretch()
+        page_layout.addLayout(return_limit_bar)
+
         tools = QHBoxLayout()
         for label, mode in (("Set start", "start"), ("+ Weight", "weight"),
                             ("+ Dummy weight", "dummy"), ("+ Wall", "wall"),
                             ("+ Ramp", "ramp"), ("+ Tube", "tube"),
-                            ("+ Block destination", "block_target")):
+                            ("+ After-unload destination", "block_target")):
             button = QPushButton(label)
             if mode == "block_target":
                 button.setToolTip(
@@ -2887,6 +2990,15 @@ class ArenaView(QWidget):
         delete = QPushButton("Delete selected")
         delete.clicked.connect(lambda: self.mission_canvas.delete_selected())
         tools.addWidget(delete)
+        self.clear_all_mission_button = QPushButton("CLEAR ALL")
+        self.clear_all_mission_button.setStyleSheet(
+            "QPushButton { background:#991b1b; color:white; font-weight:bold; }")
+        self.clear_all_mission_button.setToolTip(
+            "Remove every placed weight, obstacle, after-unload destination, and route. "
+            "The selected home, start pose, and navigation tuning are kept.")
+        self.clear_all_mission_button.clicked.connect(
+            self._clear_all_mission_items)
+        tools.addWidget(self.clear_all_mission_button)
         reset_view = QPushButton("Reset view")
         reset_view.clicked.connect(lambda: self.mission_canvas.reset_view())
         tools.addWidget(reset_view)
@@ -2897,7 +3009,8 @@ class ArenaView(QWidget):
         tools.addWidget(plan)
         self.export_local_mission_button = QPushButton("EXPORT LOCAL FIRMWARE CONFIG")
         self.export_local_mission_button.setToolTip(
-            "Save this arena, rotated obstacles, route, sensor poses, and navigation tuning "
+            "Save this arena, rotated obstacles, collection and after-unload routes, "
+            "sensor poses, and navigation tuning "
             "to PlatformIO/local_mission.json for the next Teensy build."
         )
         self.export_local_mission_button.clicked.connect(self._export_local_mission)
@@ -3218,12 +3331,38 @@ class ArenaView(QWidget):
                 "Sequence selection cancelled because the layout changed; "
                 "the saved visit order is unchanged.")
         self.mission_layout.route = []
+        self.mission_canvas.after_unload_route_visible = False
         self._return_home_route_active = False
         if hasattr(self, "mission_order_list"):
             self._refresh_mission_weight_order()
         self._save_mission_layout()
         self.mission_status.setText("Layout changed — press PLAN ROUTE to recalculate around the new geometry.")
         self.mission_canvas.update()
+
+    def _clear_all_mission_items(self):
+        confirmation = QMessageBox.question(
+            self,
+            "Clear all arena items?",
+            "This removes all real and dummy weights, walls, ramps, tubes, the "
+            "after-unload destination, and the planned route. The selected home, "
+            "start pose, and navigation tuning will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Visit sequence cancelled because the arena was cleared.")
+        self.mission_canvas.set_add_mode(None)
+        self.mission_layout.clear_arena_items()
+        self.mission_canvas.selected_id = "start"
+        self.mission_order_combo.blockSignals(True)
+        self.mission_order_combo.setCurrentIndex(0)
+        self.mission_order_combo.blockSignals(False)
+        self._mission_layout_changed()
+        self._mission_selection_changed("start")
 
     def _mission_home_changed(self, index):
         self.mission_layout.my_home = "green" if index == 0 else "blue"
@@ -3235,6 +3374,10 @@ class ArenaView(QWidget):
 
     def _mission_fallback_changed(self, index):
         self.mission_layout.fallback_strategy = max(0, min(2, int(index)))
+        self._save_mission_layout()
+
+    def _mission_weight_limit_changed(self, value):
+        self.mission_layout.confirmed_weight_limit = max(1, min(20, int(value)))
         self._save_mission_layout()
 
     def _mission_order_mode_changed(self, index):
@@ -3388,6 +3531,7 @@ class ArenaView(QWidget):
             self.map_tabs.setCurrentWidget(self.mission_page)
 
     def _plan_mission_route(self):
+        self.mission_canvas.after_unload_route_visible = False
         # Use the same physical footprint/safety margin that will be sent to
         # firmware so the graphical route and the real clearance agree.
         self.mission_layout.ROBOT_RADIUS_MM = (
@@ -3396,16 +3540,36 @@ class ArenaView(QWidget):
         self.mission_layout.SAFETY_MARGIN_MM = self.navigation_tuning_controls[
             "wall_clearance_mm"].value()
         if self.mission_layout.plan():
+            if (self.mission_layout.block_target is not None and
+                    self.mission_layout.after_unload_route() is None):
+                self.mission_layout.route_error = (
+                    "No map-clear route from the home dock to the after-unload destination.")
+                self.mission_status.setText(
+                    "ROUTE ERROR: " + self.mission_layout.route_error)
+                self.mission_canvas.update()
+                return False
+            after_unload_route = self.mission_layout.after_unload_route()
+            if after_unload_route is not None:
+                self.mission_canvas.after_unload_route_visible = True
             self._refresh_mission_weight_order()
             target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
             length = MissionLayout._path_length(
                 [(self.mission_layout.start["x"], self.mission_layout.start["y"])] +
                 [(point["x"], point["y"]) for point in self.mission_layout.route]
             )
+            after_unload_note = ""
+            if after_unload_route is not None:
+                after_unload_length = MissionLayout._path_length(after_unload_route)
+                after_unload_legs = len(after_unload_route) - 1
+                after_unload_note = (
+                    f" Red after-unload route: {after_unload_legs} legs, "
+                    f"about {after_unload_length/1000.0:.1f} m from home."
+                )
             self.mission_status.setText(
                 f"Route ready ({'manual' if self.mission_layout.order_mode == 'manual' else 'automatic'} order): "
                 f"{target_count} real weights, {len(self.mission_layout.route)} waypoints, "
                 f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
+                f"{after_unload_note}"
             )
         else:
             self.mission_status.setText("ROUTE ERROR: " + self.mission_layout.route_error)
@@ -3610,8 +3774,15 @@ class ArenaView(QWidget):
                 block_target["x"], block_target["y"]):
             QMessageBox.warning(
                 self, "Local mission export",
-                "The post-unload block destination is inside a wall, ramp, obstacle, "
+                "The after-unload destination is inside a wall, ramp, obstacle, "
                 "or arena-edge clearance. Move it to a reachable point before exporting."
+            )
+            return
+        if block_target is not None and self.mission_layout.after_unload_route() is None:
+            QMessageBox.warning(
+                self, "Local mission export",
+                "No map-clear route is available from the home dock to the "
+                "after-unload destination. Move the marker or edit the arena first."
             )
             return
         real_targets = sum(1 for item in self.mission_layout.weights

@@ -2,7 +2,7 @@
 
 The local run reuses the existing pre-laid mission navigation and home unload
 sequence. `LocalCompetition` handles the AIO9 rising edge, 90-second clock, and
-confirmed-weight limit; `BluetoothDebugWorkflow` remains the controller for
+configurable confirmed-weight limit (default 3); `BluetoothDebugWorkflow` remains the controller for
 navigation, encoders/IMU, TOFs, arm sorting, motors, and storage-gate unloading.
 
 ## Prepare and export the arena
@@ -36,8 +36,15 @@ tuning change. No Bluetooth command is needed to upload the mission.
 - The run arms the existing sorting mechanism, starts motor bank 1 at 100%,
   and starts the exported planned mission. The storage-release gate is handled
   by the existing navigation/home logic.
-- At 90 seconds from the AIO9 edge, or after five inductive weight
-  confirmations during the run, the supervisor marks remaining weight targets
+- On **Arena View → Mission Planner**, set **Return home after** to the number
+  of inductive-confirmed pickups you want. This value is saved with the layout
+  and included in the exported local firmware config. Re-export and rebuild
+  after changing it. The existing single **After-unload destination** marker is also
+  saved/exported. A red trace previews the map-clear route from the home dock;
+  the same waypoint path is sent to firmware and followed after unloading.
+  Firmware retains its existing map rerouting if a leg becomes blocked.
+- At 90 seconds from the AIO9 edge, or after the configured number of
+  inductive weight confirmations during the run, the supervisor marks remaining weight targets
   skipped and hands control to the normal map-aware return-home planner. It
   performs the existing reverse dock, gate-open and shake sequence. After
   unloading it closes the storage gate and stops the run. The live telemetry

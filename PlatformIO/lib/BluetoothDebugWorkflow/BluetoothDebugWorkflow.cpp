@@ -449,6 +449,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionAutoReturnHome_ = false;
         localBlockTargetValid_ = false;
         localBlockTargetEnroute_ = false;
+        localBlockRouteCount_ = 0;
         localPostUnloadPhase_ = 0;
         localPostUnloadStartedMs_ = 0;
         missionDockPhase_ = 0;
@@ -670,6 +671,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         const int startY = message["start_y_mm"] | -1;
         const float startHeading = message["start_heading_deg"] | 0.0f;
         const int fallback = message["fallback_strategy"] | 0;
+        const int confirmedWeightLimit = message["confirmed_weight_limit"] |
+            LocalCompetition::DEFAULT_CONFIRMED_WEIGHT_LIMIT;
         const int homeX = message["home_x_mm"] | -1;
         const int homeY = message["home_y_mm"] | -1;
         bool blockTargetValid = false;
@@ -694,10 +697,54 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             }
             blockTargetValid = true;
         }
-        if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
-            fallback < 0 || fallback > 2)
+        MissionWaypoint blockRoute[MAX_MISSION_WAYPOINTS] = {};
+        uint8_t blockRouteCount = 0;
+        if (!message["block_route"].isNull())
         {
-            link_.error("Mission start/fallback values are outside the supported range");
+            if (!message["block_route"].is<JsonArray>())
+            {
+                link_.error("After-unload route must be a flat x,y array");
+                return;
+            }
+            JsonArray route = message["block_route"].as<JsonArray>();
+            if (route.size() % 2 != 0 ||
+                route.size() / 2 > MAX_MISSION_WAYPOINTS ||
+                (blockTargetValid && route.size() < 4) ||
+                (!blockTargetValid && route.size() != 0))
+            {
+                link_.error("After-unload route must contain 2..64 x,y pairs for its destination");
+                return;
+            }
+            blockRouteCount = static_cast<uint8_t>(route.size() / 2);
+            for (uint8_t i = 0; i < blockRouteCount; ++i)
+            {
+                const int x = route[2U * i].as<int>();
+                const int y = route[2U * i + 1U].as<int>();
+                if (x < 0 || x > 4900 || y < 0 || y > 2400)
+                {
+                    link_.error("After-unload route waypoint is outside the arena");
+                    return;
+                }
+                blockRoute[i].xMm = static_cast<int16_t>(x);
+                blockRoute[i].yMm = static_cast<int16_t>(y);
+                blockRoute[i].flags = 0;
+            }
+            if (blockRouteCount > 0 &&
+                (homeX < 0 || homeX > 4900 || homeY < 0 || homeY > 2400 ||
+                 blockRoute[0].xMm != homeX || blockRoute[0].yMm != homeY ||
+                 blockRoute[blockRouteCount - 1].xMm != blockTargetX ||
+                 blockRoute[blockRouteCount - 1].yMm != blockTargetY))
+            {
+                link_.error("After-unload route must start at home and end at its destination");
+                return;
+            }
+        }
+        if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
+            fallback < 0 || fallback > 2 ||
+            confirmedWeightLimit < LocalCompetition::MIN_CONFIRMED_WEIGHT_LIMIT ||
+            confirmedWeightLimit > LocalCompetition::MAX_CONFIRMED_WEIGHT_LIMIT)
+        {
+            link_.error("Mission start, fallback, or confirmed-weight limit is outside the supported range");
             return;
         }
 
@@ -728,9 +775,14 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         while (missionStartArenaHeadingDeg_ >= 360.0f) missionStartArenaHeadingDeg_ -= 360.0f;
         while (missionStartArenaHeadingDeg_ < 0.0f) missionStartArenaHeadingDeg_ += 360.0f;
         missionFallbackStrategy_ = static_cast<uint8_t>(fallback);
+        localCompetition_.setConfirmedWeightLimit(
+            static_cast<uint8_t>(confirmedWeightLimit));
         localBlockTargetValid_ = blockTargetValid;
         localBlockTargetXmm_ = static_cast<int16_t>(blockTargetX);
         localBlockTargetYmm_ = static_cast<int16_t>(blockTargetY);
+        localBlockRouteCount_ = blockRouteCount;
+        for (uint8_t i = 0; i < blockRouteCount; ++i)
+            localBlockRoute_[i] = blockRoute[i];
         localBlockTargetEnroute_ = false;
         localPostUnloadPhase_ = 0;
         localPostUnloadStartedMs_ = 0;
@@ -2145,7 +2197,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["local_competition.remaining_ms"] = localRunActive_
         ? localCompetition_.remainingMs(now) : 0U;
     data["local_competition.confirmed_weights"] = localCompetition_.confirmedWeights();
-    data["local_competition.weight_limit"] = LocalCompetition::CONFIRMED_WEIGHT_LIMIT;
+    data["local_competition.weight_limit"] = localCompetition_.confirmedWeightLimit();
     data["local_competition.aio9_high"] = aio9ButtonRawHigh_;
     data["local_competition.aio9_available"] = aioExpanderReady_;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
@@ -5514,6 +5566,12 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (missionUnloadPhase_ == HomeUnloadConfig::LAST_SHAKE_PHASE)
                 {
                     missionUnloadPhase_ = 0;
+                    // The drum is only needed while the robot is carrying
+                    // weights and unloading. Stop it as soon as the final
+                    // shake finishes, before the dwell or any next route leg.
+                    JsonDocument stopDrum;
+                    stopDrum["command"] = "dc_motor_203_stop";
+                    handleCommand(stopDrum);
                     link_.log("INFO", "Home unload complete: 3 full-power shake cycles; storage gate open");
                 }
                 else
@@ -5699,17 +5757,25 @@ void BluetoothDebugWorkflow::updateNavigation()
                             // map rerouting for the post-unload destination.
                             // It is not a weight target and must not trigger
                             // another home-return transition.
-                            JsonDocument stopDrum;
-                            stopDrum["command"] = "dc_motor_203_stop";
-                            handleCommand(stopDrum);
                             hx12kB_.setAngle(50.0f);
                             missionReturnHome_ = false;
                             missionAutoReturnHome_ = false;
                             missionWaypointIndex_ = 0;
-                            missionWaypointCount_ = 1;
-                            missionWaypoints_[0].xMm = localBlockTargetXmm_;
-                            missionWaypoints_[0].yMm = localBlockTargetYmm_;
-                            missionWaypoints_[0].flags = 0;
+                            if (localBlockRouteCount_ >= 2)
+                            {
+                                missionWaypointCount_ = localBlockRouteCount_;
+                                for (uint8_t i = 0; i < localBlockRouteCount_; ++i)
+                                    missionWaypoints_[i] = localBlockRoute_[i];
+                            }
+                            else
+                            {
+                                // Compatibility with older planners that send
+                                // only the destination marker.
+                                missionWaypointCount_ = 1;
+                                missionWaypoints_[0].xMm = localBlockTargetXmm_;
+                                missionWaypoints_[0].yMm = localBlockTargetYmm_;
+                                missionWaypoints_[0].flags = 0;
+                            }
                             missionDockPhase_ = 0;
                             missionUnloadPhase_ = 0;
                             missionReroutePoseValid_ = false;

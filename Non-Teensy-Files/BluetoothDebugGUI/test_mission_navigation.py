@@ -276,6 +276,14 @@ class MissionUploadTests(unittest.TestCase):
         self.assertEqual(layout.block_target["x"], 3200)
         self.assertEqual(layout.command_payload()["block_target"],
                          {"x_mm": 3200, "y_mm": 1250})
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        home = layout.home_rect(layout.my_home)
+        self.assertEqual(route[0], (home[0] + home[2] * 0.5,
+                                    home[1] + home[3] * 0.5))
+        self.assertEqual(route[-1], (3200.0, 1250.0))
+        self.assertEqual(layout.command_payload()["block_route"],
+                         [int(round(value)) for point in route for value in point])
 
         restored = MissionLayout()
         restored.load_dict(layout.to_dict())
@@ -286,6 +294,111 @@ class MissionUploadTests(unittest.TestCase):
                          {"x_mm": 3300, "y_mm": 1300})
         self.assertTrue(restored.delete_item("block_target"))
         self.assertIsNone(restored.command_payload()["block_target"])
+
+    def test_after_unload_route_avoids_mapped_wall(self):
+        layout = MissionLayout()
+        wall = layout.add_obstacle("wall", 1800, 325)
+        layout.set_block_target(3200, 325)
+
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        self.assertGreater(len(route), 2)
+        self.assertTrue(all(layout._segment_clear(first, second)
+                            for first, second in zip(route, route[1:])))
+        self.assertTrue(layout.set_obstacle_rotation(wall["id"], 90))
+        rotated_route = layout.after_unload_route()
+        self.assertIsNotNone(rotated_route)
+        self.assertTrue(all(layout._segment_clear(first, second)
+                            for first, second in zip(rotated_route,
+                                                     rotated_route[1:])))
+
+    def test_after_unload_route_starts_at_blue_home_centre(self):
+        layout = MissionLayout()
+        layout.my_home = "blue"
+        layout.set_block_target(2329, 1181)
+
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        self.assertEqual(route[0], (325.0, 2075.0))
+        self.assertEqual(route[-1], (2329.0, 1181.0))
+
+    def test_clear_arena_items_keeps_home_start_and_tuning(self):
+        layout = MissionLayout()
+        layout.my_home = "blue"
+        layout.start = {"x": 700.0, "y": 900.0, "heading_deg": 90.0}
+        layout.confirmed_weight_limit = 5
+        layout.add_weight(2200, 1200)
+        layout.add_weight(2600, 900, dummy=True)
+        layout.add_obstacle("wall", 1800, 1000)
+        layout.set_block_target(3200, 1200)
+        layout.order_mode = "manual"
+        layout.target_order = [layout.weights[0]["id"]]
+        layout.route = [{"x": 2200.0, "y": 1200.0, "target": True}]
+
+        layout.clear_arena_items()
+
+        self.assertEqual(layout.weights, [])
+        self.assertEqual(layout.obstacles, [])
+        self.assertIsNone(layout.block_target)
+        self.assertEqual(layout.route, [])
+        self.assertEqual(layout.order_mode, "auto")
+        self.assertEqual(layout.target_order, [])
+        self.assertEqual(layout.my_home, "blue")
+        self.assertEqual(layout.start,
+                         {"x": 700.0, "y": 900.0, "heading_deg": 90.0})
+        self.assertEqual(layout.confirmed_weight_limit, 5)
+
+    def test_confirmed_weight_limit_is_saved_and_exported(self):
+        layout = MissionLayout()
+        self.assertEqual(layout.confirmed_weight_limit, 3)
+        layout.confirmed_weight_limit = 5
+        self.assertEqual(layout.command_payload()["confirmed_weight_limit"], 5)
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.confirmed_weight_limit, 5)
+        self.assertEqual(restored.command_payload()["confirmed_weight_limit"], 5)
+
+        restored.load_dict({"confirmed_weight_limit": 99})
+        self.assertEqual(restored.confirmed_weight_limit, 20)
+
+    def test_mission_planner_weight_limit_control_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_weight_limit.setValue(6)
+            self.assertEqual(view.mission_layout.confirmed_weight_limit, 6)
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["confirmed_weight_limit"], 6)
+            self.assertEqual(view.mission_layout.command_payload()[
+                "confirmed_weight_limit"], 6)
+            view.close()
+
+    def test_plan_route_shows_home_to_after_unload_route_in_red(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_layout.add_weight(2200, 1200)
+            view.mission_layout.set_block_target(3200, 1600)
+
+            self.assertFalse(view.mission_canvas.after_unload_route_visible)
+            self.assertTrue(view._plan_mission_route(),
+                            view.mission_layout.route_error)
+            self.assertTrue(view.mission_canvas.after_unload_route_visible)
+            self.assertIn("Red after-unload route:",
+                          view.mission_status.text())
+
+            # Editing the map invalidates the preview so the next plan is
+            # always based on current geometry and destination.
+            view._mission_layout_changed()
+            self.assertFalse(view.mission_canvas.after_unload_route_visible)
+            view.close()
+
+            restored_view = ArenaView(settings)
+            self.assertEqual(restored_view.mission_weight_limit.value(), 6)
+            restored_view.close()
 
     def test_mission_planner_records_and_persists_map_clicked_sequence(self):
         with tempfile.TemporaryDirectory() as directory:

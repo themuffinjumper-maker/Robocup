@@ -325,6 +325,8 @@ private:
         uint8_t flags = 0;  // bit 0 = target, bit 2 = reverse dock, bit 3 = gap-centre transit
     };
     MissionWaypoint missionWaypoints_[MAX_MISSION_WAYPOINTS] = {};
+    MissionWaypoint localBlockRoute_[MAX_MISSION_WAYPOINTS] = {};
+    uint8_t localBlockRouteCount_ = 0;
     uint8_t missionWaypointCount_ = 0;
     uint8_t missionWaypointIndex_ = 0;
     uint8_t missionFallbackStrategy_ = 0;
