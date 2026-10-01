@@ -236,6 +236,68 @@ class MissionUploadTests(unittest.TestCase):
         ramp_feature = layout.map_payload()["features"][:5]
         self.assertEqual(ramp_feature[4], 0)
 
+    def test_go_ramp_route_crosses_short_sides_on_centerline(self):
+        layout = MissionLayout()
+        ramp = layout.add_obstacle("ramp_go", 1800, 1200)
+
+        self.assertFalse(layout.blocked(ramp["x"], ramp["y"]))
+        self.assertEqual(layout.map_payload()["features"][4], 3)
+        path = layout._travel_path((700, 1200), (3000, 1200))
+        self.assertIsNotNone(path)
+        required = [(840.0, 1200.0), (1205.0, 1200.0),
+                    (1800.0, 1200.0), (2395.0, 1200.0),
+                    (2760.0, 1200.0)]
+        indices = [path.index(point) for point in required]
+        self.assertEqual(indices, sorted(indices))
+
+    def test_weight_mission_route_includes_go_ramp_crossing(self):
+        layout = MissionLayout()
+        ramp = layout.add_obstacle("ramp_go", 1800, 1200)
+        layout.add_weight(3000, 1200)
+
+        self.assertTrue(layout.plan(), layout.route_error)
+        self.assertIn((ramp["x"], ramp["y"]),
+                      [(point["x"], point["y"]) for point in layout.route])
+
+    def test_go_ramp_can_be_angled_and_no_go_ramp_stays_blocked(self):
+        layout = MissionLayout()
+        no_go = layout.add_obstacle("ramp_no_go", 4200, 1800)
+        self.assertTrue(layout.blocked(no_go["x"], no_go["y"]))
+        self.assertEqual(layout.map_payload()["features"][4], 0)
+
+        go = layout.add_obstacle("ramp_go", 1800, 1200)
+        self.assertTrue(layout.set_obstacle_rotation(go["id"], 37))
+        path = layout._travel_path((700, 1200), (3000, 1200))
+        self.assertIsNotNone(path)
+        angle = math.radians(37)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        centre_index = path.index((go["x"], go["y"]))
+        entry, centre, exit_point = path[centre_index - 1:centre_index + 2]
+        for point in (entry, centre, exit_point):
+            local_y = (-(point[0] - go["x"]) * sine +
+                       (point[1] - go["y"]) * cosine)
+            self.assertAlmostEqual(local_y, 0.0, places=6)
+
+    def test_mission_gui_exposes_ramp_types_and_go_ramp_angle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            labels = {button.text() for button in
+                      view.mission_page.findChildren(QPushButton)}
+            self.assertIn("+ No-go ramp", labels)
+            self.assertIn("+ Go ramp", labels)
+
+            ramp = view.mission_layout.add_obstacle("ramp_go", 1800, 1200)
+            view.mission_canvas.selected_id = ramp["id"]
+            view._mission_selection_changed(ramp["id"])
+            self.assertTrue(view.mission_obstacle_angle.isEnabled())
+            self.assertEqual(view.mission_obstacle_angle_label.text(),
+                             "Ramp angle")
+            view.mission_obstacle_angle.setValue(37)
+            self.assertEqual(ramp["rotation"], 37)
+            view.close()
+
     def test_zero_weight_limit_plans_direct_route_from_start_to_destination(self):
         layout = MissionLayout()
         layout.confirmed_weight_limit = 0

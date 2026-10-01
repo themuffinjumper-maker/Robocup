@@ -1166,9 +1166,14 @@ class MissionLayout:
 
     DEFAULT_SIZES = {
         "wall": (600.0, 130.0),
+        # Keep "ramp" as a legacy alias for the original no-go ramp.
         "ramp": (1190.0, 400.0),
+        "ramp_no_go": (1190.0, 400.0),
+        "ramp_go": (1190.0, 400.0),
         "tube": (320.0, 320.0),
     }
+    GO_RAMP_KINDS = frozenset(("ramp_go",))
+    NO_GO_RAMP_KINDS = frozenset(("ramp", "ramp_no_go"))
 
     def __init__(self):
         self.my_home = "green"
@@ -1278,7 +1283,8 @@ class MissionLayout:
 
     def rotate_item(self, item_id):
         for item in self.obstacles:
-            if item["id"] == item_id and item["kind"] in ("wall", "ramp"):
+            if item["id"] == item_id and item["kind"] in (
+                    "wall", *self.NO_GO_RAMP_KINDS, *self.GO_RAMP_KINDS):
                 item["rotation"] = (float(item.get("rotation", 0)) + 90) % 180
                 self.route = []
                 return True
@@ -1286,7 +1292,8 @@ class MissionLayout:
 
     def set_obstacle_rotation(self, item_id, angle_deg):
         for item in self.obstacles:
-            if item["id"] == item_id and item["kind"] == "wall":
+            if item["id"] == item_id and item["kind"] in (
+                    "wall", *self.GO_RAMP_KINDS):
                 item["rotation"] = float(angle_deg) % 180.0
                 self.route = []
                 return True
@@ -1316,6 +1323,10 @@ class MissionLayout:
         x0, y0, x1, y1 = rect
         return x0 <= x <= x1 and y0 <= y <= y1
 
+    def _go_ramp_ids(self):
+        return frozenset(item["id"] for item in self.obstacles
+                         if item["kind"] in self.GO_RAMP_KINDS)
+
     def _obstacle_corners(self, item):
         angle = math.radians(float(item.get("rotation", 0)))
         cosine, sine = math.cos(angle), math.sin(angle)
@@ -1330,13 +1341,20 @@ class MissionLayout:
         return (min(x for x, _ in corners), min(y for _, y in corners),
                 max(x for x, _ in corners), max(y for _, y in corners))
 
-    def blocked(self, x, y, extra=0.0):
+    def blocked(self, x, y, extra=0.0, blocked_go_ramp_ids=None):
         clearance = self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM + extra
+        blocked_go_ramp_ids = blocked_go_ramp_ids or ()
         if (x < clearance or y < clearance or
                 x > self.WIDTH_MM - clearance or
                 y > self.HEIGHT_MM - clearance):
             return True
         for item in self.obstacles:
+            if (item["kind"] in self.GO_RAMP_KINDS and
+                    item["id"] not in blocked_go_ramp_ids):
+                # A go-ramp is deliberately traversable, but its route is
+                # constrained to the perpendicular short-side centreline in
+                # _travel_path().
+                continue
             if item["kind"] == "tube":
                 radius = item["w"] / 2 + clearance
                 if math.hypot(x - item["x"], y - item["y"]) <= radius:
@@ -1360,22 +1378,25 @@ class MissionLayout:
                 return True
         return False
 
-    def _segment_clear(self, first, second):
+    def _segment_clear(self, first, second, blocked_go_ramp_ids=None):
         x0, y0 = first
         x1, y1 = second
         distance = math.hypot(x1 - x0, y1 - y0)
         samples = max(1, math.ceil(distance / 45.0))
         for index in range(samples + 1):
             t = index / samples
-            if self.blocked(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t):
+            if self.blocked(x0 + (x1 - x0) * t,
+                            y0 + (y1 - y0) * t,
+                            blocked_go_ramp_ids=blocked_go_ramp_ids):
                 return False
         return True
 
-    def _nearest_free_grid(self, point):
+    def _nearest_free_grid(self, point, blocked_go_ramp_ids=None):
         spacing = self.GRID_MM
         gx = int(round(point[0] / spacing))
         gy = int(round(point[1] / spacing))
-        if not self.blocked(gx * spacing, gy * spacing):
+        if not self.blocked(gx * spacing, gy * spacing,
+                            blocked_go_ramp_ids=blocked_go_ramp_ids):
             return gx, gy
         for radius in range(1, 8):
             candidates = []
@@ -1389,13 +1410,15 @@ class MissionLayout:
                 p[0] * spacing - point[0], p[1] * spacing - point[1]))
             for candidate in candidates:
                 x, y = candidate[0] * spacing, candidate[1] * spacing
-                if 0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM and not self.blocked(x, y):
+                if (0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM and
+                        not self.blocked(x, y,
+                                         blocked_go_ramp_ids=blocked_go_ramp_ids)):
                     return candidate
         return None
 
-    def _astar(self, start, goal):
-        start_cell = self._nearest_free_grid(start)
-        goal_cell = self._nearest_free_grid(goal)
+    def _astar(self, start, goal, blocked_go_ramp_ids=None):
+        start_cell = self._nearest_free_grid(start, blocked_go_ramp_ids)
+        goal_cell = self._nearest_free_grid(goal, blocked_go_ramp_ids)
         if start_cell is None or goal_cell is None:
             return None
         spacing = self.GRID_MM
@@ -1420,13 +1443,15 @@ class MissionLayout:
                 x, y = nxt[0] * spacing, nxt[1] * spacing
                 if not (0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM):
                     continue
-                if self.blocked(x, y):
+                if self.blocked(x, y,
+                                blocked_go_ramp_ids=blocked_go_ramp_ids):
                     continue
                 # A diagonal step can cut through an inflated rectangle even
                 # when both grid endpoints are free. Never hand that corner
                 # cut to the robot as a supposedly clear travel segment.
                 if not self._segment_clear(
-                        (current[0] * spacing, current[1] * spacing), (x, y)):
+                        (current[0] * spacing, current[1] * spacing), (x, y),
+                        blocked_go_ramp_ids):
                     continue
                 tentative = g_score[current] + cost
                 if tentative >= g_score.get(nxt, float("inf")):
@@ -1442,13 +1467,13 @@ class MissionLayout:
             cells.append(parent[cells[-1]])
         cells.reverse()
         path = [(cell[0] * spacing, cell[1] * spacing) for cell in cells]
-        if self._segment_clear(start, path[0]):
+        if self._segment_clear(start, path[0], blocked_go_ramp_ids):
             path[0] = (float(start[0]), float(start[1]))
-        if self._segment_clear(path[-1], goal):
+        if self._segment_clear(path[-1], goal, blocked_go_ramp_ids):
             path[-1] = (float(goal[0]), float(goal[1]))
-        return self._smooth(path)
+        return self._smooth(path, blocked_go_ramp_ids)
 
-    def _smooth(self, path):
+    def _smooth(self, path, blocked_go_ramp_ids=None):
         if not path:
             return []
         result = [path[0]]
@@ -1456,7 +1481,8 @@ class MissionLayout:
         while anchor < len(path) - 1:
             furthest = anchor + 1
             for candidate in range(len(path) - 1, anchor, -1):
-                if self._segment_clear(path[anchor], path[candidate]):
+                if self._segment_clear(path[anchor], path[candidate],
+                                       blocked_go_ramp_ids):
                     furthest = candidate
                     break
             result.append(path[furthest])
@@ -1468,19 +1494,114 @@ class MissionLayout:
         return sum(math.hypot(b[0] - a[0], b[1] - a[1])
                    for a, b in zip(path, path[1:]))
 
-    def _travel_path(self, start, goal):
-        """Plan at precisely the clearance displayed to the operator."""
-        path = self._astar(start, goal)
+    def _basic_travel_path(self, start, goal, blocked_go_ramp_ids):
+        """A* connector used outside explicitly traversed go-ramp corridors."""
+        path = self._astar(start, goal, blocked_go_ramp_ids)
         if not path:
             return None
-        if not self._segment_clear(start, path[0]) or \
-                not self._segment_clear(path[-1], goal):
+        if (not self._segment_clear(start, path[0], blocked_go_ramp_ids) or
+                not self._segment_clear(path[-1], goal, blocked_go_ramp_ids)):
             return None
         if math.dist(start, path[0]) > 1.0:
             path.insert(0, (float(start[0]), float(start[1])))
         if math.dist(path[-1], goal) > 1.0:
             path.append((float(goal[0]), float(goal[1])))
-        return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
+        return path if all(self._segment_clear(a, b, blocked_go_ramp_ids)
+                           for a, b in zip(path, path[1:])) else None
+
+    def _go_ramp_path_progress(self, path, ramp):
+        """Return the first distance along a path that enters the ramp footprint."""
+        half_width = float(ramp["w"]) / 2 + self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM
+        half_height = float(ramp["h"]) / 2 + self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM
+        angle = math.radians(float(ramp.get("rotation", 0.0)))
+        cosine, sine = math.cos(angle), math.sin(angle)
+        travelled = 0.0
+        for first, second in zip(path, path[1:]):
+            length = math.dist(first, second)
+            samples = max(1, math.ceil(length / 30.0))
+            for index in range(samples + 1):
+                t = index / samples
+                x = first[0] + (second[0] - first[0]) * t - ramp["x"]
+                y = first[1] + (second[1] - first[1]) * t - ramp["y"]
+                local_x = x * cosine + y * sine
+                local_y = -x * sine + y * cosine
+                if abs(local_x) <= half_width and abs(local_y) <= half_height:
+                    return travelled + length * t
+            travelled += length
+        return None
+
+    def _travel_path(self, start, goal, blocked_go_ramp_ids=None):
+        """Plan a route; any crossed go-ramp uses its perpendicular centreline."""
+        blocked_go_ramp_ids = frozenset(blocked_go_ramp_ids or ())
+        path = self._basic_travel_path(start, goal, blocked_go_ramp_ids)
+        if not path:
+            return None
+
+        go_ramps = [item for item in self.obstacles
+                    if item["kind"] in self.GO_RAMP_KINDS and
+                    item["id"] not in blocked_go_ramp_ids]
+        crossings = []
+        for ramp in go_ramps:
+            progress = self._go_ramp_path_progress(path, ramp)
+            if progress is not None:
+                crossings.append((progress, ramp))
+        if not crossings:
+            return path
+
+        # Connectors avoid every ramp. Only the explicit five-point corridor
+        # below is allowed to enter a go-ramp, ensuring square-on entry and a
+        # straight, centred crossing from one short side to the other.
+        all_go_ramp_ids = frozenset(
+            blocked_go_ramp_ids | {item["id"] for item in self.obstacles
+                                   if item["kind"] in self.GO_RAMP_KINDS})
+        route = [(float(start[0]), float(start[1]))]
+        current = route[0]
+        crossings.sort(key=lambda item: item[0])
+        for _progress, ramp in crossings:
+            angle = math.radians(float(ramp.get("rotation", 0.0)))
+            axis_x, axis_y = math.cos(angle), math.sin(angle)
+            half_length = float(ramp["w"]) / 2
+            approach_offset = (half_length + self.ROBOT_RADIUS_MM +
+                               self.SAFETY_MARGIN_MM + 120.0)
+            centre = (float(ramp["x"]), float(ramp["y"]))
+            crossing_blocked_ids = all_go_ramp_ids - {ramp["id"]}
+            candidates = []
+            for direction in (-1.0, 1.0):
+                approach = (centre[0] - direction * axis_x * approach_offset,
+                            centre[1] - direction * axis_y * approach_offset)
+                entry = (centre[0] - direction * axis_x * half_length,
+                         centre[1] - direction * axis_y * half_length)
+                exit_point = (centre[0] + direction * axis_x * half_length,
+                              centre[1] + direction * axis_y * half_length)
+                depart = (centre[0] + direction * axis_x * approach_offset,
+                          centre[1] + direction * axis_y * approach_offset)
+                prefix = self._basic_travel_path(
+                    current, approach, all_go_ramp_ids)
+                suffix = self._basic_travel_path(
+                    depart, goal, all_go_ramp_ids)
+                if prefix is None or suffix is None:
+                    continue
+                through = [approach, entry, centre, exit_point, depart]
+                if not all(self._segment_clear(a, b, crossing_blocked_ids)
+                           for a, b in zip(through, through[1:])):
+                    continue
+                length = (self._path_length(prefix) +
+                          self._path_length(through) +
+                          self._path_length(suffix))
+                candidates.append((length, prefix, through, suffix, depart))
+            if not candidates:
+                return None
+            _length, prefix, through, _suffix, depart = min(
+                candidates, key=lambda candidate: candidate[0])
+            route.extend(prefix[1:])
+            route.extend(through[1:])
+            current = depart
+
+        suffix = self._basic_travel_path(current, goal, all_go_ramp_ids)
+        if suffix is None:
+            return None
+        route.extend(suffix[1:])
+        return route
 
     def after_unload_route(self):
         """Map-clear route to the optional final destination.
@@ -1563,7 +1684,9 @@ class MissionLayout:
         for distance in (750, 950, 1150, 1350, 1550, 1750):
             for offset in (0, 100, -100, 200, -200):
                 stage = (home[0] + inward * distance, home[1] + offset)
-                if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
+                if (self.blocked(*stage, extra=70.0) or
+                        not self._segment_clear(
+                            stage, home, self._go_ramp_ids())):
                     continue
                 path = self._travel_path(start, stage)
                 if path and len(path) >= 2:
@@ -1578,7 +1701,9 @@ class MissionLayout:
                     angle = math.radians(degrees)
                     stage = (home[0] + inward * distance * math.cos(angle),
                              home[1] + distance * math.sin(angle))
-                    if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
+                    if (self.blocked(*stage, extra=70.0) or
+                            not self._segment_clear(
+                                stage, home, self._go_ramp_ids())):
                         continue
                     path = self._travel_path(start, stage)
                     if path and len(path) >= 2:
@@ -1654,13 +1779,15 @@ class MissionLayout:
                     ux, uy = math.cos(angle), math.sin(angle)
                     stage = (visit[0] - 350.0 * ux,
                              visit[1] - 350.0 * uy)
-                    if self.blocked(*stage) or not self._segment_clear(stage, visit):
+                    if (self.blocked(*stage) or not self._segment_clear(
+                            stage, visit, self._go_ramp_ids())):
                         continue
                     clear_behind = 0
                     for distance in (200, 300, 400, 500):
                         end = (visit[0] + distance * ux,
                                visit[1] + distance * uy)
-                        if self._segment_clear(visit, end):
+                        if self._segment_clear(
+                                visit, end, self._go_ramp_ids()):
                             clear_behind = distance
                         else:
                             break
@@ -1753,8 +1880,8 @@ class MissionLayout:
 
     def map_payload(self):
         # Rectangles are deliberately compact: the Teensy command receive
-        # buffer is 768 bytes. Kind 0 features are forbidden zones (ramps);
-        # kind 1 features are physical landmarks.
+        # buffer is 768 bytes. Kind 0 is a no-go ramp, kind 1 is a physical
+        # wall, kind 2 is a dummy weight, and kind 3 is a traversable ramp.
         features = []
         rectangles = []
         rotated_walls = []
@@ -1763,8 +1890,13 @@ class MissionLayout:
                 rotated_walls.extend([len(rectangles), int(round(item["x"])),
                                       int(round(item["y"])),
                                       int(round(float(item.get("rotation", 0)))) % 180])
-            rectangles.append((self._obstacle_rect(item),
-                               0 if item["kind"] == "ramp" else 1))
+            if item["kind"] in self.GO_RAMP_KINDS:
+                feature_kind = 3
+            elif item["kind"] in self.NO_GO_RAMP_KINDS:
+                feature_kind = 0
+            else:
+                feature_kind = 1
+            rectangles.append((self._obstacle_rect(item), feature_kind))
         rectangles.extend(((item["x"] - 120, item["y"] - 120,
                             item["x"] + 120, item["y"] + 120), 2)
                           for item in self.weights if item["dummy"])
@@ -1831,7 +1963,8 @@ class MissionLayout:
             if item.get("kind") == "wall":
                 item["w"], item["h"] = self.DEFAULT_SIZES["wall"]
                 item["rotation"] = float(item.get("rotation", 0)) % 180.0
-            elif item.get("kind") == "ramp":
+            elif item.get("kind") in (
+                    "ramp", "ramp_no_go", "ramp_go"):
                 # Migrate ramps that still have the former default footprint;
                 # leave any explicitly customized ramp geometry alone.
                 try:
@@ -2199,7 +2332,11 @@ class MissionLayoutCanvas(QWidget):
 
         for item in model.obstacles:
             selected = item["id"] == self.selected_id
-            colour = {"wall": "#9ca3af", "ramp": "#f59e0b", "tube": "#a78bfa"}[item["kind"]]
+            colour = {
+                "wall": "#9ca3af", "ramp": "#f59e0b",
+                "ramp_no_go": "#f97316", "ramp_go": "#22c55e",
+                "tube": "#a78bfa",
+            }[item["kind"]]
             p.setPen(QPen(QColor("#ffffff" if selected else colour), 3 if selected else 2))
             p.setBrush(QColor(colour))
             if item["kind"] == "tube":
@@ -2209,18 +2346,32 @@ class MissionLayoutCanvas(QWidget):
                 obstacle_polygon = QPolygonF([self._screen(x, y)
                                                for x, y in model._obstacle_corners(item)])
                 p.drawPolygon(obstacle_polygon)
-                if item["kind"] == "ramp":
+                if item["kind"] in model.NO_GO_RAMP_KINDS:
                     p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
                     p.setBrush(QColor(127, 29, 29, 115))
                     p.drawPolygon(obstacle_polygon)
+                elif item["kind"] in model.GO_RAMP_KINDS:
+                    angle = math.radians(float(item.get("rotation", 0)))
+                    axis_x, axis_y = math.cos(angle), math.sin(angle)
+                    half_length = float(item["w"]) / 2
+                    p.setPen(QPen(QColor("#dcfce7"), 5,
+                                  Qt.PenStyle.DashLine,
+                                  Qt.PenCapStyle.RoundCap))
+                    p.drawLine(
+                        self._screen(item["x"] - axis_x * half_length,
+                                     item["y"] - axis_y * half_length),
+                        self._screen(item["x"] + axis_x * half_length,
+                                     item["y"] + axis_y * half_length))
             centre = self._screen(item["x"], item["y"])
             p.setPen(QColor("#111827"))
             size_text = (f"Ø{item['w']:.0f}" if item["kind"] == "tube" else
                          f"{item['w']:.0f}×{item['h']:.0f}")
             p.drawText(QRectF(centre.x() - 80, centre.y() - 17, 160, 34),
                        Qt.AlignmentFlag.AlignCenter,
-                       (f"RAMP — NO-GO ZONE\n{size_text} mm"
-                        if item["kind"] == "ramp" else
+                       (f"RAMP — NO-GO\n{size_text} mm"
+                        if item["kind"] in model.NO_GO_RAMP_KINDS else
+                        f"RAMP — GO THROUGH\n{size_text} mm"
+                        if item["kind"] in model.GO_RAMP_KINDS else
                         f"{item['kind'].upper()}\n{size_text} mm"))
 
         if model.block_target is not None:
@@ -3021,9 +3172,15 @@ class ArenaView(QWidget):
         tools = QHBoxLayout()
         for label, mode in (("Set start", "start"), ("+ Weight", "weight"),
                             ("+ Dummy weight", "dummy"), ("+ Wall", "wall"),
-                            ("+ Ramp", "ramp"), ("+ Tube", "tube"),
+                            ("+ No-go ramp", "ramp_no_go"),
+                            ("+ Go ramp", "ramp_go"), ("+ Tube", "tube"),
                             ("+ After-unload destination", "block_target")):
             button = QPushButton(label)
+            if mode in ("ramp_no_go", "ramp_go"):
+                button.setToolTip(
+                    "No-go ramp: the route planner avoids the ramp and its clearance. "
+                    "Go ramp: any route crossing it approaches square-on and follows "
+                    "the centreline between the short sides.")
             if mode == "block_target":
                 button.setToolTip(
                     "Place or move the single optional post-unload destination. "
@@ -3119,13 +3276,15 @@ class ArenaView(QWidget):
             self._mission_obstacle_dimension_changed)
         selection_form.addRow("Length / diameter", self.mission_obstacle_width)
         selection_form.addRow("Thickness / depth", self.mission_obstacle_height)
+        self.mission_obstacle_angle_label = QLabel("Wall angle")
         self.mission_obstacle_angle = QDoubleSpinBox()
         self.mission_obstacle_angle.setRange(0, 179)
         self.mission_obstacle_angle.setDecimals(0)
         self.mission_obstacle_angle.setSuffix("°")
         self.mission_obstacle_angle.valueChanged.connect(
             self._mission_obstacle_angle_changed)
-        selection_form.addRow("Wall angle", self.mission_obstacle_angle)
+        selection_form.addRow(self.mission_obstacle_angle_label,
+                              self.mission_obstacle_angle)
         self.mission_dummy_extra = QDoubleSpinBox()
         self.mission_dummy_extra.setRange(0, 500)
         self.mission_dummy_extra.setDecimals(0)
@@ -3231,6 +3390,7 @@ class ArenaView(QWidget):
         self.mission_obstacle_angle.blockSignals(True)
         try:
             if obstacle is None:
+                self.mission_obstacle_angle_label.setText("Wall angle")
                 if ident == "start":
                     label = "START"
                 elif ident == "block_target" and self.mission_layout.block_target is not None:
@@ -3249,13 +3409,16 @@ class ArenaView(QWidget):
             self.mission_selected_label.setText(
                 f"{obstacle['kind'].upper()} #{obstacle['id']}")
             is_wall = obstacle.get("kind") == "wall"
+            is_go_ramp = obstacle.get("kind") in self.mission_layout.GO_RAMP_KINDS
+            self.mission_obstacle_angle_label.setText(
+                "Ramp angle" if is_go_ramp else "Wall angle")
             self.mission_obstacle_width.setEnabled(not is_wall)
             self.mission_obstacle_width.setValue(float(obstacle.get("w", 100.0)))
             is_tube = obstacle.get("kind") == "tube"
             self.mission_obstacle_height.setEnabled(not is_tube and not is_wall)
             self.mission_obstacle_height.setValue(
                 float(obstacle.get("h", obstacle.get("w", 100.0))))
-            self.mission_obstacle_angle.setEnabled(is_wall)
+            self.mission_obstacle_angle.setEnabled(is_wall or is_go_ramp)
             self.mission_obstacle_angle.setValue(float(obstacle.get("rotation", 0)))
         finally:
             self.mission_obstacle_width.blockSignals(False)

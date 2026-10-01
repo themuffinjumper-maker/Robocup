@@ -421,8 +421,8 @@ private:
     uint32_t missionPoseRecoveryHoldUntilMs_ = 0;
     uint16_t missionLandmarkRecoveryCount_ = 0;
     uint16_t missionLandmarkRecoveryResidualMm_ = 0;
-    // Axis-aligned features uploaded with the route. Kind 0 is a no-go area;
-    // kind 1 is a physical surface that may be matched to a range reading.
+    // Arena features uploaded with the route: 0 no-go ramp, 1 wall,
+    // 2 dummy weight, 3 traversable go-ramp (centreline is in the route).
     static constexpr uint8_t MAX_MISSION_FEATURES = 24;
     struct MissionFeature {
         int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;

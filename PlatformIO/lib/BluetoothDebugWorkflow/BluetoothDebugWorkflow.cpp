@@ -503,7 +503,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             const int y1 = values[i + 3].as<int>();
             const int kind = values[i + 4].as<int>();
             if (x0 < 0 || y0 < 0 || x1 > 4900 || y1 > 2400 ||
-                x0 >= x1 || y0 >= y1 || (kind < 0 || kind > 2))
+                x0 >= x1 || y0 >= y1 || (kind < 0 || kind > 3))
             {
                 link_.error("Invalid mission map rectangle");
                 return;
@@ -3120,7 +3120,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
         for (uint8_t i = 0; i < missionFeatureCount_; ++i)
         {
             const MissionFeature& feature = missionFeatures_[i];
-            if (feature.kind != 0)
+            if (feature.kind != 0 && feature.kind != 3)
             {
                 if (feature.rotatedWall)
                     nearest = min(nearest, rayRotatedWall(originX, originY,
@@ -4584,7 +4584,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
-                if (feature.kind == 0) continue;
+                if (feature.kind == 0 || feature.kind == 3) continue;
                 const float hit = feature.rotatedWall
                     ? rayRotatedWall(sensorX, sensorY, ux, uy,
                         feature.wallX, feature.wallY, feature.rotationDeg)
@@ -4774,6 +4774,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
+                if (feature.kind == 3) continue;
                 // A dummy's value is deliberately independent of the wall
                 // setting: it is the requested gap from the robot's outer
                 // edge, rather than a hidden extra margin.
@@ -5296,7 +5297,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 for (uint8_t i = 0; i < missionFeatureCount_; ++i)
                 {
                     const MissionFeature& feature = missionFeatures_[i];
-                    if (feature.kind == 0) continue;
+                    if (feature.kind == 0 || feature.kind == 3) continue;
                     distance = min(distance, feature.rotatedWall
                         ? rayRotatedWall(originX, originY, ux, uy,
                             feature.wallX, feature.wallY, feature.rotationDeg)
@@ -5397,6 +5398,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
+                if (feature.kind == 3) continue;
                 const float featureClearance = feature.kind == 2
                     ? 0.5f * navigationRobotWidthMm_ +
                       missionDummyClearanceMm_ : CLEARANCE;
@@ -7063,7 +7065,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
-                if (feature.kind == 0) continue;
+                if (feature.kind == 0 || feature.kind == 3) continue;
                 mappedWallMm = min(mappedWallMm, feature.rotatedWall
                     ? rayRotatedWall(sensorX, sensorY, ux, uy,
                         feature.wallX, feature.wallY, feature.rotationDeg)
