@@ -231,9 +231,26 @@ class MissionUploadTests(unittest.TestCase):
     def test_ramp_is_a_forbidden_zone_in_planner_and_uploaded_map(self):
         layout = MissionLayout()
         ramp = layout.add_obstacle("ramp", 1800, 1000)
+        self.assertEqual((ramp["w"], ramp["h"]), (1190.0, 400.0))
         self.assertTrue(layout.blocked(ramp["x"], ramp["y"]))
         ramp_feature = layout.map_payload()["features"][:5]
         self.assertEqual(ramp_feature[4], 0)
+
+    def test_saved_default_ramp_migrates_but_custom_size_is_preserved(self):
+        layout = MissionLayout()
+        layout.load_dict({
+            "obstacles": [
+                {"id": 1, "kind": "ramp", "x": 1800, "y": 1000,
+                 "w": 700, "h": 380, "rotation": 0},
+                {"id": 2, "kind": "ramp", "x": 2800, "y": 1000,
+                 "w": 900, "h": 450, "rotation": 0},
+            ],
+            "next_id": 3,
+        })
+        self.assertEqual((layout.obstacles[0]["w"], layout.obstacles[0]["h"]),
+                         (1190.0, 400.0))
+        self.assertEqual((layout.obstacles[1]["w"], layout.obstacles[1]["h"]),
+                         (900, 450))
 
     def test_weight_route_has_straight_staging_and_run_through(self):
         layout = MissionLayout()

@@ -1166,7 +1166,7 @@ class MissionLayout:
 
     DEFAULT_SIZES = {
         "wall": (600.0, 130.0),
-        "ramp": (700.0, 380.0),
+        "ramp": (1190.0, 400.0),
         "tube": (320.0, 320.0),
     }
 
@@ -1799,6 +1799,18 @@ class MissionLayout:
             if item.get("kind") == "wall":
                 item["w"], item["h"] = self.DEFAULT_SIZES["wall"]
                 item["rotation"] = float(item.get("rotation", 0)) % 180.0
+            elif item.get("kind") == "ramp":
+                # Migrate ramps that still have the former default footprint;
+                # leave any explicitly customized ramp geometry alone.
+                try:
+                    old_default = (
+                        float(item.get("w", 700.0)) == 700.0 and
+                        float(item.get("h", 380.0)) == 380.0
+                    )
+                except (TypeError, ValueError):
+                    old_default = True
+                if old_default:
+                    item["w"], item["h"] = self.DEFAULT_SIZES["ramp"]
         self._next_id = max(int(data.get("next_id", 1)),
                             1 + max([0] + [int(item.get("id", 0)) for item in self.weights + self.obstacles]))
         self.ordered_real_weights()
