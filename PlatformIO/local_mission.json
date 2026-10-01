@@ -101,37 +101,37 @@
     ]
   },
   "mission": {
-    "start_x_mm": 323,
-    "start_y_mm": 2093,
-    "start_heading_deg": 0,
+    "start_x_mm": 327,
+    "start_y_mm": 311,
+    "start_heading_deg": 90,
     "home_x_mm": 325,
-    "home_y_mm": 2075,
+    "home_y_mm": 325,
     "fallback_strategy": 0,
     "confirmed_weight_limit": 1,
     "block_target": {
-      "x_mm": 1841,
-      "y_mm": 578
+      "x_mm": 3035,
+      "y_mm": 304
     },
     "block_route": [
       325,
-      2075,
-      1841,
-      578
+      325,
+      3035,
+      304
     ],
     "points": [
       890,
-      2096,
+      291,
       0,
       1240,
-      2096,
+      291,
       1,
-      2107,
-      2092,
+      813,
+      914,
       0,
-      2457,
-      2092,
+      638,
+      1217,
       1,
-      2800,
+      2900,
       400,
       0,
       3300,

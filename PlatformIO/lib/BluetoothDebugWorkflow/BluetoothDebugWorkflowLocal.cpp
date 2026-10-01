@@ -103,10 +103,34 @@ bool BluetoothDebugWorkflow::loadLocalMission()
         handleParameter(parameterCommand);
     }
 
-    if (!missionPlanValid_ || !missionHomeValid_ || missionTargetCount_ == 0)
+    const bool directToDestination =
+        localCompetition_.confirmedWeightLimit() == 0;
+    if (!missionPlanValid_ || !missionHomeValid_ ||
+        (!directToDestination && missionTargetCount_ == 0) ||
+        (directToDestination &&
+         (!localBlockTargetValid_ || localBlockRouteCount_ < 2)))
     {
-        link_.log("ERROR", "Local mission requires a valid route, home, and real weight target");
+        link_.log("ERROR", directToDestination
+            ? "Zero-weight mode requires a valid route, home, and destination marker"
+            : "Local mission requires a valid route, home, and real weight target");
         return false;
+    }
+
+    if (directToDestination)
+    {
+        // The exported destination route begins at the configured start pose.
+        // Skip its start point because the normal home-exit phase handles the
+        // initial departure before following the first route waypoint.
+        missionWaypointCount_ = localBlockRouteCount_ - 1;
+        for (uint8_t i = 0; i < missionWaypointCount_; ++i)
+            missionWaypoints_[i] = localBlockRoute_[i + 1];
+        missionWaypointIndex_ = 0;
+        missionTargetCount_ = 0;
+        missionTargetsVisited_ = 0;
+        missionReturnHome_ = false;
+        missionAutoReturnHome_ = false;
+        localBlockTargetEnroute_ = true;
+        localPostUnloadPhase_ = 2;
     }
 
     auto runCommand = [this](const char* name, bool hasEnabled, bool enabled) {
@@ -118,20 +142,23 @@ bool BluetoothDebugWorkflow::loadLocalMission()
     };
 
     runCommand("run", false, false);
-    runCommand("arm_sorting", true, true);
-    if (!armSortingEnabled_)
+    if (!directToDestination)
     {
-        JsonDocument stop;
-        stop["command"] = "stop";
-        handleCommand(stop);
-        link_.log("ERROR", "Local mission needs arm sorting to initialise successfully");
-        return false;
-    }
+        runCommand("arm_sorting", true, true);
+        if (!armSortingEnabled_)
+        {
+            JsonDocument stop;
+            stop["command"] = "stop";
+            handleCommand(stop);
+            link_.log("ERROR", "Local mission needs arm sorting to initialise successfully");
+            return false;
+        }
 
-    JsonDocument drumCommand;
-    drumCommand["command"] = "set_dc_motor_203_speed";
-    drumCommand["speed_percent"] = 100;
-    handleCommand(drumCommand);
+        JsonDocument drumCommand;
+        drumCommand["command"] = "set_dc_motor_203_speed";
+        drumCommand["speed_percent"] = 100;
+        handleCommand(drumCommand);
+    }
 
     runCommand("autonomous_navigation", true, true);
     if (!navigationActive_)

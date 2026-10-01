@@ -236,6 +236,22 @@ class MissionUploadTests(unittest.TestCase):
         ramp_feature = layout.map_payload()["features"][:5]
         self.assertEqual(ramp_feature[4], 0)
 
+    def test_zero_weight_limit_plans_direct_route_from_start_to_destination(self):
+        layout = MissionLayout()
+        layout.confirmed_weight_limit = 0
+        layout.set_block_target(1450, 325)
+
+        self.assertTrue(layout.plan(), layout.route_error)
+        self.assertTrue(layout.route)
+        self.assertTrue(all(not point["target"] for point in layout.route))
+        payload = layout.command_payload()
+        self.assertEqual(payload["confirmed_weight_limit"], 0)
+        self.assertEqual(payload["block_route"][:2], [325, 325])
+        self.assertEqual(payload["block_route"][-2:], [1450, 325])
+        self.assertTrue(payload["points"])
+        self.assertTrue(all(payload["points"][i + 2] == 0
+                            for i in range(0, len(payload["points"]), 3)))
+
     def test_saved_default_ramp_migrates_but_custom_size_is_preserved(self):
         layout = MissionLayout()
         layout.load_dict({
@@ -390,6 +406,19 @@ class MissionUploadTests(unittest.TestCase):
             self.assertEqual(saved["confirmed_weight_limit"], 6)
             self.assertEqual(view.mission_layout.command_payload()[
                 "confirmed_weight_limit"], 6)
+            view.close()
+
+    def test_zero_weight_limit_control_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_weight_limit.setValue(0)
+            self.assertEqual(view.mission_layout.confirmed_weight_limit, 0)
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["confirmed_weight_limit"], 0)
+            self.assertEqual(view.mission_layout.command_payload()[
+                "confirmed_weight_limit"], 0)
             view.close()
 
     def test_plan_route_shows_home_to_after_unload_route_in_red(self):

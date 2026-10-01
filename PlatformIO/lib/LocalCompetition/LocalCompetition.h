@@ -53,12 +53,16 @@ public:
             }
         }
 
-        if (active_ && !returningHome_ && now - startedAtMs_ >= ROUND_LIMIT_MS)
+        // A zero limit is direct-to-destination mode: it bypasses weight
+        // collection/home unload and must not be interrupted by the normal
+        // competition return-home deadline.
+        if (active_ && confirmedWeightLimit_ > 0 && !returningHome_ &&
+            now - startedAtMs_ >= ROUND_LIMIT_MS)
         {
             returningHome_ = true;
             return Event::ReturnHome;
         }
-        if (active_ && !returningHome_ &&
+        if (active_ && confirmedWeightLimit_ > 0 && !returningHome_ &&
             confirmedWeights_ >= confirmedWeightLimit_)
         {
             returningHome_ = true;
@@ -121,7 +125,7 @@ public:
     static constexpr uint32_t ROUND_LIMIT_MS = 90000U;
     static constexpr uint32_t INPUT_DEBOUNCE_MS = 30U;
     static constexpr uint8_t DEFAULT_CONFIRMED_WEIGHT_LIMIT = 3U;
-    static constexpr uint8_t MIN_CONFIRMED_WEIGHT_LIMIT = 1U;
+    static constexpr uint8_t MIN_CONFIRMED_WEIGHT_LIMIT = 0U;
     static constexpr uint8_t MAX_CONFIRMED_WEIGHT_LIMIT = 20U;
 
 private:

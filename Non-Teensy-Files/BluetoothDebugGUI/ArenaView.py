@@ -1483,10 +1483,15 @@ class MissionLayout:
         return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
 
     def after_unload_route(self):
-        """Map-clear route from the home dock to the optional final destination."""
+        """Map-clear route to the optional final destination.
+
+        A zero weight-return limit is a direct-to-destination test mode, so its
+        path starts at the configured robot start rather than the home dock.
+        """
         target = self.block_target
         if target is None:
             return None
+        direct_to_target = self.confirmed_weight_limit == 0
 
         obstacle_signature = tuple(
             (item["kind"], float(item["x"]), float(item["y"]),
@@ -1497,19 +1502,25 @@ class MissionLayout:
             (float(item["x"]), float(item["y"]))
             for item in self.weights if item.get("dummy"))
         cache_key = (
-            self.my_home, float(target["x"]), float(target["y"]),
+            direct_to_target, self.my_home,
+            float(self.start["x"]) if direct_to_target else None,
+            float(self.start["y"]) if direct_to_target else None,
+            float(target["x"]), float(target["y"]),
             obstacle_signature, dummy_signature,
             float(self.dummy_clearance_mm), float(self.ROBOT_RADIUS_MM),
             float(self.SAFETY_MARGIN_MM), float(self.GRID_MM),
         )
         if cache_key != self._after_unload_route_cache_key:
-            home = self.home_rect(self.my_home)
-            # home_rect() returns (left, top, right, bottom), not
-            # (x, y, width, height). Averaging the bounds matters especially
-            # for the blue home at the bottom of the arena; treating bottom as
-            # a height placed the route start outside the arena.
-            start = ((home[0] + home[2]) * 0.5,
-                     (home[1] + home[3]) * 0.5)
+            if direct_to_target:
+                start = (float(self.start["x"]), float(self.start["y"]))
+            else:
+                home = self.home_rect(self.my_home)
+                # home_rect() returns (left, top, right, bottom), not
+                # (x, y, width, height). Averaging the bounds matters especially
+                # for the blue home at the bottom of the arena; treating bottom as
+                # a height placed the route start outside the arena.
+                start = ((home[0] + home[2]) * 0.5,
+                         (home[1] + home[3]) * 0.5)
             goal = (float(target["x"]), float(target["y"]))
             path = None if self.blocked(*start) or self.blocked(*goal) else \
                 self._travel_path(start, goal)
@@ -1581,6 +1592,27 @@ class MissionLayout:
     def plan(self):
         self.route = []
         self.route_error = ""
+        if self.confirmed_weight_limit == 0:
+            if self.block_target is None:
+                self.route_error = (
+                    "Set an after-unload destination for zero-weight direct mode.")
+                return False
+            direct_path = self.after_unload_route()
+            if direct_path is None or len(direct_path) < 2:
+                self.route_error = (
+                    "No map-clear direct route from the start to the destination.")
+                return False
+            self.route = [
+                {"x": point[0], "y": point[1], "target": False}
+                for point in direct_path[1:]
+            ]
+            if len(direct_path) > self.MAX_ROUTE_POINTS:
+                self.route = []
+                self.route_error = (
+                    f"Direct route has more than {self.MAX_ROUTE_POINTS} route points.")
+                return False
+            return True
+
         real_weights = [item for item in self.weights if not item["dummy"]]
         if not real_weights:
             self.route_error = "Add at least one real weight location."
@@ -1766,7 +1798,7 @@ class MissionLayout:
             self.my_home = data["my_home"]
         self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
         try:
-            self.confirmed_weight_limit = max(1, min(20,
+            self.confirmed_weight_limit = max(0, min(20,
                 int(data.get("confirmed_weight_limit", 3))))
         except (TypeError, ValueError):
             self.confirmed_weight_limit = 3
@@ -2205,8 +2237,11 @@ class MissionLayoutCanvas(QWidget):
                 QPointF(centre.x() - 17, centre.y()),
             ]))
             p.setPen(QColor("#fff1f2"))
-            p.drawText(QRectF(centre.x() + 20, centre.y() - 12, 185, 24),
-                       Qt.AlignmentFlag.AlignLeft, "AFTER-UNLOAD DESTINATION")
+            p.drawText(QRectF(centre.x() + 20, centre.y() - 12, 230, 24),
+                       Qt.AlignmentFlag.AlignLeft,
+                       ("DIRECT DESTINATION (0 WEIGHTS)"
+                        if model.confirmed_weight_limit == 0 else
+                        "AFTER-UNLOAD DESTINATION"))
 
         likely_weight = self._likely_visible_planned_weight()
         displayed_order = (
@@ -2970,12 +3005,13 @@ class ArenaView(QWidget):
         return_limit_bar = QHBoxLayout()
         return_limit_bar.addWidget(QLabel("Return home after:"))
         self.mission_weight_limit = QSpinBox()
-        self.mission_weight_limit.setRange(1, 20)
+        self.mission_weight_limit.setRange(0, 20)
         self.mission_weight_limit.setValue(self.mission_layout.confirmed_weight_limit)
         self.mission_weight_limit.setSuffix(" confirmed weights")
         self.mission_weight_limit.setToolTip(
             "Automatically return home after this many induction-confirmed pickups. "
-            "The 90-second round timer remains an independent backup limit.")
+            "For values 1–20 the 90-second timer is a backup. Set to 0 for direct "
+            "destination mode: skip collection and home unloading, and do not return home.")
         self.mission_weight_limit.valueChanged.connect(
             self._mission_weight_limit_changed)
         return_limit_bar.addWidget(self.mission_weight_limit)
@@ -3389,8 +3425,8 @@ class ArenaView(QWidget):
         self._save_mission_layout()
 
     def _mission_weight_limit_changed(self, value):
-        self.mission_layout.confirmed_weight_limit = max(1, min(20, int(value)))
-        self._save_mission_layout()
+        self.mission_layout.confirmed_weight_limit = max(0, min(20, int(value)))
+        self._mission_layout_changed()
 
     def _mission_order_mode_changed(self, index):
         self.mission_layout.order_mode = (
@@ -3554,14 +3590,18 @@ class ArenaView(QWidget):
         if self.mission_layout.plan():
             if (self.mission_layout.block_target is not None and
                     self.mission_layout.after_unload_route() is None):
+                route_origin = ("the start" if
+                    self.mission_layout.confirmed_weight_limit == 0 else
+                    "the home dock")
                 self.mission_layout.route_error = (
-                    "No map-clear route from the home dock to the after-unload destination.")
+                    f"No map-clear route from {route_origin} to the destination.")
                 self.mission_status.setText(
                     "ROUTE ERROR: " + self.mission_layout.route_error)
                 self.mission_canvas.update()
                 return False
             after_unload_route = self.mission_layout.after_unload_route()
-            if after_unload_route is not None:
+            direct_to_target = self.mission_layout.confirmed_weight_limit == 0
+            if after_unload_route is not None and not direct_to_target:
                 self.mission_canvas.after_unload_route_visible = True
             self._refresh_mission_weight_order()
             target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
@@ -3570,19 +3610,26 @@ class ArenaView(QWidget):
                 [(point["x"], point["y"]) for point in self.mission_layout.route]
             )
             after_unload_note = ""
-            if after_unload_route is not None:
+            if after_unload_route is not None and not direct_to_target:
                 after_unload_length = MissionLayout._path_length(after_unload_route)
                 after_unload_legs = len(after_unload_route) - 1
                 after_unload_note = (
                     f" Red after-unload route: {after_unload_legs} legs, "
                     f"about {after_unload_length/1000.0:.1f} m from home."
                 )
-            self.mission_status.setText(
-                f"Route ready ({'manual' if self.mission_layout.order_mode == 'manual' else 'automatic'} order): "
-                f"{target_count} real weights, {len(self.mission_layout.route)} waypoints, "
-                f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
-                f"{after_unload_note}"
-            )
+            if direct_to_target:
+                self.mission_status.setText(
+                    f"Zero-weight mode: direct route to the destination; "
+                    f"{len(self.mission_layout.route)} waypoints, "
+                    f"approximately {length/1000.0:.1f} m."
+                )
+            else:
+                self.mission_status.setText(
+                    f"Route ready ({'manual' if self.mission_layout.order_mode == 'manual' else 'automatic'} order): "
+                    f"{target_count} real weights, {len(self.mission_layout.route)} waypoints, "
+                    f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
+                    f"{after_unload_note}"
+                )
         else:
             self.mission_status.setText("ROUTE ERROR: " + self.mission_layout.route_error)
         self.mission_canvas.update()
@@ -3791,18 +3838,25 @@ class ArenaView(QWidget):
             )
             return
         if block_target is not None and self.mission_layout.after_unload_route() is None:
+            route_origin = ("the start" if
+                self.mission_layout.confirmed_weight_limit == 0 else
+                "the home dock")
             QMessageBox.warning(
                 self, "Local mission export",
-                "No map-clear route is available from the home dock to the "
+                f"No map-clear route is available from {route_origin} to the "
                 "after-unload destination. Move the marker or edit the arena first."
             )
             return
         real_targets = sum(1 for item in self.mission_layout.weights
                            if not item.get("dummy", False))
-        if real_targets == 0 or not mission["points"]:
+        direct_to_target = self.mission_layout.confirmed_weight_limit == 0
+        if ((real_targets == 0 and not direct_to_target) or
+                not mission["points"] or
+                (direct_to_target and block_target is None)):
             QMessageBox.warning(
                 self, "Local mission export",
-                "Add at least one real weight and plan a route before exporting."
+                "Add a real weight and plan a route, or set the weight limit to 0 "
+                "and place an after-unload destination for direct mode."
             )
             return
         if len(mission["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS or \

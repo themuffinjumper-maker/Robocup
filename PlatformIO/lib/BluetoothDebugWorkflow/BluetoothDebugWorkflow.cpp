@@ -729,19 +729,25 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
                 blockRoute[i].yMm = static_cast<int16_t>(y);
                 blockRoute[i].flags = 0;
             }
+            const int expectedRouteStartX = confirmedWeightLimit == 0
+                ? startX : homeX;
+            const int expectedRouteStartY = confirmedWeightLimit == 0
+                ? startY : homeY;
             if (blockRouteCount > 0 &&
-                (homeX < 0 || homeX > 4900 || homeY < 0 || homeY > 2400 ||
-                 blockRoute[0].xMm != homeX || blockRoute[0].yMm != homeY ||
+                (expectedRouteStartX < 0 || expectedRouteStartX > 4900 ||
+                 expectedRouteStartY < 0 || expectedRouteStartY > 2400 ||
+                 blockRoute[0].xMm != expectedRouteStartX ||
+                 blockRoute[0].yMm != expectedRouteStartY ||
                  blockRoute[blockRouteCount - 1].xMm != blockTargetX ||
                  blockRoute[blockRouteCount - 1].yMm != blockTargetY))
             {
-                link_.error("After-unload route must start at home and end at its destination");
+                link_.error("Destination route must start at its configured origin and end at the destination");
                 return;
             }
         }
         if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
             fallback < 0 || fallback > 2 ||
-            confirmedWeightLimit < LocalCompetition::MIN_CONFIRMED_WEIGHT_LIMIT ||
+            confirmedWeightLimit < 0 ||
             confirmedWeightLimit > LocalCompetition::MAX_CONFIRMED_WEIGHT_LIMIT)
         {
             link_.error("Mission start, fallback, or confirmed-weight limit is outside the supported range");
@@ -837,7 +843,9 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionLastPointTurnMs_ = 0;
         missionFrontBlockedLatched_ = false;
         missionFrontClearSinceMs_ = 0;
-        missionPlanValid_ = count > 0 && targets > 0;
+        const bool directDestinationPlan = confirmedWeightLimit == 0 &&
+            blockTargetValid && blockRouteCount >= 2;
+        missionPlanValid_ = count > 0 && (targets > 0 || directDestinationPlan);
         missionPoseInitialised_ = false;
         missionTargetAlignSinceMs_ = 0;
         missionTargetAligned_ = false;
@@ -5723,7 +5731,9 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 localPostUnloadPhase_ = 3;
                 snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
-                link_.log("INFO", "Post-unload block destination reached; spinning in place until stopped");
+                link_.log("INFO", localCompetition_.confirmedWeightLimit() == 0
+                    ? "Direct destination reached; spinning in place until stopped"
+                    : "Post-unload block destination reached; spinning in place until stopped");
             }
             setDrive(-80, 80);
             return;
@@ -5844,7 +5854,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 {
                     localPostUnloadPhase_ = 3;
                     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
-                    link_.log("INFO", "Post-unload block destination reached; spinning in place until stopped");
+                    link_.log("INFO", localCompetition_.confirmedWeightLimit() == 0
+                        ? "Direct destination reached; spinning in place until stopped"
+                        : "Post-unload block destination reached; spinning in place until stopped");
                 }
                 setDrive(-80, 80);
                 return;
