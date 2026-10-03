@@ -56,6 +56,17 @@ class MissionUploadTests(unittest.TestCase):
             self.assertIs(view.map_tabs.currentWidget(), view.mission_page)
             view.close()
 
+    def test_start_heading_supports_45_degree_diagonal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_heading_combo.setCurrentIndex(1)
+            self.assertEqual(view.mission_layout.start["heading_deg"], 45.0)
+            self.assertEqual(view.mission_layout.command_payload()["start_heading_deg"],
+                             45)
+            view.close()
+
     def test_jam_reverse_controls_persist_and_apply_to_firmware(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "mission.ini"),

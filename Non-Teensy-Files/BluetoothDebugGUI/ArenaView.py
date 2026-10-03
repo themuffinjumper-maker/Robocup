@@ -3123,9 +3123,12 @@ class ArenaView(QWidget):
         toolbar.addWidget(self.mission_home_combo)
 
         self.mission_heading_combo = QComboBox()
-        self.mission_heading_combo.addItems(["East →", "South ↓", "West ←", "North ↑"])
+        self.mission_heading_combo.addItems([
+            "East → (0°)", "SE ↘ (45°)", "South ↓ (90°)", "SW ↙ (135°)",
+            "West ← (180°)", "NW ↖ (225°)", "North ↑ (270°)", "NE ↗ (315°)",
+        ])
         self.mission_heading_combo.setCurrentIndex(
-            int(round(self.mission_layout.start["heading_deg"] / 90.0)) % 4)
+            int(round(self.mission_layout.start["heading_deg"] / 45.0)) % 8)
         self.mission_heading_combo.currentIndexChanged.connect(self._mission_heading_changed)
         toolbar.addWidget(QLabel("Start heading:"))
         toolbar.addWidget(self.mission_heading_combo)
@@ -3580,7 +3583,7 @@ class ArenaView(QWidget):
         self._mission_layout_changed()
 
     def _mission_heading_changed(self, index):
-        self.mission_layout.start["heading_deg"] = float((index % 4) * 90)
+        self.mission_layout.start["heading_deg"] = float((index % 8) * 45)
         self._mission_layout_changed()
 
     def _mission_fallback_changed(self, index):
