@@ -181,3 +181,11 @@ CLAUDE.local.md
 # ============================================================
 
 *.log
+
+# Local robot recordings, temporary diagnostics, and reference material
+tools/recording-analysis/recordings/*.rdbg
+tools/recording-analysis/recordings/*.rdbg-shm
+tools/recording-analysis/recordings/*.rdbg-wal
+tools/recording-analysis/latest_analysis.md
+.local_archive/
+artifacts/
