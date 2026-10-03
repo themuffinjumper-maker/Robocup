@@ -210,15 +210,15 @@ class MissionUploadTests(unittest.TestCase):
             self.assertIn(2, canvas.detected_weight_hits)
             view.close()
 
-    def test_map_contains_forbidden_home_and_physical_landmarks(self):
+    def test_opposing_home_is_navigable_and_map_contains_landmarks(self):
         layout = MissionLayout()
         layout.add_obstacle("wall", 1800, 1000)
         layout.add_weight(2600, 1200, dummy=True)
         features = layout.map_payload()["features"]
-        self.assertEqual(len(features), 15)
-        self.assertEqual(features[:5], [0, 1750, 650, 2400, 0])
-        self.assertEqual(features[9], 1)
-        self.assertEqual(features[14], 2)
+        self.assertEqual(len(features), 10)
+        self.assertEqual(features[:5], [1500, 935, 2100, 1065, 1])
+        self.assertEqual(features[9], 2)
+        self.assertFalse(layout.blocked(325, 2075))
         self.assertEqual(layout.map_payload()["dummy_clearance_mm"], 100)
         self.assertTrue(layout.blocked(3150, 1200))
         self.assertFalse(layout.blocked(3300, 1200))
@@ -231,9 +231,104 @@ class MissionUploadTests(unittest.TestCase):
     def test_ramp_is_a_forbidden_zone_in_planner_and_uploaded_map(self):
         layout = MissionLayout()
         ramp = layout.add_obstacle("ramp", 1800, 1000)
+        self.assertEqual((ramp["w"], ramp["h"]), (1190.0, 400.0))
         self.assertTrue(layout.blocked(ramp["x"], ramp["y"]))
-        ramp_feature = layout.map_payload()["features"][5:10]
+        ramp_feature = layout.map_payload()["features"][:5]
         self.assertEqual(ramp_feature[4], 0)
+
+    def test_go_ramp_route_crosses_short_sides_on_centerline(self):
+        layout = MissionLayout()
+        ramp = layout.add_obstacle("ramp_go", 1800, 1200)
+
+        self.assertFalse(layout.blocked(ramp["x"], ramp["y"]))
+        self.assertEqual(layout.map_payload()["features"][4], 3)
+        path = layout._travel_path((700, 1200), (3000, 1200))
+        self.assertIsNotNone(path)
+        required = [(840.0, 1200.0), (1205.0, 1200.0),
+                    (1800.0, 1200.0), (2395.0, 1200.0),
+                    (2760.0, 1200.0)]
+        indices = [path.index(point) for point in required]
+        self.assertEqual(indices, sorted(indices))
+
+    def test_weight_mission_route_includes_go_ramp_crossing(self):
+        layout = MissionLayout()
+        ramp = layout.add_obstacle("ramp_go", 1800, 1200)
+        layout.add_weight(3000, 1200)
+
+        self.assertTrue(layout.plan(), layout.route_error)
+        self.assertIn((ramp["x"], ramp["y"]),
+                      [(point["x"], point["y"]) for point in layout.route])
+
+    def test_go_ramp_can_be_angled_and_no_go_ramp_stays_blocked(self):
+        layout = MissionLayout()
+        no_go = layout.add_obstacle("ramp_no_go", 4200, 1800)
+        self.assertTrue(layout.blocked(no_go["x"], no_go["y"]))
+        self.assertEqual(layout.map_payload()["features"][4], 0)
+
+        go = layout.add_obstacle("ramp_go", 1800, 1200)
+        self.assertTrue(layout.set_obstacle_rotation(go["id"], 37))
+        path = layout._travel_path((700, 1200), (3000, 1200))
+        self.assertIsNotNone(path)
+        angle = math.radians(37)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        centre_index = path.index((go["x"], go["y"]))
+        entry, centre, exit_point = path[centre_index - 1:centre_index + 2]
+        for point in (entry, centre, exit_point):
+            local_y = (-(point[0] - go["x"]) * sine +
+                       (point[1] - go["y"]) * cosine)
+            self.assertAlmostEqual(local_y, 0.0, places=6)
+
+    def test_mission_gui_exposes_ramp_types_and_go_ramp_angle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            labels = {button.text() for button in
+                      view.mission_page.findChildren(QPushButton)}
+            self.assertIn("+ No-go ramp", labels)
+            self.assertIn("+ Go ramp", labels)
+
+            ramp = view.mission_layout.add_obstacle("ramp_go", 1800, 1200)
+            view.mission_canvas.selected_id = ramp["id"]
+            view._mission_selection_changed(ramp["id"])
+            self.assertTrue(view.mission_obstacle_angle.isEnabled())
+            self.assertEqual(view.mission_obstacle_angle_label.text(),
+                             "Ramp angle")
+            view.mission_obstacle_angle.setValue(37)
+            self.assertEqual(ramp["rotation"], 37)
+            view.close()
+
+    def test_zero_weight_limit_plans_direct_route_from_start_to_destination(self):
+        layout = MissionLayout()
+        layout.confirmed_weight_limit = 0
+        layout.set_block_target(1450, 325)
+
+        self.assertTrue(layout.plan(), layout.route_error)
+        self.assertTrue(layout.route)
+        self.assertTrue(all(not point["target"] for point in layout.route))
+        payload = layout.command_payload()
+        self.assertEqual(payload["confirmed_weight_limit"], 0)
+        self.assertEqual(payload["block_route"][:2], [325, 325])
+        self.assertEqual(payload["block_route"][-2:], [1450, 325])
+        self.assertTrue(payload["points"])
+        self.assertTrue(all(payload["points"][i + 2] == 0
+                            for i in range(0, len(payload["points"]), 3)))
+
+    def test_saved_default_ramp_migrates_but_custom_size_is_preserved(self):
+        layout = MissionLayout()
+        layout.load_dict({
+            "obstacles": [
+                {"id": 1, "kind": "ramp", "x": 1800, "y": 1000,
+                 "w": 700, "h": 380, "rotation": 0},
+                {"id": 2, "kind": "ramp", "x": 2800, "y": 1000,
+                 "w": 900, "h": 450, "rotation": 0},
+            ],
+            "next_id": 3,
+        })
+        self.assertEqual((layout.obstacles[0]["w"], layout.obstacles[0]["h"]),
+                         (1190.0, 400.0))
+        self.assertEqual((layout.obstacles[1]["w"], layout.obstacles[1]["h"]),
+                         (900, 450))
 
     def test_weight_route_has_straight_staging_and_run_through(self):
         layout = MissionLayout()
@@ -249,6 +344,191 @@ class MissionUploadTests(unittest.TestCase):
                target["y"] + 200 * dy / distance)
         self.assertTrue(layout._segment_clear(
             (target["x"], target["y"]), end))
+
+    def test_manual_visit_order_is_persisted_and_planned_in_sequence(self):
+        layout = MissionLayout()
+        first = layout.add_weight(3000, 800)
+        second = layout.add_weight(1800, 1200)
+        layout.order_mode = "manual"
+        layout.set_target_order([second["id"], first["id"]])
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.order_mode, "manual")
+        self.assertEqual(restored.target_order,
+                         [second["id"], first["id"]])
+        self.assertTrue(restored.plan(), restored.route_error)
+        targets = [(point["x"], point["y"]) for point in restored.route
+                   if point.get("target")]
+        self.assertEqual(targets, [(second["x"], second["y"]),
+                                   (first["x"], first["y"])])
+
+    def test_block_destination_is_single_persistent_and_exported(self):
+        layout = MissionLayout()
+        first = layout.set_block_target(3100, 1200)
+        second = layout.set_block_target(3200, 1250)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(layout.block_target["x"], 3200)
+        self.assertEqual(layout.command_payload()["block_target"],
+                         {"x_mm": 3200, "y_mm": 1250})
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        home = layout.home_rect(layout.my_home)
+        self.assertEqual(route[0], (home[0] + home[2] * 0.5,
+                                    home[1] + home[3] * 0.5))
+        self.assertEqual(route[-1], (3200.0, 1250.0))
+        self.assertEqual(layout.command_payload()["block_route"],
+                         [int(round(value)) for point in route for value in point])
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.block_target,
+                         {"id": "block_target", "x": 3200, "y": 1250})
+        self.assertTrue(restored.move_item("block_target", 3300, 1300))
+        self.assertEqual(restored.command_payload()["block_target"],
+                         {"x_mm": 3300, "y_mm": 1300})
+        self.assertTrue(restored.delete_item("block_target"))
+        self.assertIsNone(restored.command_payload()["block_target"])
+
+    def test_after_unload_route_avoids_mapped_wall(self):
+        layout = MissionLayout()
+        wall = layout.add_obstacle("wall", 1800, 325)
+        layout.set_block_target(3200, 325)
+
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        self.assertGreater(len(route), 2)
+        self.assertTrue(all(layout._segment_clear(first, second)
+                            for first, second in zip(route, route[1:])))
+        self.assertTrue(layout.set_obstacle_rotation(wall["id"], 90))
+        rotated_route = layout.after_unload_route()
+        self.assertIsNotNone(rotated_route)
+        self.assertTrue(all(layout._segment_clear(first, second)
+                            for first, second in zip(rotated_route,
+                                                     rotated_route[1:])))
+
+    def test_after_unload_route_starts_at_blue_home_centre(self):
+        layout = MissionLayout()
+        layout.my_home = "blue"
+        layout.set_block_target(2329, 1181)
+
+        route = layout.after_unload_route()
+        self.assertIsNotNone(route)
+        self.assertEqual(route[0], (325.0, 2075.0))
+        self.assertEqual(route[-1], (2329.0, 1181.0))
+
+    def test_clear_arena_items_keeps_home_start_and_tuning(self):
+        layout = MissionLayout()
+        layout.my_home = "blue"
+        layout.start = {"x": 700.0, "y": 900.0, "heading_deg": 90.0}
+        layout.confirmed_weight_limit = 5
+        layout.add_weight(2200, 1200)
+        layout.add_weight(2600, 900, dummy=True)
+        layout.add_obstacle("wall", 1800, 1000)
+        layout.set_block_target(3200, 1200)
+        layout.order_mode = "manual"
+        layout.target_order = [layout.weights[0]["id"]]
+        layout.route = [{"x": 2200.0, "y": 1200.0, "target": True}]
+
+        layout.clear_arena_items()
+
+        self.assertEqual(layout.weights, [])
+        self.assertEqual(layout.obstacles, [])
+        self.assertIsNone(layout.block_target)
+        self.assertEqual(layout.route, [])
+        self.assertEqual(layout.order_mode, "auto")
+        self.assertEqual(layout.target_order, [])
+        self.assertEqual(layout.my_home, "blue")
+        self.assertEqual(layout.start,
+                         {"x": 700.0, "y": 900.0, "heading_deg": 90.0})
+        self.assertEqual(layout.confirmed_weight_limit, 5)
+
+    def test_confirmed_weight_limit_is_saved_and_exported(self):
+        layout = MissionLayout()
+        self.assertEqual(layout.confirmed_weight_limit, 3)
+        layout.confirmed_weight_limit = 5
+        self.assertEqual(layout.command_payload()["confirmed_weight_limit"], 5)
+
+        restored = MissionLayout()
+        restored.load_dict(layout.to_dict())
+        self.assertEqual(restored.confirmed_weight_limit, 5)
+        self.assertEqual(restored.command_payload()["confirmed_weight_limit"], 5)
+
+        restored.load_dict({"confirmed_weight_limit": 99})
+        self.assertEqual(restored.confirmed_weight_limit, 20)
+
+    def test_mission_planner_weight_limit_control_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_weight_limit.setValue(6)
+            self.assertEqual(view.mission_layout.confirmed_weight_limit, 6)
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["confirmed_weight_limit"], 6)
+            self.assertEqual(view.mission_layout.command_payload()[
+                "confirmed_weight_limit"], 6)
+            view.close()
+
+    def test_zero_weight_limit_control_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_weight_limit.setValue(0)
+            self.assertEqual(view.mission_layout.confirmed_weight_limit, 0)
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["confirmed_weight_limit"], 0)
+            self.assertEqual(view.mission_layout.command_payload()[
+                "confirmed_weight_limit"], 0)
+            view.close()
+
+    def test_plan_route_shows_home_to_after_unload_route_in_red(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.mission_layout.add_weight(2200, 1200)
+            view.mission_layout.set_block_target(3200, 1600)
+
+            self.assertFalse(view.mission_canvas.after_unload_route_visible)
+            self.assertTrue(view._plan_mission_route(),
+                            view.mission_layout.route_error)
+            self.assertTrue(view.mission_canvas.after_unload_route_visible)
+            self.assertIn("Red after-unload route:",
+                          view.mission_status.text())
+
+            # Editing the map invalidates the preview so the next plan is
+            # always based on current geometry and destination.
+            view._mission_layout_changed()
+            self.assertFalse(view.mission_canvas.after_unload_route_visible)
+            view.close()
+
+            restored_view = ArenaView(settings)
+            self.assertEqual(restored_view.mission_weight_limit.value(), 6)
+            restored_view.close()
+
+    def test_mission_planner_records_and_persists_map_clicked_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            first = view.mission_layout.add_weight(3000, 800)
+            second = view.mission_layout.add_weight(1800, 1200)
+            view._refresh_mission_weight_order()
+            view.mission_set_sequence_button.click()
+            self.assertTrue(view._sequence_pick_active)
+            view.mission_canvas.sequence_weight_clicked.emit(second["id"])
+            view.mission_canvas.sequence_weight_clicked.emit(first["id"])
+            self.assertEqual(view.mission_layout.order_mode, "manual")
+            self.assertEqual(view.mission_layout.target_order,
+                             [second["id"], first["id"]])
+            saved = json.loads(settings.value("navigation/mission_layout"))
+            self.assertEqual(saved["target_order"],
+                             [second["id"], first["id"]])
+            self.assertFalse(view._sequence_pick_active)
+            self.assertEqual(view.mission_set_sequence_button.text(), "SET SEQUENCE")
+            view.close()
 
     def test_weight_approach_prefers_clear_side_over_short_side(self):
         layout = MissionLayout()

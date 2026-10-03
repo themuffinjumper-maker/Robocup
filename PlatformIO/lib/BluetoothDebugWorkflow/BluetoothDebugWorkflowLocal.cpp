@@ -8,6 +8,29 @@ void BluetoothDebugWorkflow::updateLocalCompetition()
     if (!LocalMissionConfig::ENABLED)
         return;
 
+    // Count each confirmed inductive event independently of the navigation
+    // waypoint attribution. The sorting subsystem already debounces a high
+    // detection before incrementing this serial; consume each event once.
+    if (localRunActive_)
+    {
+        while (localCompetitionSortingSerial_ != sortingConfirmedSerial_)
+        {
+            ++localCompetitionSortingSerial_;
+            if (localCompetition_.noteConfirmedWeight())
+            {
+                char message[112];
+                snprintf(message, sizeof(message),
+                         "%u induction-confirmed weights reached; returning home",
+                         static_cast<unsigned>(localCompetition_.confirmedWeightLimit()));
+                link_.log("INFO", message);
+            }
+        }
+    }
+    else
+    {
+        localCompetitionSortingSerial_ = sortingConfirmedSerial_;
+    }
+
     const uint32_t now = millis();
     const LocalCompetition::Event event = localCompetition_.update(
         aioExpanderReady_, aio9ButtonRawHigh_, now);
@@ -80,10 +103,34 @@ bool BluetoothDebugWorkflow::loadLocalMission()
         handleParameter(parameterCommand);
     }
 
-    if (!missionPlanValid_ || !missionHomeValid_ || missionTargetCount_ == 0)
+    const bool directToDestination =
+        localCompetition_.confirmedWeightLimit() == 0;
+    if (!missionPlanValid_ || !missionHomeValid_ ||
+        (!directToDestination && missionTargetCount_ == 0) ||
+        (directToDestination &&
+         (!localBlockTargetValid_ || localBlockRouteCount_ < 2)))
     {
-        link_.log("ERROR", "Local mission requires a valid route, home, and real weight target");
+        link_.log("ERROR", directToDestination
+            ? "Zero-weight mode requires a valid route, home, and destination marker"
+            : "Local mission requires a valid route, home, and real weight target");
         return false;
+    }
+
+    if (directToDestination)
+    {
+        // The exported destination route begins at the configured start pose.
+        // Skip its start point because the normal home-exit phase handles the
+        // initial departure before following the first route waypoint.
+        missionWaypointCount_ = localBlockRouteCount_ - 1;
+        for (uint8_t i = 0; i < missionWaypointCount_; ++i)
+            missionWaypoints_[i] = localBlockRoute_[i + 1];
+        missionWaypointIndex_ = 0;
+        missionTargetCount_ = 0;
+        missionTargetsVisited_ = 0;
+        missionReturnHome_ = false;
+        missionAutoReturnHome_ = false;
+        localBlockTargetEnroute_ = true;
+        localPostUnloadPhase_ = 2;
     }
 
     auto runCommand = [this](const char* name, bool hasEnabled, bool enabled) {
@@ -95,20 +142,23 @@ bool BluetoothDebugWorkflow::loadLocalMission()
     };
 
     runCommand("run", false, false);
-    runCommand("arm_sorting", true, true);
-    if (!armSortingEnabled_)
+    if (!directToDestination)
     {
-        JsonDocument stop;
-        stop["command"] = "stop";
-        handleCommand(stop);
-        link_.log("ERROR", "Local mission needs arm sorting to initialise successfully");
-        return false;
-    }
+        runCommand("arm_sorting", true, true);
+        if (!armSortingEnabled_)
+        {
+            JsonDocument stop;
+            stop["command"] = "stop";
+            handleCommand(stop);
+            link_.log("ERROR", "Local mission needs arm sorting to initialise successfully");
+            return false;
+        }
 
-    JsonDocument drumCommand;
-    drumCommand["command"] = "set_dc_motor_203_speed";
-    drumCommand["speed_percent"] = 100;
-    handleCommand(drumCommand);
+        JsonDocument drumCommand;
+        drumCommand["command"] = "set_dc_motor_203_speed";
+        drumCommand["speed_percent"] = 100;
+        handleCommand(drumCommand);
+    }
 
     runCommand("autonomous_navigation", true, true);
     if (!navigationActive_)
@@ -199,7 +249,16 @@ void BluetoothDebugWorkflow::requestLocalReturnHome()
     localMissionReturning_ = true;
     localCompetition_.setReturningHome();
     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "RETURNING_HOME");
-    link_.log("WARNING", "90-second local round limit reached; all remaining targets skipped, returning home to unload");
+    if (localCompetition_.confirmedWeights() >= localCompetition_.confirmedWeightLimit())
+    {
+        char message[144];
+        snprintf(message, sizeof(message),
+                 "%u induction-confirmed weights reached; skipping remaining targets and returning home to unload",
+                 static_cast<unsigned>(localCompetition_.confirmedWeightLimit()));
+        link_.log("WARNING", message);
+    }
+    else
+        link_.log("WARNING", "90-second local round limit reached; all remaining targets skipped, returning home to unload");
 }
 
 void BluetoothDebugWorkflow::finishLocalCompetition()
@@ -217,7 +276,10 @@ void BluetoothDebugWorkflow::finishLocalCompetition()
     missionAutoReturnHome_ = false;
     localRunActive_ = false;
     localMissionReturning_ = false;
+    localBlockTargetEnroute_ = false;
+    localPostUnloadPhase_ = 0;
+    localPostUnloadStartedMs_ = 0;
     localCompetition_.markComplete();
     snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "COMPLETE");
-    link_.log("INFO", "Local round complete; home unload finished and motors stopped");
+    link_.log("INFO", "Local competition run complete; motors stopped");
 }

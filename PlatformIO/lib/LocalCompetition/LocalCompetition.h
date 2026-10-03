@@ -25,6 +25,7 @@ public:
         returningHome_ = false;
         completed_ = false;
         startedAtMs_ = 0;
+        confirmedWeights_ = 0;
     }
 
     Event update(bool inputAvailable, bool levelHigh, uint32_t now)
@@ -52,12 +53,31 @@ public:
             }
         }
 
-        if (active_ && !returningHome_ && now - startedAtMs_ >= ROUND_LIMIT_MS)
+        // A zero limit is direct-to-destination mode: it bypasses weight
+        // collection/home unload and must not be interrupted by the normal
+        // competition return-home deadline.
+        if (active_ && confirmedWeightLimit_ > 0 && !returningHome_ &&
+            now - startedAtMs_ >= ROUND_LIMIT_MS)
+        {
+            returningHome_ = true;
+            return Event::ReturnHome;
+        }
+        if (active_ && confirmedWeightLimit_ > 0 && !returningHome_ &&
+            confirmedWeights_ >= confirmedWeightLimit_)
         {
             returningHome_ = true;
             return Event::ReturnHome;
         }
         return Event::None;
+    }
+
+    bool noteConfirmedWeight()
+    {
+        if (!active_ || returningHome_ || completed_ ||
+            confirmedWeights_ >= confirmedWeightLimit_)
+            return false;
+        ++confirmedWeights_;
+        return confirmedWeights_ >= confirmedWeightLimit_;
     }
 
     void markComplete()
@@ -82,6 +102,16 @@ public:
     bool active() const { return active_; }
     bool returningHome() const { return returningHome_; }
     bool completed() const { return completed_; }
+    uint8_t confirmedWeights() const { return confirmedWeights_; }
+    uint8_t confirmedWeightLimit() const { return confirmedWeightLimit_; }
+    void setConfirmedWeightLimit(uint8_t limit)
+    {
+        if (limit < MIN_CONFIRMED_WEIGHT_LIMIT)
+            limit = MIN_CONFIRMED_WEIGHT_LIMIT;
+        if (limit > MAX_CONFIRMED_WEIGHT_LIMIT)
+            limit = MAX_CONFIRMED_WEIGHT_LIMIT;
+        confirmedWeightLimit_ = limit;
+    }
     uint32_t elapsedMs(uint32_t now) const
     {
         return startedAtMs_ == 0 ? 0 : now - startedAtMs_;
@@ -94,6 +124,9 @@ public:
 
     static constexpr uint32_t ROUND_LIMIT_MS = 90000U;
     static constexpr uint32_t INPUT_DEBOUNCE_MS = 30U;
+    static constexpr uint8_t DEFAULT_CONFIRMED_WEIGHT_LIMIT = 3U;
+    static constexpr uint8_t MIN_CONFIRMED_WEIGHT_LIMIT = 0U;
+    static constexpr uint8_t MAX_CONFIRMED_WEIGHT_LIMIT = 20U;
 
 private:
     bool initialized_ = false;
@@ -102,6 +135,8 @@ private:
     bool active_ = false;
     bool returningHome_ = false;
     bool completed_ = false;
+    uint8_t confirmedWeights_ = 0;
+    uint8_t confirmedWeightLimit_ = DEFAULT_CONFIRMED_WEIGHT_LIMIT;
     uint32_t candidateSinceMs_ = 0;
     uint32_t startedAtMs_ = 0;
 };

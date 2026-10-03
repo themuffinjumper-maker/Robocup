@@ -50,6 +50,14 @@ private:
     LocalCompetition localCompetition_;
     bool localRunActive_ = false;
     bool localMissionReturning_ = false;
+    bool localBlockTargetValid_ = false;
+    bool localBlockTargetEnroute_ = false;
+    int16_t localBlockTargetXmm_ = 0;
+    int16_t localBlockTargetYmm_ = 0;
+    uint8_t localPostUnloadPhase_ = 0; // 0 idle, 1 open-gate dwell, 2 travelling, 3 blocking spin
+    uint32_t localPostUnloadStartedMs_ = 0;
+    static constexpr uint32_t LOCAL_POST_UNLOAD_WAIT_MS = 5000U;
+    uint16_t localCompetitionSortingSerial_ = 0;
     char localCompetitionStatus_[24] = "DISABLED";
 
     bool debugMode_ = false;
@@ -317,6 +325,8 @@ private:
         uint8_t flags = 0;  // bit 0 = target, bit 2 = reverse dock, bit 3 = gap-centre transit
     };
     MissionWaypoint missionWaypoints_[MAX_MISSION_WAYPOINTS] = {};
+    MissionWaypoint localBlockRoute_[MAX_MISSION_WAYPOINTS] = {};
+    uint8_t localBlockRouteCount_ = 0;
     uint8_t missionWaypointCount_ = 0;
     uint8_t missionWaypointIndex_ = 0;
     uint8_t missionFallbackStrategy_ = 0;
@@ -411,8 +421,8 @@ private:
     uint32_t missionPoseRecoveryHoldUntilMs_ = 0;
     uint16_t missionLandmarkRecoveryCount_ = 0;
     uint16_t missionLandmarkRecoveryResidualMm_ = 0;
-    // Axis-aligned features uploaded with the route. Kind 0 is a no-go area;
-    // kind 1 is a physical surface that may be matched to a range reading.
+    // Arena features uploaded with the route: 0 no-go ramp, 1 wall,
+    // 2 dummy weight, 3 traversable go-ramp (centreline is in the route).
     static constexpr uint8_t MAX_MISSION_FEATURES = 24;
     struct MissionFeature {
         int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -456,7 +466,7 @@ private:
     uint32_t missionDockPhaseStartedMs_ = 0;
     uint32_t missionDockNearWallSinceMs_ = 0;
     bool missionDockAligned_ = false;
-    uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, 2..5 shake legs
+    uint8_t missionUnloadPhase_ = 0; // 0 idle, 1 gate settling, then configured shake legs
     uint32_t missionUnloadPhaseStartedMs_ = 0;
     int32_t missionUnloadStartEncoder1_ = 0;
     int32_t missionUnloadStartEncoder2_ = 0;
@@ -474,6 +484,7 @@ private:
     bool missionWallReverseFailed_ = false;
     bool missionWallReverseNoProgress_ = false;
     bool missionWallRecoveryDetourRequested_ = false;
+    bool missionWallRecoveryMapTried_ = false;
     int8_t missionWallRecoveryPreferredSide_ = 0;
     uint32_t missionWallReverseStartedMs_ = 0;
     uint8_t missionWallReverseWaypoint_ = 255;
@@ -484,9 +495,28 @@ private:
     uint32_t missionForwardProgressStartedMs_ = 0;
     int32_t missionForwardProgressEncoder1_ = 0;
     int32_t missionForwardProgressEncoder2_ = 0;
+    uint16_t missionForwardProgressFrontMm_ = 0xFFFF;
+    uint32_t missionForwardProgressImuEventCount_ = 0;
+    float missionForwardProgressHeadingDeg_ = 0.0f;
     bool missionForwardStalled_ = false;
+    bool missionEncoderImuSkid_ = false;
+    float missionRampTiltDeg_ = 0.0f;
+    bool missionRampTiltDetected_ = false;
+    bool missionRampRecoveryLatched_ = false;
+    bool missionOnMappedGoRamp_ = false;
+    uint32_t missionRampTiltSinceMs_ = 0;
+    uint32_t missionRampTiltClearSinceMs_ = 0;
+    static constexpr uint8_t MAX_MISSION_RAMP_AVOIDS = 4;
+    struct MissionRampAvoidance {
+        bool active = false;
+        float centerXmm = 0.0f, centerYmm = 0.0f, headingDeg = 0.0f;
+    };
+    MissionRampAvoidance missionRampAvoidances_[MAX_MISSION_RAMP_AVOIDS] = {};
+    uint8_t missionRampAvoidanceNext_ = 0;
     uint32_t missionTurnProgressStartedMs_ = 0;
     float missionTurnProgressHeadingDeg_ = 0.0f;
+    int32_t missionTurnProgressEncoder1_ = 0;
+    int32_t missionTurnProgressEncoder2_ = 0;
     float missionAvoidXmm_ = 0.0f;
     float missionAvoidYmm_ = 0.0f;
     float missionAvoidForwardXmm_ = 0.0f;

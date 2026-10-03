@@ -140,6 +140,7 @@ void BluetoothDebugWorkflow::begin()
                  LocalMissionConfig::ENABLED ? "NO_AIO9" : "DISABLED");
         link_.log("WARNING", "AIO SX1509 not detected at 0x3E on I2C0; AIO9 button unavailable");
     }
+    localCompetitionSortingSerial_ = sortingConfirmedSerial_;
     const bool tof8x8Ready = tof8x8_.begin();
     Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
@@ -180,16 +181,25 @@ void BluetoothDebugWorkflow::update()
     if (lastUpdateStartedUs_ != 0)
         maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
     lastUpdateStartedUs_ = updateStartedUs;
-    link_.update();
     const uint32_t now = millis();
-    if (!bluetoothPeerAlive(now) && now - lastLinkProbeMs_ >= 2000U)
-    {
-        lastLinkProbeMs_ = now;
-        JsonDocument probe;
-        probe["type"] = "link_probe";
-        probe["uptime_ms"] = now;
-        link_.send(probe);
-    }
+    auto serviceLink = [this]() {
+        link_.update();
+        const uint32_t linkNow = millis();
+        if (!bluetoothPeerAlive(linkNow) &&
+            linkNow - lastLinkProbeMs_ >= 2000U)
+        {
+            lastLinkProbeMs_ = linkNow;
+            JsonDocument probe;
+            probe["type"] = "link_probe";
+            probe["uptime_ms"] = linkNow;
+            link_.send(probe);
+        }
+    };
+    // In the local competition profile, service the physical start edge
+    // before parsing optional Bluetooth traffic. Keep normal debug-mode order
+    // unchanged so existing manual-control behavior is unaffected.
+    if (!LocalMissionConfig::ENABLED)
+        serviceLink();
     if (!currentSensorSampleValid_ || now - lastCurrentSampleMs_ >= 10U)
     {
         lastCurrentSampleMs_ = now;
@@ -243,6 +253,8 @@ void BluetoothDebugWorkflow::update()
     // mission (or enforce the local round timer). Keep it ahead of navigation
     // so a newly accepted press starts the mission in this same update cycle.
     updateLocalCompetition();
+    if (LocalMissionConfig::ENABLED)
+        serviceLink();
     updateArmSorting(now);
     if (sortingGateTorqueOffAtMs_ != 0 &&
         static_cast<int32_t>(now - sortingGateTorqueOffAtMs_) >= 0)
@@ -435,6 +447,11 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionUltrasoundGeometryValid_ = false;
         missionReturnHome_ = false;
         missionAutoReturnHome_ = false;
+        localBlockTargetValid_ = false;
+        localBlockTargetEnroute_ = false;
+        localBlockRouteCount_ = 0;
+        localPostUnloadPhase_ = 0;
+        localPostUnloadStartedMs_ = 0;
         missionDockPhase_ = 0;
         missionDockTurnStartedMs_ = 0;
         missionDockPhaseStartedMs_ = 0;
@@ -486,7 +503,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             const int y1 = values[i + 3].as<int>();
             const int kind = values[i + 4].as<int>();
             if (x0 < 0 || y0 < 0 || x1 > 4900 || y1 > 2400 ||
-                x0 >= x1 || y0 >= y1 || (kind < 0 || kind > 2))
+                x0 >= x1 || y0 >= y1 || (kind < 0 || kind > 3))
             {
                 link_.error("Invalid mission map rectangle");
                 return;
@@ -654,12 +671,86 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         const int startY = message["start_y_mm"] | -1;
         const float startHeading = message["start_heading_deg"] | 0.0f;
         const int fallback = message["fallback_strategy"] | 0;
+        const int confirmedWeightLimit = message["confirmed_weight_limit"] |
+            LocalCompetition::DEFAULT_CONFIRMED_WEIGHT_LIMIT;
         const int homeX = message["home_x_mm"] | -1;
         const int homeY = message["home_y_mm"] | -1;
-        if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
-            fallback < 0 || fallback > 2)
+        bool blockTargetValid = false;
+        int blockTargetX = 0;
+        int blockTargetY = 0;
+        if (!message["block_target"].isNull())
         {
-            link_.error("Mission start/fallback values are outside the supported range");
+            const JsonObjectConst blockTarget =
+                message["block_target"].as<JsonObjectConst>();
+            if (blockTarget.isNull())
+            {
+                link_.error("Block destination must contain x_mm and y_mm");
+                return;
+            }
+            blockTargetX = blockTarget["x_mm"] | -1;
+            blockTargetY = blockTarget["y_mm"] | -1;
+            if (blockTargetX < 0 || blockTargetX > 4900 ||
+                blockTargetY < 0 || blockTargetY > 2400)
+            {
+                link_.error("Block destination is outside the 4900 x 2400 mm arena");
+                return;
+            }
+            blockTargetValid = true;
+        }
+        MissionWaypoint blockRoute[MAX_MISSION_WAYPOINTS] = {};
+        uint8_t blockRouteCount = 0;
+        if (!message["block_route"].isNull())
+        {
+            if (!message["block_route"].is<JsonArray>())
+            {
+                link_.error("After-unload route must be a flat x,y array");
+                return;
+            }
+            JsonArray route = message["block_route"].as<JsonArray>();
+            if (route.size() % 2 != 0 ||
+                route.size() / 2 > MAX_MISSION_WAYPOINTS ||
+                (blockTargetValid && route.size() < 4) ||
+                (!blockTargetValid && route.size() != 0))
+            {
+                link_.error("After-unload route must contain 2..64 x,y pairs for its destination");
+                return;
+            }
+            blockRouteCount = static_cast<uint8_t>(route.size() / 2);
+            for (uint8_t i = 0; i < blockRouteCount; ++i)
+            {
+                const int x = route[2U * i].as<int>();
+                const int y = route[2U * i + 1U].as<int>();
+                if (x < 0 || x > 4900 || y < 0 || y > 2400)
+                {
+                    link_.error("After-unload route waypoint is outside the arena");
+                    return;
+                }
+                blockRoute[i].xMm = static_cast<int16_t>(x);
+                blockRoute[i].yMm = static_cast<int16_t>(y);
+                blockRoute[i].flags = 0;
+            }
+            const int expectedRouteStartX = confirmedWeightLimit == 0
+                ? startX : homeX;
+            const int expectedRouteStartY = confirmedWeightLimit == 0
+                ? startY : homeY;
+            if (blockRouteCount > 0 &&
+                (expectedRouteStartX < 0 || expectedRouteStartX > 4900 ||
+                 expectedRouteStartY < 0 || expectedRouteStartY > 2400 ||
+                 blockRoute[0].xMm != expectedRouteStartX ||
+                 blockRoute[0].yMm != expectedRouteStartY ||
+                 blockRoute[blockRouteCount - 1].xMm != blockTargetX ||
+                 blockRoute[blockRouteCount - 1].yMm != blockTargetY))
+            {
+                link_.error("Destination route must start at its configured origin and end at the destination");
+                return;
+            }
+        }
+        if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
+            fallback < 0 || fallback > 2 ||
+            confirmedWeightLimit < 0 ||
+            confirmedWeightLimit > LocalCompetition::MAX_CONFIRMED_WEIGHT_LIMIT)
+        {
+            link_.error("Mission start, fallback, or confirmed-weight limit is outside the supported range");
             return;
         }
 
@@ -690,6 +781,17 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         while (missionStartArenaHeadingDeg_ >= 360.0f) missionStartArenaHeadingDeg_ -= 360.0f;
         while (missionStartArenaHeadingDeg_ < 0.0f) missionStartArenaHeadingDeg_ += 360.0f;
         missionFallbackStrategy_ = static_cast<uint8_t>(fallback);
+        localCompetition_.setConfirmedWeightLimit(
+            static_cast<uint8_t>(confirmedWeightLimit));
+        localBlockTargetValid_ = blockTargetValid;
+        localBlockTargetXmm_ = static_cast<int16_t>(blockTargetX);
+        localBlockTargetYmm_ = static_cast<int16_t>(blockTargetY);
+        localBlockRouteCount_ = blockRouteCount;
+        for (uint8_t i = 0; i < blockRouteCount; ++i)
+            localBlockRoute_[i] = blockRoute[i];
+        localBlockTargetEnroute_ = false;
+        localPostUnloadPhase_ = 0;
+        localPostUnloadStartedMs_ = 0;
         missionWaypointCount_ = count;
         missionWaypointIndex_ = 0;
         missionTargetCount_ = targets;
@@ -741,7 +843,9 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionLastPointTurnMs_ = 0;
         missionFrontBlockedLatched_ = false;
         missionFrontClearSinceMs_ = 0;
-        missionPlanValid_ = count > 0 && targets > 0;
+        const bool directDestinationPlan = confirmedWeightLimit == 0 &&
+            blockTargetValid && blockRouteCount >= 2;
+        missionPlanValid_ = count > 0 && (targets > 0 || directDestinationPlan);
         missionPoseInitialised_ = false;
         missionTargetAlignSinceMs_ = 0;
         missionTargetAligned_ = false;
@@ -1260,6 +1364,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionWallReverseFailed_ = false;
         missionWallReverseNoProgress_ = false;
         missionWallRecoveryDetourRequested_ = false;
+        missionWallRecoveryMapTried_ = false;
         missionWallRecoveryPreferredSide_ = 0;
         missionWallReverseWaypoint_ = 255;
         missionWallReverseRepeatCount_ = 0;
@@ -1270,8 +1375,23 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionOuterReverseActive_ = false;
         missionOuterCueAlignedSinceMs_ = 0;
         missionForwardProgressStartedMs_ = 0;
+        missionForwardProgressFrontMm_ = 0xFFFF;
+        missionForwardProgressImuEventCount_ = imuMotionEventCount;
+        missionForwardProgressHeadingDeg_ = 0.0f;
         missionForwardStalled_ = false;
+        missionEncoderImuSkid_ = false;
+        missionRampTiltDeg_ = 0.0f;
+        missionRampTiltDetected_ = false;
+        missionRampRecoveryLatched_ = false;
+        missionOnMappedGoRamp_ = false;
+        missionRampTiltSinceMs_ = 0;
+        missionRampTiltClearSinceMs_ = 0;
+        missionRampAvoidanceNext_ = 0;
+        for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            missionRampAvoidances_[i].active = false;
         missionTurnProgressStartedMs_ = 0;
+        missionTurnProgressEncoder1_ = 0;
+        missionTurnProgressEncoder2_ = 0;
         missionLandmarkCorrections_ = 0;
         missionLastLandmarkId_ = -1;
         for (uint8_t i = 0; i < 2; ++i)
@@ -2100,6 +2220,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         ? localCompetition_.elapsedMs(now) : 0U;
     data["local_competition.remaining_ms"] = localRunActive_
         ? localCompetition_.remainingMs(now) : 0U;
+    data["local_competition.confirmed_weights"] = localCompetition_.confirmedWeights();
+    data["local_competition.weight_limit"] = localCompetition_.confirmedWeightLimit();
     data["local_competition.aio9_high"] = aio9ButtonRawHigh_;
     data["local_competition.aio9_available"] = aioExpanderReady_;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
@@ -2241,6 +2363,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         missionVerifyPhase_ == 5 ? "reversing_for_weight_retry" :
         missionVerifyPhase_ != 0 ? "checking_pickup" :
         missionTofRecoveryHold_ ? "waiting_for_point_tofs" :
+        missionRampRecoveryLatched_ && missionWallReverseActive_
+            ? "reversing_from_unexpected_ramp" :
         missionWallReverseActive_ ? "reversing_from_wall" :
         missionReturnHome_ && missionWaypointIndex_ < missionWaypointCount_ &&
             (missionWaypoints_[missionWaypointIndex_].flags & 0x04) != 0
@@ -2335,6 +2459,18 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["mission.wall_reverse_active"] = missionWallReverseActive_;
     data["mission.wall_reverse_failed"] = missionWallReverseFailed_;
     data["mission.forward_stalled"] = missionForwardStalled_;
+    data["mission.encoder_imu_skid"] = missionEncoderImuSkid_;
+    data["mission.ramp_tilt_deg"] = missionRampTiltDeg_;
+    data["mission.ramp_tilt_detected"] = missionRampTiltDetected_;
+    data["mission.ramp_recovery_latched"] = missionRampRecoveryLatched_;
+    data["mission.on_mapped_go_ramp"] = missionOnMappedGoRamp_;
+    uint8_t rampAvoidanceCount = 0;
+    for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+        if (missionRampAvoidances_[i].active) ++rampAvoidanceCount;
+    data["mission.ramp_avoidance_count"] = rampAvoidanceCount;
+    data["mission.wall_recovery_detour_requested"] =
+        missionWallRecoveryDetourRequested_;
+    data["mission.wall_recovery_map_tried"] = missionWallRecoveryMapTried_;
     data["mission.avoid_phase"] = missionAvoidPhase_;
     data["mission.reroute_count"] = missionRerouteCount_;
     data["mission.skipped_route_points"] = missionSkippedWaypoints_;
@@ -2977,7 +3113,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
         const float ray = (missionArenaHeadingDeg_ + sensor.angleDeg) * DEG_TO_RAD;
         const float ux = cosf(ray), uy = sinf(ray);
         float nearest = 5000.0f;
-        // Slab intersection with physical walls; no-go home zones are not
+        // Slab intersection with physical walls; map exclusions are not
         // physical surfaces. Include the four real arena boundaries.
         auto intersect = [&](float x0, float y0, float x1, float y1) {
             float enter = -5000.0f, leave = 5000.0f;
@@ -3014,7 +3150,7 @@ void BluetoothDebugWorkflow::updateWeightDetection()
         for (uint8_t i = 0; i < missionFeatureCount_; ++i)
         {
             const MissionFeature& feature = missionFeatures_[i];
-            if (feature.kind != 0)
+            if (feature.kind != 0 && feature.kind != 3)
             {
                 if (feature.rotatedWall)
                     nearest = min(nearest, rayRotatedWall(originX, originY,
@@ -3333,6 +3469,7 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionWallReverseFailed_ = false;
     missionWallReverseNoProgress_ = false;
     missionWallRecoveryDetourRequested_ = false;
+    missionWallRecoveryMapTried_ = false;
     missionWallRecoveryPreferredSide_ = 0;
     missionWallReverseWaypoint_ = 255;
     missionWallReverseRepeatCount_ = 0;
@@ -3344,8 +3481,23 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     missionOuterReverseActive_ = false;
     missionOuterCueAlignedSinceMs_ = 0;
     missionForwardProgressStartedMs_ = 0;
+    missionForwardProgressFrontMm_ = 0xFFFF;
+    missionForwardProgressImuEventCount_ = imuMotionEventCount;
+    missionForwardProgressHeadingDeg_ = 0.0f;
     missionForwardStalled_ = false;
+    missionEncoderImuSkid_ = false;
+    missionRampTiltDeg_ = 0.0f;
+    missionRampTiltDetected_ = false;
+    missionRampRecoveryLatched_ = false;
+    missionOnMappedGoRamp_ = false;
+    missionRampTiltSinceMs_ = 0;
+    missionRampTiltClearSinceMs_ = 0;
+    missionRampAvoidanceNext_ = 0;
+    for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+        missionRampAvoidances_[i].active = false;
     missionTurnProgressStartedMs_ = 0;
+    missionTurnProgressEncoder1_ = 0;
+    missionTurnProgressEncoder2_ = 0;
     missionBlockedSinceMs_ = 0;
     dcMotor203Second_.stop();
     dcMotor203SecondActive_ = false;
@@ -4399,6 +4551,61 @@ void BluetoothDebugWorkflow::updateNavigation()
         link_.log("WARNING", "U-shaped enclosure detected; reversing to find turning clearance");
     }
 
+    // Reactive navigation has no uploaded waypoint corridor to route around an
+    // unexpected incline, so use its existing single-reverse/90-degree escape.
+    // Planned missions handle this below, where the incline is also recorded
+    // as a temporary no-go area for map-based rerouting.
+    if (navigationStrategy_ != 3)
+    {
+        missionRampTiltDeg_ = lastImuSampleValid_
+            ? max(fabsf(imu_.pitchDeg()), fabsf(imu_.rollDeg())) : 0.0f;
+        missionRampTiltDetected_ = lastImuSampleValid_ &&
+            missionRampTiltDeg_ > 5.0f;
+        missionOnMappedGoRamp_ = false;
+        if (missionRampRecoveryLatched_)
+        {
+            if (lastImuSampleValid_ && missionRampTiltDeg_ < 3.0f)
+            {
+                if (missionRampTiltClearSinceMs_ == 0)
+                    missionRampTiltClearSinceMs_ = now;
+                else if (now - missionRampTiltClearSinceMs_ >= 500U)
+                {
+                    missionRampRecoveryLatched_ = false;
+                    missionRampTiltClearSinceMs_ = 0;
+                }
+            }
+            else
+                missionRampTiltClearSinceMs_ = 0;
+        }
+        const int16_t rampDriveA = dcMotor203Second_.channelAPercent();
+        const int16_t rampDriveB = dcMotor203Second_.channelBPercent();
+        const bool rampForwardCommand = rampDriveA <= -35 && rampDriveB <= -35;
+        if (rampForwardCommand && missionRampTiltDetected_ &&
+            !missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltSinceMs_ == 0)
+                missionRampTiltSinceMs_ = now;
+            if (now - missionRampTiltSinceMs_ >= 200U)
+            {
+                missionRampRecoveryLatched_ = true;
+                missionRampTiltClearSinceMs_ = 0;
+                navigationState_ = NAV_ESCAPE_REVERSE;
+                navigationEscapeStartEncoder1_ = encoders_.firstCount();
+                navigationEscapeStartEncoder2_ = encoders_.secondCount();
+                navigationEscapeTurnRight_ = recoveryRight != 0xFFFF &&
+                    (recoveryLeft == 0xFFFF || recoveryRight >= recoveryLeft);
+                navigationMotionStartedMs_ = now;
+                navigationMotionConsistent_ = true;
+                setDrive(100, 100);
+                link_.log("WARNING",
+                    "Unexpected incline over 5 degrees; reversing once and turning toward open space");
+                return;
+            }
+        }
+        else
+            missionRampTiltSinceMs_ = 0;
+    }
+
     if (navigationState_ == NAV_MISSION_TRACK && navigationStrategy_ == 3)
     {
         if (!lastImuSampleValid_)
@@ -4406,6 +4613,56 @@ void BluetoothDebugWorkflow::updateNavigation()
             setDrive(0, 0);
             return;
         }
+        missionRampTiltDeg_ = max(fabsf(imu_.pitchDeg()), fabsf(imu_.rollDeg()));
+        missionRampTiltDetected_ = missionRampTiltDeg_ > 5.0f;
+        missionOnMappedGoRamp_ = false;
+        const float goRampPoseMarginMm =
+            0.5f * static_cast<float>(navigationRobotLengthMm_) + 60.0f;
+        for (uint8_t i = 0; i < missionFeatureCount_; ++i)
+        {
+            const MissionFeature& feature = missionFeatures_[i];
+            if (feature.kind == 3 &&
+                missionPoseXmm_ >= feature.x0 - goRampPoseMarginMm &&
+                missionPoseXmm_ <= feature.x1 + goRampPoseMarginMm &&
+                missionPoseYmm_ >= feature.y0 - goRampPoseMarginMm &&
+                missionPoseYmm_ <= feature.y1 + goRampPoseMarginMm)
+            {
+                // Go ramps are an explicit, planned route feature. Keep the
+                // incline recovery for unexpected ramps, not this deliberate
+                // centreline crossing.
+                missionOnMappedGoRamp_ = true;
+                break;
+            }
+        }
+        const int16_t rampDriveA = dcMotor203Second_.channelAPercent();
+        const int16_t rampDriveB = dcMotor203Second_.channelBPercent();
+        const bool drivingForwardForRamp = rampDriveA <= -35 && rampDriveB <= -35;
+        bool missionRampEscapeReady = false;
+        if (missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltDeg_ < 3.0f)
+            {
+                if (missionRampTiltClearSinceMs_ == 0)
+                    missionRampTiltClearSinceMs_ = now;
+                else if (now - missionRampTiltClearSinceMs_ >= 500U)
+                {
+                    missionRampRecoveryLatched_ = false;
+                    missionRampTiltClearSinceMs_ = 0;
+                }
+            }
+            else
+                missionRampTiltClearSinceMs_ = 0;
+        }
+        if (drivingForwardForRamp && !missionOnMappedGoRamp_ &&
+            missionRampTiltDetected_ && !missionRampRecoveryLatched_)
+        {
+            if (missionRampTiltSinceMs_ == 0)
+                missionRampTiltSinceMs_ = now;
+            missionRampEscapeReady = now - missionRampTiltSinceMs_ >= 200U;
+        }
+        else
+            missionRampTiltSinceMs_ = 0;
+
         // Associate a NEW side-ultrasound echo with the nearest uploaded
         // physical rectangle or arena boundary. Three independent echoes must
         // match the same surface before a small position correction is made.
@@ -4478,7 +4735,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
-                if (feature.kind == 0) continue;
+                if (feature.kind == 0 || feature.kind == 3) continue;
                 const float hit = feature.rotatedWall
                     ? rayRotatedWall(sensorX, sensorY, ux, uy,
                         feature.wallX, feature.wallY, feature.rotationDeg)
@@ -4665,9 +4922,26 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (x < clearance || y < clearance ||
                 x > 4900.0f - clearance || y > 2400.0f - clearance)
                 return false;
+            for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            {
+                const MissionRampAvoidance& avoid = missionRampAvoidances_[i];
+                if (!avoid.active) continue;
+                const float angle = avoid.headingDeg * DEG_TO_RAD;
+                const float dx = x - avoid.centerXmm;
+                const float dy = y - avoid.centerYmm;
+                const float localX = dx * cosf(angle) + dy * sinf(angle);
+                const float localY = -dx * sinf(angle) + dy * cosf(angle);
+                // A detected unexpected incline becomes a no-go footprint for
+                // the rest of this run, so map rerouting cannot send the robot
+                // straight back onto the same ramp.
+                if (fabsf(localX) <= 600.0f + clearance &&
+                    fabsf(localY) <= 200.0f + clearance)
+                    return false;
+            }
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
+                if (feature.kind == 3) continue;
                 // A dummy's value is deliberately independent of the wall
                 // setting: it is the requested gap from the robot's outer
                 // edge, rather than a hidden extra margin.
@@ -5084,19 +5358,33 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWallReverseNoProgress_ = reversedMm < 80.0f;
             missionWallReverseFailed_ = missionWallReverseNoProgress_ ||
                 front == 0xFFFF || front < 220U;
+            // A single bounded retreat is the only push/back-up retry at a
+            // blocked waypoint. From here, switch to map/live-space planning;
+            // never repeat the same reverse-and-drive-into-it cycle.
+            missionWallRecoveryDetourRequested_ = true;
+            missionWallRecoveryPreferredSide_ =
+                right != 0xFFFF && (left == 0xFFFF || right >= left)
+                    ? 1 : left != 0xFFFF ? -1 : 0;
             missionAvoidPhase_ = 0;
             missionBlockedSinceMs_ = 0;
             link_.log(missionWallReverseFailed_ ? "WARNING" : "INFO",
                 missionWallReverseNoProgress_
-                    ? "Reverse produced no encoder progress; motors held stopped"
+                    ? "Reverse produced no encoder progress; switching to map/open-space detour"
                     : missionWallReverseFailed_
-                    ? "Wall still too close after bounded reverse; holding motors stopped"
-                    : "Backed away from frontal wall; replanning before turning");
+                    ? "Wall still close after one bounded retreat; switching to detour"
+                    : "Backed away once; selecting a map-checked open-space detour");
             return;
         }
         if (missionWallReverseFailed_)
         {
-            if (missionWallReverseNoProgress_ || front == 0xFFFF || front < 220U)
+            if (missionWallRecoveryDetourRequested_)
+            {
+                // The detour planner below owns the next action, even when
+                // encoder/ultrasound evidence says the retreat did not work.
+                missionWallReverseFailed_ = false;
+                missionWallReverseNoProgress_ = false;
+            }
+            else if (missionWallReverseNoProgress_ || front == 0xFFFF || front < 220U)
             {
                 setDrive(0, 0);
                 return;
@@ -5105,13 +5393,17 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
         const int16_t commandedA = dcMotor203Second_.channelAPercent();
         const int16_t commandedB = dcMotor203Second_.channelBPercent();
-        if (commandedA <= -75 && commandedB <= -75)
+        if (commandedA <= -35 && commandedB <= -35)
         {
             if (missionForwardProgressStartedMs_ == 0)
             {
                 missionForwardProgressStartedMs_ = now;
                 missionForwardProgressEncoder1_ = encoders_.firstCount();
                 missionForwardProgressEncoder2_ = encoders_.secondCount();
+                missionForwardProgressFrontMm_ = front;
+                missionForwardProgressImuEventCount_ = imuMotionEventCount;
+                missionForwardProgressHeadingDeg_ = lastImuSampleValid_
+                    ? imu_.headingDeg() : 0.0f;
             }
             else if (now - missionForwardProgressStartedMs_ >= 1000U)
             {
@@ -5121,16 +5413,87 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const float rightTravel = fabsf(
                     (encoders_.secondCount() - missionForwardProgressEncoder2_) *
                     0.08461399f);
-                missionForwardStalled_ = leftTravel < 35.0f && rightTravel < 35.0f;
+                const float encoderTravelMm = 0.5f * (leftTravel + rightTravel);
+                const bool encoderStopped = leftTravel < 35.0f && rightTravel < 35.0f;
+                const uint16_t skidFrontRangeMm = min(
+                    static_cast<uint16_t>(FRONT_AVOID_MM + 150U),
+                    static_cast<uint16_t>(600U));
+                const bool closeForwardSurface =
+                    front != 0xFFFF && front <= skidFrontRangeMm &&
+                    missionForwardProgressFrontMm_ != 0xFFFF &&
+                    missionForwardProgressFrontMm_ <= skidFrontRangeMm + 250U;
+                const float measuredClosingMm = closeForwardSurface
+                    ? static_cast<float>(missionForwardProgressFrontMm_) - front
+                    : 0.0f;
+                const bool rangeConfirmsTranslation = closeForwardSurface &&
+                    fabsf(measuredClosingMm) >=
+                        max(25.0f, encoderTravelMm * 0.30f);
+                const bool imuReportsNoChassisMotion = lastImuSampleValid_ &&
+                    !imuMotionActive &&
+                    imuMotionEventCount == missionForwardProgressImuEventCount_ &&
+                    fabsf(headingDelta(missionForwardProgressHeadingDeg_,
+                                       imu_.headingDeg())) < 2.0f;
+                const bool driveIsStraight = abs(commandedA - commandedB) <= 20 &&
+                    lastImuSampleValid_ &&
+                    fabsf(headingDelta(missionArenaHeadingDeg_,
+                                       navigationTargetHeadingDeg_)) <= 12.0f;
+                // The BNO055 has no trustworthy absolute translation speed;
+                // use a close, stable front surface as the independent proof
+                // that commanded straight-line wheel travel did not move the
+                // chassis. Compare range change in either direction so an
+                // oblique wall edge that is opening up still counts as motion.
+                const bool straightWheelSlip = encoderTravelMm >= 90.0f &&
+                    min(leftTravel, rightTravel) >= 35.0f &&
+                    closeForwardSurface && !rangeConfirmsTranslation &&
+                    imuReportsNoChassisMotion && driveIsStraight;
+                // On a differential turn the signed wheel-distance difference
+                // predicts yaw. If the encoders imply a substantial turn but
+                // the IMU reports almost none while an obstacle is close, the
+                // wheels are scrubbing at the wall edge rather than turning
+                // the robot. Treat this as blocked, not as a slow correction.
+                const float leftSignedTravel =
+                    (missionForwardProgressEncoder1_ - encoders_.firstCount()) *
+                    0.08437374f;
+                const float rightSignedTravel =
+                    (encoders_.secondCount() - missionForwardProgressEncoder2_) *
+                    0.08461399f;
+                const float encoderDifferentialMm =
+                    fabsf(leftSignedTravel - rightSignedTravel);
+                const float expectedEncoderTurnDeg = encoderDifferentialMm *
+                    RAD_TO_DEG / max(180.0f,
+                        static_cast<float>(navigationRobotWidthMm_));
+                const float imuHeadingChangeDeg = lastImuSampleValid_
+                    ? fabsf(headingDelta(missionForwardProgressHeadingDeg_,
+                                         imu_.headingDeg()))
+                    : 180.0f;
+                const bool nearbySurface =
+                    (front != 0xFFFF && front <= 700U) ||
+                    (left != 0xFFFF && left <= 500U) ||
+                    (right != 0xFFFF && right <= 500U);
+                const bool turnWheelSlip = abs(commandedA - commandedB) >= 25 &&
+                    encoderDifferentialMm >= 70.0f &&
+                    expectedEncoderTurnDeg >= 12.0f &&
+                    imuHeadingChangeDeg <= max(3.0f,
+                                                expectedEncoderTurnDeg * 0.20f) &&
+                    nearbySurface;
+                missionEncoderImuSkid_ = straightWheelSlip || turnWheelSlip;
+                missionForwardStalled_ = encoderStopped ||
+                    missionEncoderImuSkid_;
                 missionForwardProgressStartedMs_ = now;
                 missionForwardProgressEncoder1_ = encoders_.firstCount();
                 missionForwardProgressEncoder2_ = encoders_.secondCount();
+                missionForwardProgressFrontMm_ = front;
+                missionForwardProgressImuEventCount_ = imuMotionEventCount;
+                missionForwardProgressHeadingDeg_ = lastImuSampleValid_
+                    ? imu_.headingDeg() : 0.0f;
             }
         }
         else
         {
             missionForwardProgressStartedMs_ = 0;
             missionForwardStalled_ = false;
+            missionEncoderImuSkid_ = false;
+            missionForwardProgressFrontMm_ = 0xFFFF;
         }
         auto beginMissionWallReverse = [&](const char* reason) {
             if (missionWallReverseWaypoint_ == missionWaypointIndex_ &&
@@ -5144,16 +5507,40 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWallReverseLastStartMs_ = now;
             missionWallReverseActive_ = true;
             missionWallReverseStartedMs_ = now;
+            missionWallRecoveryDetourRequested_ = false;
+            missionWallRecoveryMapTried_ = false;
             missionWallReverseEncoder1_ = encoders_.firstCount();
             missionWallReverseEncoder2_ = encoders_.secondCount();
             missionForwardStalled_ = false;
+            missionEncoderImuSkid_ = false;
             missionForwardProgressStartedMs_ = 0;
+            missionForwardProgressFrontMm_ = 0xFFFF;
             missionTurnProgressStartedMs_ = 0;
             missionWeightVectorActive_ = false;
             missionInnerWeightLocked_ = false;
             missionAvoidPhase_ = 0;
             setDrive(75, 75);
             link_.log("WARNING", reason);
+        };
+        auto rememberUnexpectedRamp = [&]() {
+            const float heading = missionArenaHeadingDeg_ * DEG_TO_RAD;
+            const float centerX = missionPoseXmm_ + 700.0f * cosf(heading);
+            const float centerY = missionPoseYmm_ + 700.0f * sinf(heading);
+            for (uint8_t i = 0; i < MAX_MISSION_RAMP_AVOIDS; ++i)
+            {
+                const MissionRampAvoidance& existing = missionRampAvoidances_[i];
+                if (existing.active && hypotf(existing.centerXmm - centerX,
+                                              existing.centerYmm - centerY) < 500.0f)
+                    return;
+            }
+            MissionRampAvoidance& avoid =
+                missionRampAvoidances_[missionRampAvoidanceNext_];
+            avoid.active = true;
+            avoid.centerXmm = centerX;
+            avoid.centerYmm = centerY;
+            avoid.headingDeg = missionArenaHeadingDeg_;
+            missionRampAvoidanceNext_ = static_cast<uint8_t>(
+                (missionRampAvoidanceNext_ + 1U) % MAX_MISSION_RAMP_AVOIDS);
         };
 
         // Large odometry errors cannot be repaired by the ordinary 3 mm
@@ -5190,7 +5577,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 for (uint8_t i = 0; i < missionFeatureCount_; ++i)
                 {
                     const MissionFeature& feature = missionFeatures_[i];
-                    if (feature.kind == 0) continue;
+                    if (feature.kind == 0 || feature.kind == 3) continue;
                     distance = min(distance, feature.rotatedWall
                         ? rayRotatedWall(originX, originY, ux, uy,
                             feature.wallX, feature.wallY, feature.rotationDeg)
@@ -5291,6 +5678,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
+                if (feature.kind == 3) continue;
                 const float featureClearance = feature.kind == 2
                     ? 0.5f * navigationRobotWidthMm_ +
                       missionDummyClearanceMm_ : CLEARANCE;
@@ -5424,7 +5812,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 setDrive(0, 0);
                 if (now - missionUnloadPhaseStartedMs_ >= 650U)
                 {
-                    missionUnloadPhase_ = 2;
+                    missionUnloadPhase_ = HomeUnloadConfig::FIRST_SHAKE_PHASE;
                     missionUnloadPhaseStartedMs_ = now;
                     missionUnloadStartEncoder1_ = encoders_.firstCount();
                     missionUnloadStartEncoder2_ = encoders_.secondCount();
@@ -5438,9 +5826,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionUnloadStartEncoder2_) * ENCODER_2_MM_PER_COUNT);
             const float travelledMm = min(leftMm, rightMm);
             const uint32_t elapsedMs = now - missionUnloadPhaseStartedMs_;
-            // Give the motor driver a short neutral interval before each
-            // direction change instead of slamming straight into reverse.
-            if (elapsedMs < 150U)
+            // Briefly neutralise between legs, then use full drive power for
+            // a decisive shake rather than the old soft 75% motion.
+            if (elapsedMs < HomeUnloadConfig::DIRECTION_SETTLE_MS)
             {
                 setDrive(0, 0);
                 return;
@@ -5451,13 +5839,24 @@ void BluetoothDebugWorkflow::updateNavigation()
                 stopNavigation("Home unload aborted: shake travel did not track encoders");
                 return;
             }
-            if (travelledMm >= 90.0f || elapsedMs > 1800U)
+            if (travelledMm >= HomeUnloadConfig::SHAKE_LEG_TRAVEL_MM ||
+                elapsedMs > 1800U)
             {
                 setDrive(0, 0);
-                if (missionUnloadPhase_ == 5)
+                if ((missionUnloadPhase_ - HomeUnloadConfig::FIRST_SHAKE_PHASE + 1U) % 2U == 0U)
+                {
+                    char shakeMessage[48];
+                    const uint8_t completedCycles =
+                        (missionUnloadPhase_ - HomeUnloadConfig::FIRST_SHAKE_PHASE + 1U) / 2U;
+                    snprintf(shakeMessage, sizeof(shakeMessage),
+                        "Home unload shake cycle %u/%u complete",
+                        completedCycles, HomeUnloadConfig::SHAKE_CYCLES);
+                    link_.log("INFO", shakeMessage);
+                }
+                if (missionUnloadPhase_ == HomeUnloadConfig::LAST_SHAKE_PHASE)
                 {
                     missionUnloadPhase_ = 0;
-                    link_.log("INFO", "Home unload shake complete; storage gate open");
+                    link_.log("INFO", "Home unload complete: 3 full-power shake cycles; storage gate open");
                 }
                 else
                 {
@@ -5482,7 +5881,9 @@ void BluetoothDebugWorkflow::updateNavigation()
                 stopNavigation("Home unload aborted: shake corridor blocked");
                 return;
             }
-            setDrive(outward ? -75 : 75, outward ? -75 : 75);
+            const int16_t shakePower = HomeUnloadConfig::SHAKE_SPEED_PERCENT;
+            setDrive(outward ? -shakePower : shakePower,
+                     outward ? -shakePower : shakePower);
             return;
         }
 
@@ -5522,7 +5923,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             return found;
         };
 
-        if (!missionReturnHome_ && missionTargetsVisited_ >= missionTargetCount_ &&
+        if (!localBlockTargetEnroute_ && !missionReturnHome_ &&
+            missionTargetsVisited_ >= missionTargetCount_ &&
             missionHomeValid_)
         {
             if (missionWaypointIndex_ + 3U >= MAX_MISSION_WAYPOINTS)
@@ -5600,8 +6002,28 @@ void BluetoothDebugWorkflow::updateNavigation()
             link_.log("INFO", "All weight sites checked; returning home before exploring");
             return;
         }
+        // The post-unload destination is the final blocking position, not a
+        // normal mission stop. Keep the drive bank rotating in place until a
+        // deliberate stop command arrives; do not fall through to the generic
+        // end-of-route neutral/finish handling below.
+        if (localRunActive_ && localBlockTargetEnroute_ &&
+            missionWaypointIndex_ >= missionWaypointCount_)
+        {
+            if (localPostUnloadPhase_ != 3)
+            {
+                localPostUnloadPhase_ = 3;
+                snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
+                link_.log("INFO", localCompetition_.confirmedWeightLimit() == 0
+                    ? "Direct destination reached; spinning in place until stopped"
+                    : "Post-unload block destination reached; spinning in place until stopped");
+            }
+            setDrive(-80, 80);
+            return;
+        }
+
         if (missionWaypointIndex_ >= missionWaypointCount_ ||
-            (!missionReturnHome_ && missionTargetsVisited_ >= missionTargetCount_))
+            (!localBlockTargetEnroute_ && !missionReturnHome_ &&
+             missionTargetsVisited_ >= missionTargetCount_))
         {
             setDrive(0, 0);
             if (missionReturnHome_)
@@ -5610,6 +6032,71 @@ void BluetoothDebugWorkflow::updateNavigation()
                 {
                     if (localRunActive_)
                     {
+                        if (localBlockTargetValid_)
+                        {
+                            if (localPostUnloadPhase_ == 0)
+                            {
+                                localPostUnloadPhase_ = 1;
+                                localPostUnloadStartedMs_ = now;
+                                setDrive(0, 0);
+                                link_.log("INFO", "Home unload complete; holding 5 seconds before closing gate and heading to block destination");
+                                return;
+                            }
+                            if (localPostUnloadPhase_ == 1 &&
+                                now - localPostUnloadStartedMs_ < LOCAL_POST_UNLOAD_WAIT_MS)
+                            {
+                                setDrive(0, 0);
+                                return;
+                            }
+
+                            if (!pointFree(localBlockTargetXmm_, localBlockTargetYmm_))
+                            {
+                                link_.log("ERROR", "Block destination is inside a mapped obstacle/no-go clearance; local run stopping at home");
+                                finishLocalCompetition();
+                                return;
+                            }
+
+                            // Reuse the mission waypoint follower and its live
+                            // map rerouting for the post-unload destination.
+                            // It is not a weight target and must not trigger
+                            // another home-return transition.
+                            hx12kB_.setAngle(50.0f);
+                            // Match the GUI's first-203 0% command without
+                            // routing a manual command through the handler,
+                            // which would stop the active navigation route.
+                            cancelDrumJamRecovery();
+                            setDcMotor203Speed(0, 0);
+                            drumJamMonitorStartedMs_ = 0;
+                            drumJamBaselineInitialized_ = false;
+                            drumJamLowSinceMs_ = 0;
+                            link_.log("INFO", "First 203 DC motors set to 0% after storage gate close");
+                            missionReturnHome_ = false;
+                            missionAutoReturnHome_ = false;
+                            missionWaypointIndex_ = 0;
+                            if (localBlockRouteCount_ >= 2)
+                            {
+                                missionWaypointCount_ = localBlockRouteCount_;
+                                for (uint8_t i = 0; i < localBlockRouteCount_; ++i)
+                                    missionWaypoints_[i] = localBlockRoute_[i];
+                            }
+                            else
+                            {
+                                // Compatibility with older planners that send
+                                // only the destination marker.
+                                missionWaypointCount_ = 1;
+                                missionWaypoints_[0].xMm = localBlockTargetXmm_;
+                                missionWaypoints_[0].yMm = localBlockTargetYmm_;
+                                missionWaypoints_[0].flags = 0;
+                            }
+                            missionDockPhase_ = 0;
+                            missionUnloadPhase_ = 0;
+                            missionReroutePoseValid_ = false;
+                            missionLastRerouteMs_ = 0;
+                            localPostUnloadPhase_ = 2;
+                            localBlockTargetEnroute_ = true;
+                            link_.log("INFO", "Gate closed; following mapped route to the post-unload block destination");
+                            return;
+                        }
                         finishLocalCompetition();
                         return;
                     }
@@ -5639,6 +6126,21 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
                 stopNavigation("Return-home route complete; motors stopped");
                 missionReturnHome_ = false;
+                return;
+            }
+            if (localRunActive_ && localBlockTargetEnroute_)
+            {
+                // The route index normally catches this at the top of the
+                // end-of-route handling. Keep a defensive fallback here too.
+                if (localPostUnloadPhase_ != 3)
+                {
+                    localPostUnloadPhase_ = 3;
+                    snprintf(localCompetitionStatus_, sizeof(localCompetitionStatus_), "BLOCKING");
+                    link_.log("INFO", localCompetition_.confirmedWeightLimit() == 0
+                        ? "Direct destination reached; spinning in place until stopped"
+                        : "Post-unload block destination reached; spinning in place until stopped");
+                }
+                setDrive(-80, 80);
                 return;
             }
             navigationStrategy_ = missionFallbackStrategy_;
@@ -5932,10 +6434,17 @@ void BluetoothDebugWorkflow::updateNavigation()
                 missionDockPhaseStartedMs_ = 0;
                 missionDockNearWallSinceMs_ = 0;
                 missionDockAligned_ = false;
-                missionUnloadHomeXmm_ = routeWaypoint.xMm;
-                missionUnloadHomeYmm_ = routeWaypoint.yMm;
+                // Anchor the unload guard and the return leg to the actual
+                // docked pose. The physical wall approach/turn/retreat can
+                // leave the estimated pose offset from the planned waypoint;
+                // comparing against that waypoint can abort the shimmy before
+                // it starts even though the robot is correctly docked.
+                missionUnloadHomeXmm_ = missionPoseXmm_;
+                missionUnloadHomeYmm_ = missionPoseYmm_;
                 missionUnloadArenaHeadingDeg_ = outwardArena;
-                missionUnloadImuHeadingDeg_ = outwardImu;
+                // Use the measured heading after the turn and retreat as the
+                // reference, rather than the ideal route heading.
+                missionUnloadImuHeadingDeg_ = imu_.headingDeg();
                 missionUnloadPhase_ = 1;
                 missionUnloadPhaseStartedMs_ = now;
                 hx12kB_.setAngle(10.0f);
@@ -6836,7 +7345,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             for (uint8_t i = 0; i < missionFeatureCount_; ++i)
             {
                 const MissionFeature& feature = missionFeatures_[i];
-                if (feature.kind == 0) continue;
+                if (feature.kind == 0 || feature.kind == 3) continue;
                 mappedWallMm = min(mappedWallMm, feature.rotatedWall
                     ? rayRotatedWall(sensorX, sensorY, ux, uy,
                         feature.wallX, feature.wallY, feature.rotationDeg)
@@ -6923,29 +7432,142 @@ void BluetoothDebugWorkflow::updateNavigation()
         // every ordinary obstacle still retains the hard physical stop.
         const bool hardFrontWall = front != 0xFFFF && front < hardWallMm &&
             !missionInnerWeightLocked_;
-        // A 240-260 mm return is not grounds for reversing a pivot away
-        // from a wall; that threshold created the repeated reverse/advance
-        // loop at the first weight site. A genuinely close wall still backs out.
-        if (hardFrontWall || missionForwardStalled_)
-        {
-            if (missionWallReverseWaypoint_ == missionWaypointIndex_ &&
-                missionWallReverseRepeatCount_ >= 3U &&
-                now - missionWallReverseLastStartMs_ <= 30000U)
+        auto planMissionOpenSpaceDetour = [&]() -> bool {
+            const float headingRad = missionArenaHeadingDeg_ * DEG_TO_RAD;
+            const float forwardX = cosf(headingRad), forwardY = sinf(headingRad);
+            int8_t selectedSide = 0;
+            float bestScore = -1000000.0f;
+            for (int8_t side = -1; side <= 1; side += 2)
             {
-                setDrive(0, 0);
-                if (searchActive && (waypoint.flags & 0x01) != 0)
+                const uint16_t sideRange = side < 0 ? left : right;
+                const bool sideMeasured = sideRange != 0xFFFF;
+                const uint8_t openColumns = side < 0
+                    ? matrixLeftOpenColumns : matrixRightOpenColumns;
+                const uint16_t mappedDepth = side < 0
+                    ? matrixLeftGapMm : matrixRightGapMm;
+                if (!sideMeasured && (!matrixFresh || openColumns < 2U ||
+                    mappedDepth < OBSTACLE_FORWARD_GAP_MM))
+                    continue;
+
+                for (const float lateralMm : {250.0f, 350.0f, 500.0f})
                 {
-                    finishSiteSearch(true);
-                    link_.log("WARNING", "Repeated wall retreat ended weight-site search");
+                    if (sideMeasured && sideRange < lateralMm +
+                        0.5f * navigationRobotWidthMm_ + 50.0f)
+                        continue;
+                    const float x = missionPoseXmm_ - forwardY * side * lateralMm;
+                    const float y = missionPoseYmm_ + forwardX * side * lateralMm;
+                    if (!segmentFree(missionPoseXmm_, missionPoseYmm_, x, y))
+                        continue;
+                    for (const float forwardMm : {250.0f, 400.0f, 650.0f})
+                    {
+                        const float passX = x + forwardX * forwardMm;
+                        const float passY = y + forwardY * forwardMm;
+                        if (!segmentFree(x, y, passX, passY))
+                            continue;
+                        const bool mapClearToGoal = segmentFree(
+                            passX, passY, waypoint.xMm, waypoint.yMm);
+                        const float measuredSpace = sideMeasured
+                            ? static_cast<float>(sideRange)
+                            : static_cast<float>(mappedDepth);
+                        const float preferredSideBonus =
+                            side == missionWallRecoveryPreferredSide_ ? 80.0f : 0.0f;
+                        const float previousSidePenalty =
+                            side == missionAvoidSide_ ? 130.0f : 0.0f;
+                        const float score = measuredSpace + preferredSideBonus -
+                            0.2f * hypotf(waypoint.xMm - passX,
+                                         waypoint.yMm - passY) -
+                            0.05f * (lateralMm + forwardMm) -
+                            (sideMeasured ? 0.0f : 160.0f) -
+                            previousSidePenalty +
+                            (mapClearToGoal ? 120.0f : -180.0f);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            selectedSide = side;
+                            missionAvoidXmm_ = x;
+                            missionAvoidYmm_ = y;
+                            missionAvoidForwardXmm_ = passX;
+                            missionAvoidForwardYmm_ = passY;
+                        }
+                    }
                 }
-                else if (!rerouteAroundMap())
-                    beginMissionWallReverse(
-                        "Repeated wall retreat; backing out again for a new mapped approach");
+            }
+            if (selectedSide == 0)
+                return false;
+            missionAvoidSide_ = selectedSide;
+            missionAvoidPhase_ = 1;
+            if (missionAvoidAttempts_ < 255U)
+                ++missionAvoidAttempts_;
+            return true;
+        };
+
+        const bool sameRecoveryWaypoint =
+            missionWallReverseWaypoint_ == missionWaypointIndex_ &&
+            missionWallReverseRepeatCount_ >= 1U;
+        const bool recoveryDetourPending =
+            missionWallRecoveryDetourRequested_ || sameRecoveryWaypoint;
+        const bool alreadyTurningOut = recoveryDetourPending &&
+            (missionAvoidPhase_ != 0 || missionWallRecoveryMapTried_) &&
+            !missionForwardStalled_ &&
+            fabsf(headingDelta(missionArenaHeadingDeg_,
+                               desiredArenaHeadingDeg)) > 18.0f;
+
+        if ((hardFrontWall || missionForwardStalled_) &&
+            recoveryDetourPending && !alreadyTurningOut)
+        {
+            setDrive(0, 0);
+            missionAvoidPhase_ = 0;
+            if (!missionWallRecoveryMapTried_)
+            {
+                missionWallRecoveryMapTried_ = true;
+                if (rerouteAroundMap())
+                {
+                    missionWallRecoveryDetourRequested_ = false;
+                    missionWallReverseFailed_ = false;
+                    missionWallReverseNoProgress_ = false;
+                    missionBlockedSinceMs_ = 0;
+                    link_.log("WARNING", "After one retreat, routed around the blockage using the arena map");
+                    return;
+                }
+            }
+            if (planMissionOpenSpaceDetour())
+            {
+                missionWallRecoveryDetourRequested_ = false;
+                missionWallReverseFailed_ = false;
+                missionWallReverseNoProgress_ = false;
+                missionBlockedSinceMs_ = 0;
+                link_.log("WARNING", "After one retreat, detouring through sensor- and map-verified open space");
                 return;
             }
-            beginMissionWallReverse(missionForwardStalled_
-                ? "Forward drive stalled; reversing before replanning"
-                : "Frontal wall too close to turn; reversing before replanning");
+            missionWallRecoveryDetourRequested_ = true;
+            if (missionBlockedSinceMs_ == 0)
+            {
+                missionBlockedSinceMs_ = now;
+                link_.log("WARNING", "No map-clear side route yet; holding and checking for open space");
+            }
+            return;
+        }
+
+        if (missionRampEscapeReady && !recoveryDetourPending)
+        {
+            missionRampRecoveryLatched_ = true;
+            missionRampTiltClearSinceMs_ = 0;
+            rememberUnexpectedRamp();
+            beginMissionWallReverse(
+                "Unexpected incline over 5 degrees; reversing once and routing around it");
+            return;
+        }
+
+        // A single bounded retreat is permitted at each blocked route point.
+        // Further recovery is handled by the map/open-space detour above.
+        if ((hardFrontWall || missionForwardStalled_) &&
+            !recoveryDetourPending)
+        {
+            beginMissionWallReverse(missionEncoderImuSkid_
+                ? "Wheel encoders moved but range and IMU did not: one retreat before detouring"
+                : missionForwardStalled_
+                    ? "Forward drive stalled: one retreat before detouring"
+                    : "Frontal wall too close: one retreat before detouring");
             return;
         }
         const bool blockedOnLeg = (front != 0xFFFF || missionFrontBlockedLatched_) &&
@@ -7005,57 +7627,30 @@ void BluetoothDebugWorkflow::updateNavigation()
             setDrive(0, 0);
             return;
         }
+        if (blockedOnLeg && missionAvoidPhase_ != 0 &&
+            sameRecoveryWaypoint)
+        {
+            // The first escape vector met another close return. Try a
+            // different verified flank, never another straight push/reverse.
+            setDrive(0, 0);
+            missionAvoidPhase_ = 0;
+            missionWallRecoveryDetourRequested_ = true;
+            if (planMissionOpenSpaceDetour())
+            {
+                missionWallRecoveryDetourRequested_ = false;
+                missionBlockedSinceMs_ = 0;
+                link_.log("WARNING", "First detour blocked; switching to the other map-clear side");
+                return;
+            }
+            if (missionBlockedSinceMs_ == 0)
+                missionBlockedSinceMs_ = now;
+            return;
+        }
         if (blockedOnLeg && missionAvoidPhase_ == 0 &&
             missionAvoidAttempts_ < (missionReturnHome_ ? 6U : 3U))
         {
-            const float headingRad = missionArenaHeadingDeg_ * DEG_TO_RAD;
-            const float forwardX = cosf(headingRad), forwardY = sinf(headingRad);
-            int8_t selectedSide = 0;
-            float bestScore = -1000000.0f;
-            for (int8_t side = -1; side <= 1; side += 2)
+            if (planMissionOpenSpaceDetour())
             {
-                const uint16_t sideRange = side < 0 ? left : right;
-                const bool sideMeasured = sideRange != 0xFFFF;
-                // A fixed 500 mm sidestep plus 650 mm forward leg was
-                // impossible near the arena edge in the return-home run,
-                // even though a shorter route was map-clear.  Prefer a live
-                // side measurement, but permit a map-verified side when its
-                // ultrasound is temporarily unavailable.
-                for (const float lateralMm : {250.0f, 350.0f, 500.0f})
-                {
-                    if (sideMeasured && sideRange < lateralMm +
-                        0.5f * navigationRobotWidthMm_ + 50.0f) continue;
-                    const float x = missionPoseXmm_ - forwardY * side * lateralMm;
-                    const float y = missionPoseYmm_ + forwardX * side * lateralMm;
-                    if (!segmentFree(missionPoseXmm_, missionPoseYmm_, x, y)) continue;
-                    for (const float forwardMm : {250.0f, 400.0f, 650.0f})
-                    {
-                        const float passX = x + forwardX * forwardMm;
-                        const float passY = y + forwardY * forwardMm;
-                        if (!segmentFree(x, y, passX, passY)) continue;
-                        const float score = (sideMeasured ? static_cast<float>(sideRange) : 450.0f) -
-                            0.2f * hypotf(waypoint.xMm - passX,
-                                         waypoint.yMm - passY) -
-                            0.05f * (lateralMm + forwardMm) -
-                            (sideMeasured ? 0.0f : 160.0f) -
-                            (side == missionAvoidSide_ ? 100.0f : 0.0f);
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            selectedSide = side;
-                            missionAvoidXmm_ = x;
-                            missionAvoidYmm_ = y;
-                            missionAvoidForwardXmm_ = passX;
-                            missionAvoidForwardYmm_ = passY;
-                        }
-                    }
-                }
-            }
-            if (selectedSide != 0)
-            {
-                missionAvoidSide_ = selectedSide;
-                missionAvoidPhase_ = 1;
-                ++missionAvoidAttempts_;
                 missionBlockedSinceMs_ = 0;
                 link_.log("INFO", "Mission route blocked; taking map-checked live detour");
                 setDrive(0, 0);
@@ -7121,18 +7716,56 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 missionTurnProgressStartedMs_ = now;
                 missionTurnProgressHeadingDeg_ = imu_.headingDeg();
+                missionTurnProgressEncoder1_ = encoders_.firstCount();
+                missionTurnProgressEncoder2_ = encoders_.secondCount();
             }
-            else if (now - missionTurnProgressStartedMs_ >= 3000U)
+            else
             {
                 const float turnedDeg = fabsf(headingDelta(
                     missionTurnProgressHeadingDeg_, imu_.headingDeg()));
-                missionTurnProgressStartedMs_ = now;
-                missionTurnProgressHeadingDeg_ = imu_.headingDeg();
-                if (turnedDeg < 5.0f)
+                const float leftSignedTravel =
+                    (missionTurnProgressEncoder1_ - encoders_.firstCount()) *
+                    0.08437374f;
+                const float rightSignedTravel =
+                    (encoders_.secondCount() - missionTurnProgressEncoder2_) *
+                    0.08461399f;
+                const float encoderDifferentialMm =
+                    fabsf(leftSignedTravel - rightSignedTravel);
+                const float expectedEncoderTurnDeg = encoderDifferentialMm *
+                    RAD_TO_DEG / max(180.0f,
+                        static_cast<float>(navigationRobotWidthMm_));
+                const uint32_t turnProgressElapsedMs =
+                    now - missionTurnProgressStartedMs_;
+                const bool nearbyTurnObstacle =
+                    (front != 0xFFFF && front <= 700U) ||
+                    (left != 0xFFFF && left <= 500U) ||
+                    (right != 0xFFFF && right <= 500U);
+                const bool encoderImuTurnMismatch =
+                    turnProgressElapsedMs >= 1000U &&
+                    encoderDifferentialMm >= 70.0f &&
+                    expectedEncoderTurnDeg >= 12.0f &&
+                    turnedDeg <= max(3.0f, expectedEncoderTurnDeg * 0.20f) &&
+                    nearbyTurnObstacle;
+                if (encoderImuTurnMismatch)
                 {
+                    missionEncoderImuSkid_ = true;
+                    missionForwardStalled_ = true;
                     beginMissionWallReverse(
-                        "Point turn made no IMU progress; reversing before another turn");
+                        "Encoders predicted a turn but the IMU saw almost none at a nearby obstacle; backing out to detour");
                     return;
+                }
+                if (turnProgressElapsedMs >= 3000U)
+                {
+                    missionTurnProgressStartedMs_ = now;
+                    missionTurnProgressHeadingDeg_ = imu_.headingDeg();
+                    missionTurnProgressEncoder1_ = encoders_.firstCount();
+                    missionTurnProgressEncoder2_ = encoders_.secondCount();
+                    if (turnedDeg < 5.0f)
+                    {
+                        beginMissionWallReverse(
+                            "Point turn made no IMU progress; reversing before another turn");
+                        return;
+                    }
                 }
             }
         }

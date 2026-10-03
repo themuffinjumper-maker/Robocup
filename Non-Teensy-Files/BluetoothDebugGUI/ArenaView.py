@@ -17,8 +17,8 @@ from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QTabWidget,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -1166,20 +1166,31 @@ class MissionLayout:
 
     DEFAULT_SIZES = {
         "wall": (600.0, 130.0),
-        "ramp": (700.0, 380.0),
+        # Keep "ramp" as a legacy alias for the original no-go ramp.
+        "ramp": (1190.0, 400.0),
+        "ramp_no_go": (1190.0, 400.0),
+        "ramp_go": (1190.0, 400.0),
         "tube": (320.0, 320.0),
     }
+    GO_RAMP_KINDS = frozenset(("ramp_go",))
+    NO_GO_RAMP_KINDS = frozenset(("ramp", "ramp_no_go"))
 
     def __init__(self):
         self.my_home = "green"
         self.fallback_strategy = 0
+        self.confirmed_weight_limit = 3
+        self.order_mode = "auto"
+        self.target_order = []
         # Physical clearance from the robot's outer edge to a dummy weight.
         self.dummy_clearance_mm = 100.0
         self.start = {"x": 325.0, "y": 325.0, "heading_deg": 0.0}
         self.weights = []
         self.obstacles = []
+        self.block_target = None
         self.route = []
         self.route_error = ""
+        self._after_unload_route_cache_key = None
+        self._after_unload_route_cache = None
         self._next_id = 1
 
     def _id(self):
@@ -1193,13 +1204,12 @@ class MissionLayout:
         return (0.0, self.HEIGHT_MM - self.HOME_HEIGHT_MM,
                 self.HOME_WIDTH_MM, self.HEIGHT_MM)
 
-    def no_go_home(self):
-        return self.home_rect("blue" if self.my_home == "green" else "green")
-
     def add_weight(self, x, y, dummy=False):
         item = {"id": self._id(), "x": float(x), "y": float(y),
                 "dummy": bool(dummy)}
         self.weights.append(item)
+        if not item["dummy"]:
+            self.target_order.append(item["id"])
         self.route = []
         return item
 
@@ -1213,10 +1223,26 @@ class MissionLayout:
         self.route = []
         return item
 
+    def set_block_target(self, x, y):
+        """Set the one optional destination visited after home unloading."""
+        if self.block_target is None:
+            self.block_target = {"id": "block_target"}
+        self.block_target.update({
+            "x": max(0.0, min(self.WIDTH_MM, float(x))),
+            "y": max(0.0, min(self.HEIGHT_MM, float(y))),
+        })
+        self.route = []
+        return self.block_target
+
     def move_item(self, item_id, x, y):
         if item_id == "start":
             self.start["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
             self.start["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
+            self.route = []
+            return True
+        if item_id == "block_target" and self.block_target is not None:
+            self.block_target["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
+            self.block_target["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
             self.route = []
             return True
         for collection in (self.weights, self.obstacles):
@@ -1229,17 +1255,36 @@ class MissionLayout:
         return False
 
     def delete_item(self, item_id):
+        if item_id == "block_target" and self.block_target is not None:
+            self.block_target = None
+            self.route = []
+            return True
         for collection in (self.weights, self.obstacles):
             for index, item in enumerate(collection):
                 if item["id"] == item_id:
                     del collection[index]
+                    self.target_order = [target_id for target_id in self.target_order
+                                         if str(target_id) != str(item_id)]
                     self.route = []
                     return True
         return False
 
+    def clear_arena_items(self):
+        """Remove placed map objects and plans while keeping the start/home setup."""
+        self.weights.clear()
+        self.obstacles.clear()
+        self.block_target = None
+        self.route = []
+        self.route_error = ""
+        self.order_mode = "auto"
+        self.target_order = []
+        self._after_unload_route_cache_key = None
+        self._after_unload_route_cache = None
+
     def rotate_item(self, item_id):
         for item in self.obstacles:
-            if item["id"] == item_id and item["kind"] in ("wall", "ramp"):
+            if item["id"] == item_id and item["kind"] in (
+                    "wall", *self.NO_GO_RAMP_KINDS, *self.GO_RAMP_KINDS):
                 item["rotation"] = (float(item.get("rotation", 0)) + 90) % 180
                 self.route = []
                 return True
@@ -1247,7 +1292,8 @@ class MissionLayout:
 
     def set_obstacle_rotation(self, item_id, angle_deg):
         for item in self.obstacles:
-            if item["id"] == item_id and item["kind"] == "wall":
+            if item["id"] == item_id and item["kind"] in (
+                    "wall", *self.GO_RAMP_KINDS):
                 item["rotation"] = float(angle_deg) % 180.0
                 self.route = []
                 return True
@@ -1277,6 +1323,10 @@ class MissionLayout:
         x0, y0, x1, y1 = rect
         return x0 <= x <= x1 and y0 <= y <= y1
 
+    def _go_ramp_ids(self):
+        return frozenset(item["id"] for item in self.obstacles
+                         if item["kind"] in self.GO_RAMP_KINDS)
+
     def _obstacle_corners(self, item):
         angle = math.radians(float(item.get("rotation", 0)))
         cosine, sine = math.cos(angle), math.sin(angle)
@@ -1291,15 +1341,20 @@ class MissionLayout:
         return (min(x for x, _ in corners), min(y for _, y in corners),
                 max(x for x, _ in corners), max(y for _, y in corners))
 
-    def blocked(self, x, y, extra=0.0):
+    def blocked(self, x, y, extra=0.0, blocked_go_ramp_ids=None):
         clearance = self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM + extra
+        blocked_go_ramp_ids = blocked_go_ramp_ids or ()
         if (x < clearance or y < clearance or
                 x > self.WIDTH_MM - clearance or
                 y > self.HEIGHT_MM - clearance):
             return True
-        if self._inside_rect(x, y, self._inflate_rect(self.no_go_home(), clearance)):
-            return True
         for item in self.obstacles:
+            if (item["kind"] in self.GO_RAMP_KINDS and
+                    item["id"] not in blocked_go_ramp_ids):
+                # A go-ramp is deliberately traversable, but its route is
+                # constrained to the perpendicular short-side centreline in
+                # _travel_path().
+                continue
             if item["kind"] == "tube":
                 radius = item["w"] / 2 + clearance
                 if math.hypot(x - item["x"], y - item["y"]) <= radius:
@@ -1323,22 +1378,25 @@ class MissionLayout:
                 return True
         return False
 
-    def _segment_clear(self, first, second):
+    def _segment_clear(self, first, second, blocked_go_ramp_ids=None):
         x0, y0 = first
         x1, y1 = second
         distance = math.hypot(x1 - x0, y1 - y0)
         samples = max(1, math.ceil(distance / 45.0))
         for index in range(samples + 1):
             t = index / samples
-            if self.blocked(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t):
+            if self.blocked(x0 + (x1 - x0) * t,
+                            y0 + (y1 - y0) * t,
+                            blocked_go_ramp_ids=blocked_go_ramp_ids):
                 return False
         return True
 
-    def _nearest_free_grid(self, point):
+    def _nearest_free_grid(self, point, blocked_go_ramp_ids=None):
         spacing = self.GRID_MM
         gx = int(round(point[0] / spacing))
         gy = int(round(point[1] / spacing))
-        if not self.blocked(gx * spacing, gy * spacing):
+        if not self.blocked(gx * spacing, gy * spacing,
+                            blocked_go_ramp_ids=blocked_go_ramp_ids):
             return gx, gy
         for radius in range(1, 8):
             candidates = []
@@ -1352,13 +1410,15 @@ class MissionLayout:
                 p[0] * spacing - point[0], p[1] * spacing - point[1]))
             for candidate in candidates:
                 x, y = candidate[0] * spacing, candidate[1] * spacing
-                if 0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM and not self.blocked(x, y):
+                if (0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM and
+                        not self.blocked(x, y,
+                                         blocked_go_ramp_ids=blocked_go_ramp_ids)):
                     return candidate
         return None
 
-    def _astar(self, start, goal):
-        start_cell = self._nearest_free_grid(start)
-        goal_cell = self._nearest_free_grid(goal)
+    def _astar(self, start, goal, blocked_go_ramp_ids=None):
+        start_cell = self._nearest_free_grid(start, blocked_go_ramp_ids)
+        goal_cell = self._nearest_free_grid(goal, blocked_go_ramp_ids)
         if start_cell is None or goal_cell is None:
             return None
         spacing = self.GRID_MM
@@ -1383,13 +1443,15 @@ class MissionLayout:
                 x, y = nxt[0] * spacing, nxt[1] * spacing
                 if not (0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM):
                     continue
-                if self.blocked(x, y):
+                if self.blocked(x, y,
+                                blocked_go_ramp_ids=blocked_go_ramp_ids):
                     continue
                 # A diagonal step can cut through an inflated rectangle even
                 # when both grid endpoints are free. Never hand that corner
                 # cut to the robot as a supposedly clear travel segment.
                 if not self._segment_clear(
-                        (current[0] * spacing, current[1] * spacing), (x, y)):
+                        (current[0] * spacing, current[1] * spacing), (x, y),
+                        blocked_go_ramp_ids):
                     continue
                 tentative = g_score[current] + cost
                 if tentative >= g_score.get(nxt, float("inf")):
@@ -1405,13 +1467,13 @@ class MissionLayout:
             cells.append(parent[cells[-1]])
         cells.reverse()
         path = [(cell[0] * spacing, cell[1] * spacing) for cell in cells]
-        if self._segment_clear(start, path[0]):
+        if self._segment_clear(start, path[0], blocked_go_ramp_ids):
             path[0] = (float(start[0]), float(start[1]))
-        if self._segment_clear(path[-1], goal):
+        if self._segment_clear(path[-1], goal, blocked_go_ramp_ids):
             path[-1] = (float(goal[0]), float(goal[1]))
-        return self._smooth(path)
+        return self._smooth(path, blocked_go_ramp_ids)
 
-    def _smooth(self, path):
+    def _smooth(self, path, blocked_go_ramp_ids=None):
         if not path:
             return []
         result = [path[0]]
@@ -1419,7 +1481,8 @@ class MissionLayout:
         while anchor < len(path) - 1:
             furthest = anchor + 1
             for candidate in range(len(path) - 1, anchor, -1):
-                if self._segment_clear(path[anchor], path[candidate]):
+                if self._segment_clear(path[anchor], path[candidate],
+                                       blocked_go_ramp_ids):
                     furthest = candidate
                     break
             result.append(path[furthest])
@@ -1431,19 +1494,188 @@ class MissionLayout:
         return sum(math.hypot(b[0] - a[0], b[1] - a[1])
                    for a, b in zip(path, path[1:]))
 
-    def _travel_path(self, start, goal):
-        """Plan at precisely the clearance displayed to the operator."""
-        path = self._astar(start, goal)
+    def _basic_travel_path(self, start, goal, blocked_go_ramp_ids):
+        """A* connector used outside explicitly traversed go-ramp corridors."""
+        path = self._astar(start, goal, blocked_go_ramp_ids)
         if not path:
             return None
-        if not self._segment_clear(start, path[0]) or \
-                not self._segment_clear(path[-1], goal):
+        if (not self._segment_clear(start, path[0], blocked_go_ramp_ids) or
+                not self._segment_clear(path[-1], goal, blocked_go_ramp_ids)):
             return None
         if math.dist(start, path[0]) > 1.0:
             path.insert(0, (float(start[0]), float(start[1])))
         if math.dist(path[-1], goal) > 1.0:
             path.append((float(goal[0]), float(goal[1])))
-        return path if all(self._segment_clear(a, b) for a, b in zip(path, path[1:])) else None
+        return path if all(self._segment_clear(a, b, blocked_go_ramp_ids)
+                           for a, b in zip(path, path[1:])) else None
+
+    def _go_ramp_path_progress(self, path, ramp):
+        """Return the first distance along a path that enters the ramp footprint."""
+        half_width = float(ramp["w"]) / 2 + self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM
+        half_height = float(ramp["h"]) / 2 + self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM
+        angle = math.radians(float(ramp.get("rotation", 0.0)))
+        cosine, sine = math.cos(angle), math.sin(angle)
+        travelled = 0.0
+        for first, second in zip(path, path[1:]):
+            length = math.dist(first, second)
+            samples = max(1, math.ceil(length / 30.0))
+            for index in range(samples + 1):
+                t = index / samples
+                x = first[0] + (second[0] - first[0]) * t - ramp["x"]
+                y = first[1] + (second[1] - first[1]) * t - ramp["y"]
+                local_x = x * cosine + y * sine
+                local_y = -x * sine + y * cosine
+                if abs(local_x) <= half_width and abs(local_y) <= half_height:
+                    return travelled + length * t
+            travelled += length
+        return None
+
+    def _travel_path(self, start, goal, blocked_go_ramp_ids=None):
+        """Plan a route; any crossed go-ramp uses its perpendicular centreline."""
+        blocked_go_ramp_ids = frozenset(blocked_go_ramp_ids or ())
+        path = self._basic_travel_path(start, goal, blocked_go_ramp_ids)
+        if not path:
+            return None
+
+        go_ramps = [item for item in self.obstacles
+                    if item["kind"] in self.GO_RAMP_KINDS and
+                    item["id"] not in blocked_go_ramp_ids]
+        crossings = []
+        for ramp in go_ramps:
+            progress = self._go_ramp_path_progress(path, ramp)
+            if progress is not None:
+                crossings.append((progress, ramp))
+        if not crossings:
+            return path
+
+        # Connectors avoid every ramp. Only the explicit five-point corridor
+        # below is allowed to enter a go-ramp, ensuring square-on entry and a
+        # straight, centred crossing from one short side to the other.
+        all_go_ramp_ids = frozenset(
+            blocked_go_ramp_ids | {item["id"] for item in self.obstacles
+                                   if item["kind"] in self.GO_RAMP_KINDS})
+        route = [(float(start[0]), float(start[1]))]
+        current = route[0]
+        crossings.sort(key=lambda item: item[0])
+        for _progress, ramp in crossings:
+            angle = math.radians(float(ramp.get("rotation", 0.0)))
+            axis_x, axis_y = math.cos(angle), math.sin(angle)
+            half_length = float(ramp["w"]) / 2
+            approach_offset = (half_length + self.ROBOT_RADIUS_MM +
+                               self.SAFETY_MARGIN_MM + 120.0)
+            centre = (float(ramp["x"]), float(ramp["y"]))
+            crossing_blocked_ids = all_go_ramp_ids - {ramp["id"]}
+            candidates = []
+            for direction in (-1.0, 1.0):
+                approach = (centre[0] - direction * axis_x * approach_offset,
+                            centre[1] - direction * axis_y * approach_offset)
+                entry = (centre[0] - direction * axis_x * half_length,
+                         centre[1] - direction * axis_y * half_length)
+                exit_point = (centre[0] + direction * axis_x * half_length,
+                              centre[1] + direction * axis_y * half_length)
+                depart = (centre[0] + direction * axis_x * approach_offset,
+                          centre[1] + direction * axis_y * approach_offset)
+                prefix = self._basic_travel_path(
+                    current, approach, all_go_ramp_ids)
+                suffix = self._basic_travel_path(
+                    depart, goal, all_go_ramp_ids)
+                if prefix is None or suffix is None:
+                    continue
+                through = [approach, entry, centre, exit_point, depart]
+                if not all(self._segment_clear(a, b, crossing_blocked_ids)
+                           for a, b in zip(through, through[1:])):
+                    continue
+                length = (self._path_length(prefix) +
+                          self._path_length(through) +
+                          self._path_length(suffix))
+                candidates.append((length, prefix, through, suffix, depart))
+            if not candidates:
+                return None
+            _length, prefix, through, _suffix, depart = min(
+                candidates, key=lambda candidate: candidate[0])
+            route.extend(prefix[1:])
+            route.extend(through[1:])
+            current = depart
+
+        suffix = self._basic_travel_path(current, goal, all_go_ramp_ids)
+        if suffix is None:
+            return None
+        route.extend(suffix[1:])
+        return route
+
+    def after_unload_route(self):
+        """Map-clear route to the optional final destination.
+
+        A zero weight-return limit is a direct-to-destination test mode, so its
+        path starts at the configured robot start rather than the home dock.
+        """
+        target = self.block_target
+        if target is None:
+            return None
+        direct_to_target = self.confirmed_weight_limit == 0
+
+        obstacle_signature = tuple(
+            (item["kind"], float(item["x"]), float(item["y"]),
+             float(item["w"]), float(item["h"]),
+             float(item.get("rotation", 0.0)))
+            for item in self.obstacles)
+        dummy_signature = tuple(
+            (float(item["x"]), float(item["y"]))
+            for item in self.weights if item.get("dummy"))
+        cache_key = (
+            direct_to_target, self.my_home,
+            float(self.start["x"]) if direct_to_target else None,
+            float(self.start["y"]) if direct_to_target else None,
+            float(target["x"]), float(target["y"]),
+            obstacle_signature, dummy_signature,
+            float(self.dummy_clearance_mm), float(self.ROBOT_RADIUS_MM),
+            float(self.SAFETY_MARGIN_MM), float(self.GRID_MM),
+        )
+        if cache_key != self._after_unload_route_cache_key:
+            if direct_to_target:
+                start = (float(self.start["x"]), float(self.start["y"]))
+            else:
+                home = self.home_rect(self.my_home)
+                # home_rect() returns (left, top, right, bottom), not
+                # (x, y, width, height). Averaging the bounds matters especially
+                # for the blue home at the bottom of the arena; treating bottom as
+                # a height placed the route start outside the arena.
+                start = ((home[0] + home[2]) * 0.5,
+                         (home[1] + home[3]) * 0.5)
+            goal = (float(target["x"]), float(target["y"]))
+            path = None if self.blocked(*start) or self.blocked(*goal) else \
+                self._travel_path(start, goal)
+            if path and len(path) == 1:
+                path = [start, goal]
+            self._after_unload_route_cache = (
+                path if path and len(path) <= self.MAX_ROUTE_POINTS else None)
+            self._after_unload_route_cache_key = cache_key
+        route = self._after_unload_route_cache
+        return None if route is None else list(route)
+
+    def ordered_real_weights(self):
+        """Return real targets in saved manual order, appending newly added sites."""
+        by_id = {str(item["id"]): item for item in self.weights
+                 if not item.get("dummy")}
+        ordered_ids = []
+        seen = set()
+        for target_id in self.target_order:
+            key = str(target_id)
+            if key in by_id and key not in seen:
+                ordered_ids.append(by_id[key]["id"])
+                seen.add(key)
+        for item in self.weights:
+            key = str(item["id"])
+            if not item.get("dummy") and key not in seen:
+                ordered_ids.append(item["id"])
+                seen.add(key)
+        self.target_order = ordered_ids
+        return [by_id[str(target_id)] for target_id in ordered_ids]
+
+    def set_target_order(self, target_ids):
+        self.target_order = list(target_ids)
+        self.ordered_real_weights()
+        self.route = []
 
     def docking_path(self, start, home):
         """Route to a clear turning point, then a straight reversing corridor."""
@@ -1452,7 +1684,9 @@ class MissionLayout:
         for distance in (750, 950, 1150, 1350, 1550, 1750):
             for offset in (0, 100, -100, 200, -200):
                 stage = (home[0] + inward * distance, home[1] + offset)
-                if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
+                if (self.blocked(*stage, extra=70.0) or
+                        not self._segment_clear(
+                            stage, home, self._go_ramp_ids())):
                     continue
                 path = self._travel_path(start, stage)
                 if path and len(path) >= 2:
@@ -1467,7 +1701,9 @@ class MissionLayout:
                     angle = math.radians(degrees)
                     stage = (home[0] + inward * distance * math.cos(angle),
                              home[1] + distance * math.sin(angle))
-                    if self.blocked(*stage, extra=70.0) or not self._segment_clear(stage, home):
+                    if (self.blocked(*stage, extra=70.0) or
+                            not self._segment_clear(
+                                stage, home, self._go_ramp_ids())):
                         continue
                     path = self._travel_path(start, stage)
                     if path and len(path) >= 2:
@@ -1481,6 +1717,27 @@ class MissionLayout:
     def plan(self):
         self.route = []
         self.route_error = ""
+        if self.confirmed_weight_limit == 0:
+            if self.block_target is None:
+                self.route_error = (
+                    "Set an after-unload destination for zero-weight direct mode.")
+                return False
+            direct_path = self.after_unload_route()
+            if direct_path is None or len(direct_path) < 2:
+                self.route_error = (
+                    "No map-clear direct route from the start to the destination.")
+                return False
+            self.route = [
+                {"x": point[0], "y": point[1], "target": False}
+                for point in direct_path[1:]
+            ]
+            if len(direct_path) > self.MAX_ROUTE_POINTS:
+                self.route = []
+                self.route_error = (
+                    f"Direct route has more than {self.MAX_ROUTE_POINTS} route points.")
+                return False
+            return True
+
         real_weights = [item for item in self.weights if not item["dummy"]]
         if not real_weights:
             self.route_error = "Add at least one real weight location."
@@ -1489,11 +1746,16 @@ class MissionLayout:
         if self.blocked(*current):
             self.route_error = "Start position is inside a border/no-go/obstacle clearance."
             return False
-        remaining = list(real_weights)
+        remaining = (self.ordered_real_weights()
+                     if self.order_mode == "manual" else list(real_weights))
         route = []
         while remaining:
             options = []
-            for item in remaining:
+            # Automatic mode chooses the cheapest reachable next site. Manual
+            # mode fixes the next site but still plans its safe staging and
+            # collection approach with the same A* path planner.
+            candidates = remaining[:1] if self.order_mode == "manual" else remaining
+            for item in candidates:
                 weight_options = []
                 weight = (item["x"], item["y"])
                 visit = weight
@@ -1517,13 +1779,15 @@ class MissionLayout:
                     ux, uy = math.cos(angle), math.sin(angle)
                     stage = (visit[0] - 350.0 * ux,
                              visit[1] - 350.0 * uy)
-                    if self.blocked(*stage) or not self._segment_clear(stage, visit):
+                    if (self.blocked(*stage) or not self._segment_clear(
+                            stage, visit, self._go_ramp_ids())):
                         continue
                     clear_behind = 0
                     for distance in (200, 300, 400, 500):
                         end = (visit[0] + distance * ux,
                                visit[1] + distance * uy)
-                        if self._segment_clear(visit, end):
+                        if self._segment_clear(
+                                visit, end, self._go_ramp_ids()):
                             clear_behind = distance
                         else:
                             break
@@ -1593,6 +1857,10 @@ class MissionLayout:
         for point in self.route:
             points.extend([int(round(point["x"])), int(round(point["y"])),
                            1 if point.get("target") else 0])
+        after_unload_route = self.after_unload_route()
+        block_route = ([] if after_unload_route is None else
+                       [int(round(value)) for point in after_unload_route
+                        for value in point])
         home = self.home_rect(self.my_home)
         return {
             "start_x_mm": int(round(self.start["x"])),
@@ -1601,23 +1869,34 @@ class MissionLayout:
             "home_x_mm": int(round((home[0] + home[2]) * 0.5)),
             "home_y_mm": int(round((home[1] + home[3]) * 0.5)),
             "fallback_strategy": int(self.fallback_strategy),
+            "confirmed_weight_limit": int(self.confirmed_weight_limit),
+            "block_target": (None if self.block_target is None else {
+                "x_mm": int(round(self.block_target["x"])),
+                "y_mm": int(round(self.block_target["y"])),
+            }),
+            "block_route": block_route,
             "points": points,
         }
 
     def map_payload(self):
         # Rectangles are deliberately compact: the Teensy command receive
-        # buffer is 768 bytes. Kind 0 features are forbidden zones (the other
-        # team's home and ramps); kind 1 features are physical landmarks.
+        # buffer is 768 bytes. Kind 0 is a no-go ramp, kind 1 is a physical
+        # wall, kind 2 is a dummy weight, and kind 3 is a traversable ramp.
         features = []
-        rectangles = [(self.no_go_home(), 0)]
+        rectangles = []
         rotated_walls = []
         for item in self.obstacles:
             if item["kind"] == "wall":
                 rotated_walls.extend([len(rectangles), int(round(item["x"])),
                                       int(round(item["y"])),
                                       int(round(float(item.get("rotation", 0)))) % 180])
-            rectangles.append((self._obstacle_rect(item),
-                               0 if item["kind"] == "ramp" else 1))
+            if item["kind"] in self.GO_RAMP_KINDS:
+                feature_kind = 3
+            elif item["kind"] in self.NO_GO_RAMP_KINDS:
+                feature_kind = 0
+            else:
+                feature_kind = 1
+            rectangles.append((self._obstacle_rect(item), feature_kind))
         rectangles.extend(((item["x"] - 120, item["y"] - 120,
                             item["x"] + 120, item["y"] + 120), 2)
                           for item in self.weights if item["dummy"])
@@ -1633,10 +1912,14 @@ class MissionLayout:
         return {
             "my_home": self.my_home,
             "fallback_strategy": self.fallback_strategy,
+            "confirmed_weight_limit": self.confirmed_weight_limit,
+            "order_mode": self.order_mode,
+            "target_order": list(self.target_order),
             "dummy_clearance_mm": self.dummy_clearance_mm,
             "start": self.start,
             "weights": self.weights,
             "obstacles": self.obstacles,
+            "block_target": self.block_target,
             "next_id": self._next_id,
         }
 
@@ -1646,6 +1929,14 @@ class MissionLayout:
         if data.get("my_home") in ("green", "blue"):
             self.my_home = data["my_home"]
         self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
+        try:
+            self.confirmed_weight_limit = max(0, min(20,
+                int(data.get("confirmed_weight_limit", 3))))
+        except (TypeError, ValueError):
+            self.confirmed_weight_limit = 3
+        self.order_mode = "manual" if data.get("order_mode") == "manual" else "auto"
+        stored_order = data.get("target_order", [])
+        self.target_order = list(stored_order) if isinstance(stored_order, list) else []
         # Read the previous field too, so existing layouts retain their
         # selected dummy berth after this update.
         self.dummy_clearance_mm = max(0.0, min(500.0,
@@ -1659,12 +1950,35 @@ class MissionLayout:
         }
         self.weights = [dict(item) for item in data.get("weights", []) if isinstance(item, dict)]
         self.obstacles = [dict(item) for item in data.get("obstacles", []) if isinstance(item, dict)]
+        target = data.get("block_target")
+        if isinstance(target, dict) and "x" in target and "y" in target:
+            self.block_target = {
+                "id": "block_target",
+                "x": max(0.0, min(self.WIDTH_MM, float(target["x"]))),
+                "y": max(0.0, min(self.HEIGHT_MM, float(target["y"]))),
+            }
+        else:
+            self.block_target = None
         for item in self.obstacles:
             if item.get("kind") == "wall":
                 item["w"], item["h"] = self.DEFAULT_SIZES["wall"]
                 item["rotation"] = float(item.get("rotation", 0)) % 180.0
+            elif item.get("kind") in (
+                    "ramp", "ramp_no_go", "ramp_go"):
+                # Migrate ramps that still have the former default footprint;
+                # leave any explicitly customized ramp geometry alone.
+                try:
+                    old_default = (
+                        float(item.get("w", 700.0)) == 700.0 and
+                        float(item.get("h", 380.0)) == 380.0
+                    )
+                except (TypeError, ValueError):
+                    old_default = True
+                if old_default:
+                    item["w"], item["h"] = self.DEFAULT_SIZES["ramp"]
         self._next_id = max(int(data.get("next_id", 1)),
                             1 + max([0] + [int(item.get("id", 0)) for item in self.weights + self.obstacles]))
+        self.ordered_real_weights()
         self.route = []
 
 
@@ -1672,6 +1986,7 @@ class MissionLayoutCanvas(QWidget):
     layout_changed = pyqtSignal()
     selection_changed = pyqtSignal(object)
     cursor_moved = pyqtSignal(float, float)
+    sequence_weight_clicked = pyqtSignal(object)
 
     def __init__(self, layout_model, live_model, parent=None):
         super().__init__(parent)
@@ -1680,6 +1995,11 @@ class MissionLayoutCanvas(QWidget):
         self.setMinimumSize(760, 430)
         self.setMouseTracking(True)
         self.add_mode = None
+        self.sequence_pick_active = False
+        self.sequence_preview_order = []
+        # The home-to-after-unload route is a planner preview, not a permanent
+        # decoration. It becomes visible when PLAN ROUTE succeeds.
+        self.after_unload_route_visible = False
         self.selected_id = "start"
         self._dragging = False
         self._panning = False
@@ -1748,6 +2068,8 @@ class MissionLayoutCanvas(QWidget):
         self.update()
 
     def set_add_mode(self, mode):
+        if self.sequence_pick_active:
+            return
         self.add_mode = mode
         self.update()
 
@@ -1787,6 +2109,9 @@ class MissionLayoutCanvas(QWidget):
                        for item in self.layout_model.weights]
         candidates += [(item["id"], item["x"], item["y"])
                        for item in self.layout_model.obstacles]
+        if self.layout_model.block_target is not None:
+            target = self.layout_model.block_target
+            candidates.append(("block_target", target["x"], target["y"]))
         if not candidates:
             return None
         ident, x, y = min(
@@ -1813,6 +2138,8 @@ class MissionLayoutCanvas(QWidget):
                 self.selected_id = self.layout_model.add_weight(x, y, False)["id"]
             elif self.add_mode == "dummy":
                 self.selected_id = self.layout_model.add_weight(x, y, True)["id"]
+            elif self.add_mode == "block_target":
+                self.selected_id = self.layout_model.set_block_target(x, y)["id"]
             else:
                 self.selected_id = self.layout_model.add_obstacle(self.add_mode, x, y)["id"]
             self.add_mode = None
@@ -1821,6 +2148,12 @@ class MissionLayoutCanvas(QWidget):
             self.update()
             return
         selected = self._nearest_item(event.position())
+        if self.sequence_pick_active:
+            weight = next((item for item in self.layout_model.weights
+                           if item["id"] == selected and not item.get("dummy")), None)
+            if weight is not None:
+                self.sequence_weight_clicked.emit(weight["id"])
+            return
         if selected is not None:
             self.selected_id = selected
             self._dragging = True
@@ -1925,6 +2258,18 @@ class MissionLayoutCanvas(QWidget):
                        f"L{index}  {x:.0f} mm")
             p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
 
+        # Quarter, midpoint, and three-quarter cross-arena references.
+        for index, fraction in enumerate((0.25, 0.5, 0.75), start=1):
+            y = model.HEIGHT_MM * fraction
+            left = self._screen(0.0, y)
+            right = self._screen(model.WIDTH_MM, y)
+            p.drawLine(left, right)
+            p.setPen(QColor("#94a3b8"))
+            p.drawText(QRectF(right.x() - 104, right.y() - 21, 100, 18),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       f"H{index}  {y:.0f} mm")
+            p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
+
         for colour, fill, text in (("green", "#166534", "GREEN HOME"),
                                    ("blue", "#1d4ed8", "BLUE HOME")):
             rect = rect_world(model.home_rect(colour))
@@ -1933,12 +2278,6 @@ class MissionLayoutCanvas(QWidget):
             p.drawRect(rect)
             p.setPen(QColor("#f8fafc"))
             p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-            if colour != model.my_home:
-                p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
-                p.setBrush(QColor(127, 29, 29, 90))
-                p.drawRect(rect)
-                p.drawText(rect.adjusted(0, 22, 0, 0),
-                           Qt.AlignmentFlag.AlignCenter, "NO-GO ZONE")
 
         if model.route:
             points = ([self._screen(model.start["x"], model.start["y"])] +
@@ -1959,6 +2298,25 @@ class MissionLayoutCanvas(QWidget):
                 p.drawText(QRectF(centre.x() - 12, centre.y() - 25, 24, 18),
                            Qt.AlignmentFlag.AlignCenter, str(visit_number))
 
+        if model.block_target is not None and self.after_unload_route_visible:
+            after_unload_route = model.after_unload_route()
+            if after_unload_route and len(after_unload_route) >= 2:
+                route_points = QPolygonF([
+                    self._screen(x, y) for x, y in after_unload_route])
+                # A light casing keeps the requested red route legible over
+                # the arena, home zone, and the cyan collection route.
+                p.setPen(QPen(QColor("#fff1f2"), 8, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline(route_points)
+                p.setPen(QPen(QColor("#ef4444"), 4, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline(route_points)
+            else:
+                p.setPen(QColor("#fca5a5"))
+                p.drawText(QRectF(ox + 14, oy + 24, 350, 24),
+                           Qt.AlignmentFlag.AlignLeft,
+                           "NO CLEAR AFTER-UNLOAD ROUTE FROM HOME")
+
         if len(self.replay_path) >= 2:
             p.setPen(QPen(QColor("#fb923c"), 3, Qt.PenStyle.SolidLine,
                           Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -1974,7 +2332,11 @@ class MissionLayoutCanvas(QWidget):
 
         for item in model.obstacles:
             selected = item["id"] == self.selected_id
-            colour = {"wall": "#9ca3af", "ramp": "#f59e0b", "tube": "#a78bfa"}[item["kind"]]
+            colour = {
+                "wall": "#9ca3af", "ramp": "#f59e0b",
+                "ramp_no_go": "#f97316", "ramp_go": "#22c55e",
+                "tube": "#a78bfa",
+            }[item["kind"]]
             p.setPen(QPen(QColor("#ffffff" if selected else colour), 3 if selected else 2))
             p.setBrush(QColor(colour))
             if item["kind"] == "tube":
@@ -1984,21 +2346,61 @@ class MissionLayoutCanvas(QWidget):
                 obstacle_polygon = QPolygonF([self._screen(x, y)
                                                for x, y in model._obstacle_corners(item)])
                 p.drawPolygon(obstacle_polygon)
-                if item["kind"] == "ramp":
+                if item["kind"] in model.NO_GO_RAMP_KINDS:
                     p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
                     p.setBrush(QColor(127, 29, 29, 115))
                     p.drawPolygon(obstacle_polygon)
+                elif item["kind"] in model.GO_RAMP_KINDS:
+                    angle = math.radians(float(item.get("rotation", 0)))
+                    axis_x, axis_y = math.cos(angle), math.sin(angle)
+                    half_length = float(item["w"]) / 2
+                    p.setPen(QPen(QColor("#dcfce7"), 5,
+                                  Qt.PenStyle.DashLine,
+                                  Qt.PenCapStyle.RoundCap))
+                    p.drawLine(
+                        self._screen(item["x"] - axis_x * half_length,
+                                     item["y"] - axis_y * half_length),
+                        self._screen(item["x"] + axis_x * half_length,
+                                     item["y"] + axis_y * half_length))
             centre = self._screen(item["x"], item["y"])
             p.setPen(QColor("#111827"))
             size_text = (f"Ø{item['w']:.0f}" if item["kind"] == "tube" else
                          f"{item['w']:.0f}×{item['h']:.0f}")
             p.drawText(QRectF(centre.x() - 80, centre.y() - 17, 160, 34),
                        Qt.AlignmentFlag.AlignCenter,
-                       (f"RAMP — NO-GO ZONE\n{size_text} mm"
-                        if item["kind"] == "ramp" else
+                       (f"RAMP — NO-GO\n{size_text} mm"
+                        if item["kind"] in model.NO_GO_RAMP_KINDS else
+                        f"RAMP — GO THROUGH\n{size_text} mm"
+                        if item["kind"] in model.GO_RAMP_KINDS else
                         f"{item['kind'].upper()}\n{size_text} mm"))
 
+        if model.block_target is not None:
+            target = model.block_target
+            centre = self._screen(target["x"], target["y"])
+            selected = target["id"] == self.selected_id
+            p.setPen(QPen(QColor("#ffffff" if selected else "#fb7185"),
+                          3 if selected else 2))
+            p.setBrush(QColor("#be123c"))
+            p.drawPolygon(QPolygonF([
+                QPointF(centre.x(), centre.y() - 17),
+                QPointF(centre.x() + 17, centre.y()),
+                QPointF(centre.x(), centre.y() + 17),
+                QPointF(centre.x() - 17, centre.y()),
+            ]))
+            p.setPen(QColor("#fff1f2"))
+            p.drawText(QRectF(centre.x() + 20, centre.y() - 12, 230, 24),
+                       Qt.AlignmentFlag.AlignLeft,
+                       ("DIRECT DESTINATION (0 WEIGHTS)"
+                        if model.confirmed_weight_limit == 0 else
+                        "AFTER-UNLOAD DESTINATION"))
+
         likely_weight = self._likely_visible_planned_weight()
+        displayed_order = (
+            self.sequence_preview_order if self.sequence_pick_active else
+            self.layout_model.target_order
+            if self.layout_model.order_mode == "manual" else [])
+        displayed_rank = {str(target_id): index
+                          for index, target_id in enumerate(displayed_order, 1)}
         for index, item in enumerate(model.weights, 1):
             centre = self._screen(item["x"], item["y"])
             selected = item["id"] == self.selected_id
@@ -2014,7 +2416,10 @@ class MissionLayoutCanvas(QWidget):
             p.setPen(QColor("#111827"))
             p.drawText(QRectF(centre.x() - 16, centre.y() - 9, 32, 18),
                        Qt.AlignmentFlag.AlignCenter,
-                       "D" if item["dummy"] else str(index))
+                       "D" if item["dummy"] else
+                       str(displayed_rank.get(str(item["id"]), "·")
+                           if self.sequence_pick_active else
+                           displayed_rank.get(str(item["id"]), index)))
 
         for route_index, (hit_x, hit_y, committed) in self.detected_weight_hits.items():
             centre = self._screen(hit_x, hit_y)
@@ -2676,6 +3081,8 @@ class ArenaView(QWidget):
     def _build_mission_editor(self):
         self.mission_layout = MissionLayout()
         self._return_home_route_active = False
+        self._sequence_pick_active = False
+        self._sequence_pick_ids = []
         try:
             saved = self.settings.value("navigation/mission_layout", "")
             if saved:
@@ -2729,14 +3136,56 @@ class ArenaView(QWidget):
         self.mission_fallback_combo.currentIndexChanged.connect(self._mission_fallback_changed)
         toolbar.addWidget(QLabel("After weights:"))
         toolbar.addWidget(self.mission_fallback_combo)
+
+        self.mission_order_combo = QComboBox()
+        self.mission_order_combo.addItem("Automatic order", "auto")
+        self.mission_order_combo.addItem("My chosen order", "manual")
+        self.mission_order_combo.setCurrentIndex(
+            1 if self.mission_layout.order_mode == "manual" else 0)
+        self.mission_order_combo.currentIndexChanged.connect(
+            self._mission_order_mode_changed)
+        self.mission_order_combo.setToolTip(
+            "Automatic lets the planner choose the next weight. My chosen order "
+            "visits the targets in the list order, while planning a clear route "
+            "and collection approach for each one.")
+        toolbar.addWidget(QLabel("Visit order:"))
+        toolbar.addWidget(self.mission_order_combo)
         toolbar.addStretch()
         page_layout.addLayout(toolbar)
+
+        return_limit_bar = QHBoxLayout()
+        return_limit_bar.addWidget(QLabel("Return home after:"))
+        self.mission_weight_limit = QSpinBox()
+        self.mission_weight_limit.setRange(0, 20)
+        self.mission_weight_limit.setValue(self.mission_layout.confirmed_weight_limit)
+        self.mission_weight_limit.setSuffix(" confirmed weights")
+        self.mission_weight_limit.setToolTip(
+            "Automatically return home after this many induction-confirmed pickups. "
+            "For values 1–20 the 90-second timer is a backup. Set to 0 for direct "
+            "destination mode: skip collection and home unloading, and do not return home.")
+        self.mission_weight_limit.valueChanged.connect(
+            self._mission_weight_limit_changed)
+        return_limit_bar.addWidget(self.mission_weight_limit)
+        return_limit_bar.addStretch()
+        page_layout.addLayout(return_limit_bar)
 
         tools = QHBoxLayout()
         for label, mode in (("Set start", "start"), ("+ Weight", "weight"),
                             ("+ Dummy weight", "dummy"), ("+ Wall", "wall"),
-                            ("+ Ramp", "ramp"), ("+ Tube", "tube")):
+                            ("+ No-go ramp", "ramp_no_go"),
+                            ("+ Go ramp", "ramp_go"), ("+ Tube", "tube"),
+                            ("+ After-unload destination", "block_target")):
             button = QPushButton(label)
+            if mode in ("ramp_no_go", "ramp_go"):
+                button.setToolTip(
+                    "No-go ramp: the route planner avoids the ramp and its clearance. "
+                    "Go ramp: any route crossing it approaches square-on and follows "
+                    "the centreline between the short sides.")
+            if mode == "block_target":
+                button.setToolTip(
+                    "Place or move the single optional post-unload destination. "
+                    "It runs after home unload/shaking and a 5-second pause. "
+                    "Choose a reachable point clear of walls and ramp obstacles.")
             button.clicked.connect(
                 lambda _checked=False, m=mode: self.mission_canvas.set_add_mode(m))
             tools.addWidget(button)
@@ -2746,6 +3195,15 @@ class ArenaView(QWidget):
         delete = QPushButton("Delete selected")
         delete.clicked.connect(lambda: self.mission_canvas.delete_selected())
         tools.addWidget(delete)
+        self.clear_all_mission_button = QPushButton("CLEAR ALL")
+        self.clear_all_mission_button.setStyleSheet(
+            "QPushButton { background:#991b1b; color:white; font-weight:bold; }")
+        self.clear_all_mission_button.setToolTip(
+            "Remove every placed weight, obstacle, after-unload destination, and route. "
+            "The selected home, start pose, and navigation tuning are kept.")
+        self.clear_all_mission_button.clicked.connect(
+            self._clear_all_mission_items)
+        tools.addWidget(self.clear_all_mission_button)
         reset_view = QPushButton("Reset view")
         reset_view.clicked.connect(lambda: self.mission_canvas.reset_view())
         tools.addWidget(reset_view)
@@ -2756,7 +3214,8 @@ class ArenaView(QWidget):
         tools.addWidget(plan)
         self.export_local_mission_button = QPushButton("EXPORT LOCAL FIRMWARE CONFIG")
         self.export_local_mission_button.setToolTip(
-            "Save this arena, rotated obstacles, route, sensor poses, and navigation tuning "
+            "Save this arena, rotated obstacles, collection and after-unload routes, "
+            "sensor poses, and navigation tuning "
             "to PlatformIO/local_mission.json for the next Teensy build."
         )
         self.export_local_mission_button.clicked.connect(self._export_local_mission)
@@ -2768,6 +3227,8 @@ class ArenaView(QWidget):
             self.mission_layout, self.model, self.mission_page)
         self.mission_canvas.layout_changed.connect(self._mission_layout_changed)
         self.mission_canvas.selection_changed.connect(self._mission_selection_changed)
+        self.mission_canvas.sequence_weight_clicked.connect(
+            self._sequence_weight_clicked)
         self.mission_canvas.cursor_moved.connect(self._mission_cursor_moved)
         body.addWidget(self.mission_canvas, 1)
 
@@ -2775,6 +3236,27 @@ class ArenaView(QWidget):
         inspector.setMaximumWidth(310)
         inspector_layout = QVBoxLayout(inspector)
         inspector_layout.setContentsMargins(4, 4, 4, 4)
+
+        order_group = QGroupBox("Weight visit sequence")
+        order_layout = QVBoxLayout(order_group)
+        self.mission_order_list = QListWidget()
+        self.mission_order_list.setMinimumHeight(76)
+        self.mission_order_list.setMaximumHeight(145)
+        self.mission_order_list.setToolTip(
+            "Shows the planned visit order (updated after PLAN ROUTE in automatic mode). "
+            "To choose your own sequence, press SET SEQUENCE and click real weight "
+            "markers on the arena map.")
+        self.mission_order_list.currentItemChanged.connect(
+            self._mission_order_selection_changed)
+        order_layout.addWidget(self.mission_order_list)
+        self.mission_set_sequence_button = QPushButton("SET SEQUENCE")
+        self.mission_set_sequence_button.clicked.connect(
+            self._toggle_mission_sequence_pick)
+        self.mission_set_sequence_button.setToolTip(
+            "Click each real weight on the arena map in the order you want to visit them.")
+        order_layout.addWidget(self.mission_set_sequence_button)
+        inspector_layout.addWidget(order_group)
+        self._refresh_mission_weight_order()
 
         selection_group = QGroupBox("Selected obstacle geometry")
         selection_form = QFormLayout(selection_group)
@@ -2794,13 +3276,15 @@ class ArenaView(QWidget):
             self._mission_obstacle_dimension_changed)
         selection_form.addRow("Length / diameter", self.mission_obstacle_width)
         selection_form.addRow("Thickness / depth", self.mission_obstacle_height)
+        self.mission_obstacle_angle_label = QLabel("Wall angle")
         self.mission_obstacle_angle = QDoubleSpinBox()
         self.mission_obstacle_angle.setRange(0, 179)
         self.mission_obstacle_angle.setDecimals(0)
         self.mission_obstacle_angle.setSuffix("°")
         self.mission_obstacle_angle.valueChanged.connect(
             self._mission_obstacle_angle_changed)
-        selection_form.addRow("Wall angle", self.mission_obstacle_angle)
+        selection_form.addRow(self.mission_obstacle_angle_label,
+                              self.mission_obstacle_angle)
         self.mission_dummy_extra = QDoubleSpinBox()
         self.mission_dummy_extra.setRange(0, 500)
         self.mission_dummy_extra.setDecimals(0)
@@ -2835,9 +3319,16 @@ class ArenaView(QWidget):
         self.mission_cursor_label.setWordWrap(True)
         inspector_layout.addWidget(self.mission_cursor_label)
         guide = QLabel(
-            "Seven dashed vertical placement lines split the 4.9 m arena into eight equal bays. "
+            "Seven dashed vertical placement lines split the arena length into eight bays; "
+            "three horizontal lines mark the quarter, midpoint, and three-quarter positions. "
+            "Choose automatic ordering, or press SET SEQUENCE and click real weight markers "
+            "in the desired order; Plan Route then plans a path through that sequence. "
+            "The optional POST-UNLOAD BLOCK marker is a single destination: after home "
+            "unloading/shaking, the robot waits 5 seconds with the gate open, closes it, "
+            "then navigates there. Place it at a reachable point clear of walls and ramps. "
             "Dummy clearance and wall clearance are both measured from the robot edge. "
-            "Walls/tubes use normal robot clearance; ramps and the opposing base are no-go zones. "
+            "Homes are shown for reference and are not no-go zones; ramps remain forbidden. "
+            "Walls/tubes use normal robot clearance. "
             "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
         guide.setWordWrap(True)
         inspector_layout.addWidget(guide)
@@ -2847,7 +3338,8 @@ class ArenaView(QWidget):
 
         self.mission_status = QLabel(
             "Pre-lay the arena: fixed border; green home top-left; blue home bottom-left. "
-            "The other home is NO-GO. Add real/dummy weights and obstacles, set START, then Plan Route.")
+            "Both homes are shown for reference. Add real/dummy weights and obstacles, set START, then Plan Route. "
+            "Use + Block destination for one optional post-unload destination.")
         self.mission_status.setWordWrap(True)
         page_layout.addWidget(self.mission_status)
         self._mission_selection_changed("start")
@@ -2880,6 +3372,16 @@ class ArenaView(QWidget):
     def _mission_selection_changed(self, ident):
         if not hasattr(self, "mission_obstacle_width"):
             return
+        if (self.mission_layout.order_mode == "manual" and
+                hasattr(self, "mission_order_list")):
+            for index in range(self.mission_order_list.count()):
+                row = self.mission_order_list.item(index)
+                if str(row.data(Qt.ItemDataRole.UserRole)) == str(ident):
+                    if self.mission_order_list.currentRow() != index:
+                        self.mission_order_list.blockSignals(True)
+                        self.mission_order_list.setCurrentRow(index)
+                        self.mission_order_list.blockSignals(False)
+                    break
         obstacle = next(
             (item for item in self.mission_layout.obstacles
              if item.get("id") == ident), None)
@@ -2888,8 +3390,11 @@ class ArenaView(QWidget):
         self.mission_obstacle_angle.blockSignals(True)
         try:
             if obstacle is None:
+                self.mission_obstacle_angle_label.setText("Wall angle")
                 if ident == "start":
                     label = "START"
+                elif ident == "block_target" and self.mission_layout.block_target is not None:
+                    label = "POST-UNLOAD BLOCK DESTINATION"
                 else:
                     weight = next(
                         (item for item in self.mission_layout.weights
@@ -2904,13 +3409,16 @@ class ArenaView(QWidget):
             self.mission_selected_label.setText(
                 f"{obstacle['kind'].upper()} #{obstacle['id']}")
             is_wall = obstacle.get("kind") == "wall"
+            is_go_ramp = obstacle.get("kind") in self.mission_layout.GO_RAMP_KINDS
+            self.mission_obstacle_angle_label.setText(
+                "Ramp angle" if is_go_ramp else "Wall angle")
             self.mission_obstacle_width.setEnabled(not is_wall)
             self.mission_obstacle_width.setValue(float(obstacle.get("w", 100.0)))
             is_tube = obstacle.get("kind") == "tube"
             self.mission_obstacle_height.setEnabled(not is_tube and not is_wall)
             self.mission_obstacle_height.setValue(
                 float(obstacle.get("h", obstacle.get("w", 100.0))))
-            self.mission_obstacle_angle.setEnabled(is_wall)
+            self.mission_obstacle_angle.setEnabled(is_wall or is_go_ramp)
             self.mission_obstacle_angle.setValue(float(obstacle.get("rotation", 0)))
         finally:
             self.mission_obstacle_width.blockSignals(False)
@@ -3029,11 +3537,43 @@ class ArenaView(QWidget):
         )
 
     def _mission_layout_changed(self):
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Sequence selection cancelled because the layout changed; "
+                "the saved visit order is unchanged.")
         self.mission_layout.route = []
+        self.mission_canvas.after_unload_route_visible = False
         self._return_home_route_active = False
+        if hasattr(self, "mission_order_list"):
+            self._refresh_mission_weight_order()
         self._save_mission_layout()
         self.mission_status.setText("Layout changed — press PLAN ROUTE to recalculate around the new geometry.")
         self.mission_canvas.update()
+
+    def _clear_all_mission_items(self):
+        confirmation = QMessageBox.question(
+            self,
+            "Clear all arena items?",
+            "This removes all real and dummy weights, walls, ramps, tubes, the "
+            "after-unload destination, and the planned route. The selected home, "
+            "start pose, and navigation tuning will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Visit sequence cancelled because the arena was cleared.")
+        self.mission_canvas.set_add_mode(None)
+        self.mission_layout.clear_arena_items()
+        self.mission_canvas.selected_id = "start"
+        self.mission_order_combo.blockSignals(True)
+        self.mission_order_combo.setCurrentIndex(0)
+        self.mission_order_combo.blockSignals(False)
+        self._mission_layout_changed()
+        self._mission_selection_changed("start")
 
     def _mission_home_changed(self, index):
         self.mission_layout.my_home = "green" if index == 0 else "blue"
@@ -3047,6 +3587,151 @@ class ArenaView(QWidget):
         self.mission_layout.fallback_strategy = max(0, min(2, int(index)))
         self._save_mission_layout()
 
+    def _mission_weight_limit_changed(self, value):
+        self.mission_layout.confirmed_weight_limit = max(0, min(20, int(value)))
+        self._mission_layout_changed()
+
+    def _mission_order_mode_changed(self, index):
+        self.mission_layout.order_mode = (
+            "manual" if self.mission_order_combo.itemData(index) == "manual"
+            else "auto")
+        self._mission_layout_changed()
+
+    def _toggle_mission_sequence_pick(self):
+        if self._sequence_pick_active:
+            self._cancel_mission_sequence(
+                "Sequence selection cancelled; the previously saved order is unchanged.")
+            return
+        if not self.mission_layout.ordered_real_weights():
+            self.mission_status.setText(
+                "Add at least one real weight before setting a visit sequence.")
+            return
+        self._sequence_pick_active = True
+        self._sequence_pick_ids = []
+        self.mission_canvas.sequence_pick_active = True
+        self.mission_canvas.sequence_preview_order = []
+        self.mission_canvas.add_mode = None
+        self.mission_order_combo.setEnabled(False)
+        self.mission_set_sequence_button.setText("CANCEL SEQUENCE")
+        self._refresh_mission_weight_order()
+        self.mission_status.setText(
+            "SET SEQUENCE: click each real weight marker on the map in the "
+            f"desired order (0/{len(self.mission_layout.ordered_real_weights())}).")
+        self.mission_canvas.update()
+
+    def _cancel_mission_sequence(self, message):
+        self._sequence_pick_active = False
+        self._sequence_pick_ids = []
+        self.mission_canvas.sequence_pick_active = False
+        self.mission_canvas.sequence_preview_order = []
+        self.mission_order_combo.setEnabled(True)
+        self.mission_set_sequence_button.setText("SET SEQUENCE")
+        self._refresh_mission_weight_order()
+        self.mission_status.setText(message)
+        self.mission_canvas.update()
+
+    def _sequence_weight_clicked(self, target_id):
+        if not self._sequence_pick_active:
+            return
+        weight = next((item for item in self.mission_layout.weights
+                       if str(item["id"]) == str(target_id) and
+                       not item.get("dummy")), None)
+        if weight is None:
+            return
+        if any(str(existing) == str(weight["id"])
+               for existing in self._sequence_pick_ids):
+            self.mission_status.setText(
+                "That weight is already in the sequence; click a different real weight.")
+            return
+        self._sequence_pick_ids.append(weight["id"])
+        self.mission_canvas.sequence_preview_order = list(self._sequence_pick_ids)
+        self.mission_canvas.selected_id = weight["id"]
+        self._refresh_mission_weight_order()
+        for index in range(self.mission_order_list.count()):
+            row = self.mission_order_list.item(index)
+            if str(row.data(Qt.ItemDataRole.UserRole)) == str(weight["id"]):
+                self.mission_order_list.setCurrentRow(index)
+                break
+        self._mission_selection_changed(weight["id"])
+        self.mission_canvas.update()
+
+        count = len(self.mission_layout.ordered_real_weights())
+        picked = len(self._sequence_pick_ids)
+        if picked == count:
+            self.mission_layout.set_target_order(self._sequence_pick_ids)
+            self.mission_layout.order_mode = "manual"
+            self._sequence_pick_active = False
+            self._sequence_pick_ids = []
+            self.mission_canvas.sequence_pick_active = False
+            self.mission_canvas.sequence_preview_order = []
+            self.mission_order_combo.blockSignals(True)
+            self.mission_order_combo.setCurrentIndex(1)
+            self.mission_order_combo.blockSignals(False)
+            self.mission_order_combo.setEnabled(True)
+            self.mission_set_sequence_button.setText("SET SEQUENCE")
+            self._mission_layout_changed()
+            self.mission_status.setText(
+                f"Manual visit sequence saved for {count} weights. Click PLAN ROUTE "
+                "to calculate a safe path in that order.")
+            self.mission_canvas.update()
+            return
+        self.mission_status.setText(
+            f"Visit sequence: {picked}/{count}. Click the next weight in your order.")
+
+    def _refresh_mission_weight_order(self):
+        if not hasattr(self, "mission_order_list"):
+            return
+        selected_id = None
+        current = self.mission_order_list.currentItem()
+        if current is not None:
+            selected_id = current.data(Qt.ItemDataRole.UserRole)
+        weights = self.mission_layout.ordered_real_weights()
+        if self._sequence_pick_active:
+            weights_by_id = {str(weight["id"]): weight for weight in weights}
+            weights = [weights_by_id[str(target_id)]
+                       for target_id in self._sequence_pick_ids
+                       if str(target_id) in weights_by_id]
+        elif self.mission_layout.order_mode == "auto" and self.mission_layout.route:
+            remaining = {str(weight["id"]): weight for weight in weights}
+            planned = []
+            for point in self.mission_layout.route:
+                if not point.get("target") or not remaining:
+                    continue
+                nearest = min(
+                    remaining.values(),
+                    key=lambda weight: math.hypot(
+                        weight["x"] - point["x"], weight["y"] - point["y"]),
+                )
+                planned.append(nearest)
+                remaining.pop(str(nearest["id"]), None)
+            weights = planned + list(remaining.values())
+        self.mission_order_list.blockSignals(True)
+        self.mission_order_list.clear()
+        for index, weight in enumerate(weights, start=1):
+            row = QListWidgetItem(
+                f"{index}. Weight #{weight['id']}  "
+                f"({weight['x']:.0f}, {weight['y']:.0f} mm)")
+            row.setData(Qt.ItemDataRole.UserRole, weight["id"])
+            self.mission_order_list.addItem(row)
+            if str(weight["id"]) == str(selected_id):
+                self.mission_order_list.setCurrentItem(row)
+        if self.mission_order_list.currentRow() < 0 and weights:
+            self.mission_order_list.setCurrentRow(0)
+        self.mission_order_list.blockSignals(False)
+        manual = self.mission_layout.order_mode == "manual"
+        self.mission_order_list.setEnabled(
+            (manual or self._sequence_pick_active) and bool(weights))
+        self.mission_set_sequence_button.setEnabled(
+            bool(self.mission_layout.ordered_real_weights()))
+
+    def _mission_order_selection_changed(self, current, _previous):
+        if current is None or not hasattr(self, "mission_canvas"):
+            return
+        ident = current.data(Qt.ItemDataRole.UserRole)
+        self.mission_canvas.selected_id = ident
+        self._mission_selection_changed(ident)
+        self.mission_canvas.update()
+
     def _mission_dummy_extra_changed(self, value):
         self.mission_layout.dummy_clearance_mm = float(value)
         self._mission_layout_changed()
@@ -3057,6 +3742,7 @@ class ArenaView(QWidget):
             self.map_tabs.setCurrentWidget(self.mission_page)
 
     def _plan_mission_route(self):
+        self.mission_canvas.after_unload_route_visible = False
         # Use the same physical footprint/safety margin that will be sent to
         # firmware so the graphical route and the real clearance agree.
         self.mission_layout.ROBOT_RADIUS_MM = (
@@ -3065,15 +3751,48 @@ class ArenaView(QWidget):
         self.mission_layout.SAFETY_MARGIN_MM = self.navigation_tuning_controls[
             "wall_clearance_mm"].value()
         if self.mission_layout.plan():
+            if (self.mission_layout.block_target is not None and
+                    self.mission_layout.after_unload_route() is None):
+                route_origin = ("the start" if
+                    self.mission_layout.confirmed_weight_limit == 0 else
+                    "the home dock")
+                self.mission_layout.route_error = (
+                    f"No map-clear route from {route_origin} to the destination.")
+                self.mission_status.setText(
+                    "ROUTE ERROR: " + self.mission_layout.route_error)
+                self.mission_canvas.update()
+                return False
+            after_unload_route = self.mission_layout.after_unload_route()
+            direct_to_target = self.mission_layout.confirmed_weight_limit == 0
+            if after_unload_route is not None and not direct_to_target:
+                self.mission_canvas.after_unload_route_visible = True
+            self._refresh_mission_weight_order()
             target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
             length = MissionLayout._path_length(
                 [(self.mission_layout.start["x"], self.mission_layout.start["y"])] +
                 [(point["x"], point["y"]) for point in self.mission_layout.route]
             )
-            self.mission_status.setText(
-                f"Route ready: {target_count} real weights, {len(self.mission_layout.route)} waypoints, "
-                f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
-            )
+            after_unload_note = ""
+            if after_unload_route is not None and not direct_to_target:
+                after_unload_length = MissionLayout._path_length(after_unload_route)
+                after_unload_legs = len(after_unload_route) - 1
+                after_unload_note = (
+                    f" Red after-unload route: {after_unload_legs} legs, "
+                    f"about {after_unload_length/1000.0:.1f} m from home."
+                )
+            if direct_to_target:
+                self.mission_status.setText(
+                    f"Zero-weight mode: direct route to the destination; "
+                    f"{len(self.mission_layout.route)} waypoints, "
+                    f"approximately {length/1000.0:.1f} m."
+                )
+            else:
+                self.mission_status.setText(
+                    f"Route ready ({'manual' if self.mission_layout.order_mode == 'manual' else 'automatic'} order): "
+                    f"{target_count} real weights, {len(self.mission_layout.route)} waypoints, "
+                    f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
+                    f"{after_unload_note}"
+                )
         else:
             self.mission_status.setText("ROUTE ERROR: " + self.mission_layout.route_error)
         self.mission_canvas.update()
@@ -3272,12 +3991,35 @@ class ArenaView(QWidget):
 
         mission = self.mission_layout.command_payload()
         map_payload = self._mission_map_payload()
-        real_targets = sum(1 for item in self.mission_layout.weights
-                           if not item.get("dummy", False))
-        if real_targets == 0 or not mission["points"]:
+        block_target = self.mission_layout.block_target
+        if block_target is not None and self.mission_layout.blocked(
+                block_target["x"], block_target["y"]):
             QMessageBox.warning(
                 self, "Local mission export",
-                "Add at least one real weight and plan a route before exporting."
+                "The after-unload destination is inside a wall, ramp, obstacle, "
+                "or arena-edge clearance. Move it to a reachable point before exporting."
+            )
+            return
+        if block_target is not None and self.mission_layout.after_unload_route() is None:
+            route_origin = ("the start" if
+                self.mission_layout.confirmed_weight_limit == 0 else
+                "the home dock")
+            QMessageBox.warning(
+                self, "Local mission export",
+                f"No map-clear route is available from {route_origin} to the "
+                "after-unload destination. Move the marker or edit the arena first."
+            )
+            return
+        real_targets = sum(1 for item in self.mission_layout.weights
+                           if not item.get("dummy", False))
+        direct_to_target = self.mission_layout.confirmed_weight_limit == 0
+        if ((real_targets == 0 and not direct_to_target) or
+                not mission["points"] or
+                (direct_to_target and block_target is None)):
+            QMessageBox.warning(
+                self, "Local mission export",
+                "Add a real weight and plan a route, or set the weight limit to 0 "
+                "and place an after-unload destination for direct mode."
             )
             return
         if len(mission["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS or \

@@ -7007,3 +7007,70 @@ Not verified here:
   and no hardware/arena run has been performed. The exporter must be used
   before the competition profile is enabled in the next build.
 - The existing drum jam-detection/reversal logic was not edited.
+
+2026-09-30 — Stronger home unloading shake
+------------------------------------------
+- Changed the home unload motion from two back-and-forth cycles at 75% to
+  three complete cycles (six encoder-measured legs) at 100% drive command.
+  Each leg remains capped at 90 mm; a 100 ms neutral interval remains between
+  direction changes. The gate still opens before shaking and closes only after
+  the unload sequence completes.
+- Kept the existing encoder travel limits, heading/pose checks, and mapped
+  corridor/front-clearance checks. Added per-cycle log messages so a recording
+  can show how many cycles completed. The cycle count, drive percentage, stroke
+  length, and reversal pause are grouped in `HomeUnloadConfig` in
+  `PlatformIO/include/config.h` for deliberate tuning.
+- No changes were made to drum jam detection/reversal, its ADC sampling or
+  calibration, thresholds, timing, motor commands, or associated parameters.
+- Verification: `git diff --check` passed. Teensy 4.0 PlatformIO build passed
+  (FLASH code 237,240 B; RAM1 variables 78,688 B). Firmware was not uploaded
+  and the unload motion has not yet been tested on the robot.
+
+2026-09-30 — Local-run return-home limits
+-----------------------------------------
+- Confirmed the local competition timer was already implemented at 90,000 ms
+  from the debounced AIO9 rising-edge start. Kept that deadline unchanged.
+- Added an additional return-home trigger after five confirmed inductive
+  sorting events. The supervisor consumes the existing debounced confirmation
+  serial once per event, keeps a local-run count, and routes the fifth event
+  through the same existing map-aware return-home and unload sequence. It does
+  not count planned/visited sites as successful weights.
+- Added `local_competition.confirmed_weights` and
+  `local_competition.weight_limit` telemetry, and updated
+  `PlatformIO/LOCAL_COMPETITION.md` with both return conditions.
+- Drum jam detection/reversal behavior was not changed. `git diff --check` and
+  the Teensy 4.0 PlatformIO build passed (FLASH code 237,496 B; RAM1 variables
+  78,688 B). Firmware was not uploaded and the five-weight return has not yet
+  been tested on the robot.
+
+2026-09-30 — Mission layout horizontal reference guides
+-------------------------------------------------------
+- Added three dashed horizontal reference guides to the mission layout canvas
+  at one-quarter, one-half, and three-quarters of the arena height. They are
+  labeled H1–H3 with their millimetre positions and use the same subdued style
+  as the existing vertical lane references.
+- These are display-only guides; they do not change arena geometry, route
+  planning, or exported mission data. No firmware or protected drum jam
+  recovery code was changed.
+
+2026-09-30 — Automatic or manually ordered mission targets
+----------------------------------------------------------
+- Added a Mission Planner visit-order selector with Automatic order (the
+  existing planner-selected target order) and My chosen order modes.
+- Replaced the earlier list-reordering interaction with SET SEQUENCE: press it,
+  then click every real weight marker on the map in the desired order. The list
+  and marker numbers show the picks; completing the sequence saves it and
+  switches to My chosen order. PLAN ROUTE respects that order while still using
+  the existing obstacle-aware route, safe staging, and collection run-through
+  planner for every site. Cancel leaves the previously saved order unchanged.
+- The visit list displays the computed route order after PLAN ROUTE in automatic
+  mode. Selecting a list entry highlights its corresponding weight marker.
+- Mode and target sequence are saved with the arena layout. Adding a real
+  weight appends it to the sequence; deleting one removes it. Dummy weights do
+  not appear in the visit sequence. Switching back to automatic mode preserves
+  the manual sequence for later use.
+- Added three labeled horizontal quarter/midpoint guides to the mission layout;
+  they are display-only and do not affect route planning or exported geometry.
+- Added hardware-free checks for manual route ordering, persistence, and the
+  map-click sequence workflow. No firmware or protected drum jam-recovery code
+  was changed.
